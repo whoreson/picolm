@@ -706,6 +706,20 @@ static void kv_strides_for(int device, int is_k, int n_kv_heads, int head_dim,
  * exactly -- no regression risk for short contexts) vs split-K (grid=
  * n_kv_heads*n_splits + a merge pass) based on how many KV positions
  * there are to walk. xb_dev/q_dev must already be device pointers. */
+/* Decode attention on picolm_gpu_attention_decode_warp_kernel: F16 KV cache,
+ * head_dim 64/128/256, kv_mul <= 8, CUDA (32-lane warps).
+ * PICOLM_NO_ATTN_DECODE_WARP=1 keeps the single-pass/split kernels. */
+static int attn_decode_warp_ok(int head_dim, int kv_mul, int kv_type) {
+#ifdef __HIP__
+    (void)head_dim; (void)kv_mul; (void)kv_type;
+    return 0;
+#else
+    static int off = -1;
+    if (off < 0) off = getenv("PICOLM_NO_ATTN_DECODE_WARP") ? 1 : 0;
+    return !off && kv_type == 0 && (head_dim == 64 || head_dim == 128 || head_dim == 256) && kv_mul <= 8;
+#endif
+}
+
 static int
 attn_decode_dispatch(float *xb_dev, const float *q_dev,
                       int layer_ordinal, int pos,
@@ -743,6 +757,13 @@ attn_decode_dispatch(float *xb_dev, const float *q_dev,
     int n_splits = (total_kv + ATTN_DECODE_TARGET_CHUNK - 1) / ATTN_DECODE_TARGET_CHUNK;
     if (n_splits > ATTN_DECODE_MAX_SPLITS) n_splits = ATTN_DECODE_MAX_SPLITS;
     if (n_splits < 1) n_splits = 1;
+    int warp_kernel = attn_decode_warp_ok(head_dim, kv_mul, kv_type);
+    if (warp_kernel) {
+        /* ~240 blocks fill the GPU; keep at least 16 keys per split. */
+        n_splits = (240 + n_kv_heads - 1) / n_kv_heads;
+        if (n_splits > (total_kv + 15) / 16) n_splits = (total_kv + 15) / 16;
+        if (n_splits < 1) n_splits = 1;
+    }
 
     size_t shared_bytes = 2 * head_dim * sizeof(uint16_t) + 256 * sizeof(float)
                          + (size_t)kv_mul * head_dim * sizeof(float)
@@ -750,7 +771,7 @@ attn_decode_dispatch(float *xb_dev, const float *q_dev,
                          + (size_t)kv_mul * sizeof(float)
                          + 2 * sizeof(float); /* rescale_sh + weight_sh */
 
-    if (n_splits <= 1) {
+    if (n_splits <= 1 && !warp_kernel) {
         gpu_dispatch_print("attn_decode");
         int _ps = picolm_gpu_prof_slot("attn_decode");
         picolm_gpu_prof_begin(device);
@@ -775,7 +796,7 @@ attn_decode_dispatch(float *xb_dev, const float *q_dev,
     float *partial_sum = partial_max + (size_t)n_heads * n_splits;
     float *partial_acc = partial_sum + (size_t)n_heads * n_splits;
 
-    gpu_dispatch_print("attn_decode_split");
+    if (!warp_kernel) gpu_dispatch_print("attn_decode_split");
     /* The split-K path had NO prof slot, so every time context grew past
      * ATTN_DECODE_MIN_CHUNK the decode attention's cost simply left the
      * accounting and inflated the "unexplained" gap. That is precisely the
@@ -783,6 +804,14 @@ attn_decode_dispatch(float *xb_dev, const float *q_dev,
     int _ps_split = picolm_gpu_prof_slot("attn_decode_split");
     picolm_gpu_prof_begin(device);
     dim3 grid_split((unsigned)n_kv_heads, (unsigned)n_splits, 1);
+    if (warp_kernel) {
+        gpu_dispatch_print("attn_decode_warp");
+        picolm_gpu_attention_decode_warp_launch(grid_split, ctx->stream,
+            partial_max, partial_sum, partial_acc,
+            q_dev, g_kv_k_dev[device], g_kv_v_dev[device],
+            layer_ordinal, pos, n_heads, n_kv_heads, head_dim, max_seq_len,
+            kv_pos_stride_bytes, kv_head_stride_bytes, kv_head_stride_v_bytes, n_splits, chunk_size, n_swa);
+    } else
     picolm_gpu_attention_decode_split_kernel<<<grid_split, 256, (unsigned)shared_bytes, ctx->stream>>>(
         partial_max, partial_sum, partial_acc,
         q_dev, g_kv_k_dev[device], g_kv_v_dev[device],
@@ -947,6 +976,14 @@ ensure_attn_fa2_shared_mem(size_t bytes) {
  * no reduce_sh buffer (reduction is warp-local now), so this is 1KB+8B
  * smaller for the same head_dim/tile_q -- more headroom before the
  * dynamic-shared-memory opt-in kicks in. */
+/* Volta tensor-core attention prefill: has_hmma, head_dim 128, F16 KV cache.
+ * PICOLM_NO_ATTN_HMMA=1 (or PICOLM_FORCE_SCALAR_ATTN) keeps the scalar kernels. */
+static int picolm_gpu_attn_hmma(const gpu_device_ctx_t *ctx, int n_tokens, int head_dim, int kv_type) {
+    static int off = -1;
+    if (off < 0) off = getenv("PICOLM_NO_ATTN_HMMA") || getenv("PICOLM_FORCE_SCALAR_ATTN");
+    return !off && ctx->has_hmma && n_tokens >= 64 && head_dim == 128 && kv_type == 0;
+}
+
 static size_t
 attn_prefill_warpgrp_shared_bytes(int head_dim, int tile_q) {
     /* Q tile (FP16) + K tile (FP16) + V tile (FP16) + acc (FP32) + max/sum (FP32) */
@@ -1076,6 +1113,18 @@ picolm_gpu_attention_prefill(float *xb_out, const float *q_host,
         }
     }
 
+    if (!use_fa2 && picolm_gpu_attn_hmma(ctx, n_tokens, head_dim, kv_type)) {
+        gpu_dispatch_print("attn_prefill_hmma_host");
+        dim3 grid((unsigned)n_heads, (unsigned)((n_tokens + 63) / 64), 1);
+        picolm_gpu_attention_prefill_hmma_kernel<<<grid, 128, 0, ctx->stream>>>(
+            ctx->y, ctx->x,
+            g_kv_k_dev[device], g_kv_v_dev[device],
+            layer_ordinal, start_pos, n_tokens, n_heads, n_kv_heads, max_seq_len,
+            kv_pos_stride_bytes, kv_head_stride_bytes, kv_head_stride_v_bytes, n_swa);
+        if (!gpu_ok(gpuGetLastError(), "attn prefill hmma (host)")) return 0;
+        use_fa2 = 1;   /* done: skip the scalar kernels below */
+    }
+
     /* TODO(perf, head_dim=256): on NVIDIA IMMA GPUs, the warpgrp path below
      * is pure scalar F32 and does not use tensor cores. For Qwen3.5/3.6
      * (head_dim=256), FA2 falls through here because its shared memory
@@ -1202,6 +1251,18 @@ picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
             if (!gpu_ok(gpuGetLastError(), "attn prefill fa2 (dev)")) return 0;
             return 1;
         }
+    }
+
+    if (picolm_gpu_attn_hmma(ctx, n_tokens, head_dim, kv_type)) {
+        gpu_dispatch_print("attn_prefill_hmma_dev");
+        dim3 grid((unsigned)n_heads, (unsigned)((n_tokens + 63) / 64), 1);
+        picolm_gpu_attention_prefill_hmma_kernel<<<grid, 128, 0, ctx->stream>>>(
+            xb_out_dev, q_dev,
+            g_kv_k_dev[device], g_kv_v_dev[device],
+            layer_ordinal, start_pos, n_tokens, n_heads, n_kv_heads, max_seq_len,
+            kv_pos_stride_bytes, kv_head_stride_bytes, kv_head_stride_v_bytes, n_swa);
+        if (!gpu_ok(gpuGetLastError(), "attn prefill hmma (dev)")) return 0;
+        return 1;
     }
 
     int tile_q = ATTN_TILE_Q;
@@ -1975,23 +2036,25 @@ picolm_gpu_pipeline_logits_alloc(size_t bytes, int device) {
     return 1;
 }
 
-/* KV cache flush to CPU -- no-op on CUDA/HIP (KV cache IS CPU memory). */
+/* KV cache flush to CPU: copy positions [0, n_pos) of every layer
+ * ([layer][pos] rows, layers max_seq rows apart). n_pos outside 1..max_seq
+ * copies the whole cache. This used to copy all max_seq rows every time:
+ * 1.5 GB per prefill for an 11B model at 8K context. */
 extern "C" int
 picolm_gpu_kv_flush_to_cpu(uint8_t *cpu_k, uint8_t *cpu_v,
     int n_attn_ord, int max_seq, int n_pos,
     size_t row_sz_k, size_t row_sz_v, int device) {
-    (void)n_pos;
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!ctx || !select_ctx(ctx)) return 0;
     if (!g_kv_k_dev[device] || !g_kv_v_dev[device]) return 0;
     if (!cpu_k || !cpu_v) return 0;
-    size_t flush_bytes_k = (size_t)n_attn_ord * (size_t)max_seq * row_sz_k;
-    size_t flush_bytes_v = (size_t)n_attn_ord * (size_t)max_seq * row_sz_v;
-    if (!gpu_ok(gpuMemcpy(cpu_k, g_kv_k_dev[device], flush_bytes_k, gpuMemcpyDeviceToHost),
-                "kv flush K D2H")) return 0;
-    if (!gpu_ok(gpuMemcpy(cpu_v, g_kv_v_dev[device], flush_bytes_v, gpuMemcpyDeviceToHost),
-                "kv flush V D2H")) return 0;
-    return 1;
+    if (n_pos < 1 || n_pos > max_seq) n_pos = max_seq;
+    /* One strided copy per cache: n_attn_ord rows of n_pos * row_sz bytes,
+     * max_seq * row_sz apart on both sides. */
+    return gpu_ok(gpuMemcpy2D(cpu_k, (size_t)max_seq * row_sz_k, g_kv_k_dev[device], (size_t)max_seq * row_sz_k,
+                              (size_t)n_pos * row_sz_k, (size_t)n_attn_ord, gpuMemcpyDeviceToHost), "kv flush K D2H") &&
+           gpu_ok(gpuMemcpy2D(cpu_v, (size_t)max_seq * row_sz_v, g_kv_v_dev[device], (size_t)max_seq * row_sz_v,
+                              (size_t)n_pos * row_sz_v, (size_t)n_attn_ord, gpuMemcpyDeviceToHost), "kv flush V D2H");
 }
 
 /* Upload CPU KV cache to GPU KV cache (H2D).

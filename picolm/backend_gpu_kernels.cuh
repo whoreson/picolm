@@ -139,6 +139,10 @@ __global__ void picolm_q6_K_gemv(float *y, const int8_t *xq, const float *xd, co
  * bit-exact. For S=1 (decode) reduces to one tile of size 1. */
 
 __global__ void picolm_q8_q8_matmul_tiled(float *y, const int8_t *xq, const float *xd, const void *weights, int S, int I, int O, int row_bytes, int y_stride);
+/* Q8_0 x Q8_0 GEMM without IMMA; bit-identical to _tiled. grid ((O+7)/8, (S+7)/8), 256 threads. */
+__global__ void picolm_q8_q8_matmul_dp4a(float *y, const int8_t *xq, const float *xd, const void *weights, int S, int I, int O, int row_bytes, int y_stride);
+/* Q8_0 x Q8_0 GEMM on Volta tensor cores (f32, ~3e-7). grid ((O+63)/64, (S+127)/128), 128 threads. */
+__global__ void picolm_q8_q8_matmul_hmma(float *y, const int8_t *xq, const float *xd, const void *weights, int S, int I, int O, int row_bytes, int y_stride);
 
 __global__ void picolm_q8_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
                                           const void *weights, int S, int I, int O,
@@ -283,6 +287,16 @@ __global__ void picolm_gpu_attention_decode_kernel( float *xb_out, const float *
  * [1, ATTN_DECODE_MAX_SPLITS]. Larger context therefore means more blocks
  * rather than longer serial scans. */
 #define ATTN_DECODE_TARGET_CHUNK 64
+/* Decode attention, warp per key: split-K partials for the merge kernel.
+ * Launches picolm_gpu_attention_decode_warp_kernel<G, DPL> on grid
+ * (n_kv_heads, n_splits), 128 threads; 0 if kv_mul > 8 or head_dim is not
+ * 64/128/256. F16 KV cache only. */
+int picolm_gpu_attention_decode_warp_launch(dim3 grid, gpuStream_t stream,
+    float *partial_max, float *partial_sum, float *partial_acc, const float *q_dev,
+    const uint16_t *kv_k, const uint16_t *kv_v, int layer_ordinal, int pos,
+    int n_heads, int n_kv_heads, int head_dim, int max_seq_len,
+    size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes, size_t kv_head_stride_v_bytes,
+    int n_splits, int chunk_size, int n_swa);
 
 /* Partial state layout (flat float buffer, sized by the host wrapper):
  *   partial_max: [n_heads][n_splits]
@@ -324,6 +338,12 @@ __global__ void picolm_gpu_attention_prefill_kernel( float *xb_out,  const float
  * for the correctness argument (why the two reductions are bit-identical).
  * Legacy block-wide-reduce kernel available via PICOLM_ATTN_SLOW_SCALAR=1. */
 #define ATTN_WARPGRP_SIZE 32
+/* Volta tensor-core attention prefill: head_dim 128, F16 KV cache.
+ * grid (n_heads, (n_tokens+63)/64), 128 threads, static shared memory. */
+__global__ void picolm_gpu_attention_prefill_hmma_kernel(
+    float *xb_out, const float *q_dev, const uint16_t *kv_k, const uint16_t *kv_v,
+    int layer_ordinal, int start_pos, int n_tokens, int n_heads, int n_kv_heads, int max_seq_len,
+    size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes, size_t kv_head_stride_v_bytes, int n_swa);
 __global__ void picolm_gpu_attention_prefill_warpgrp_kernel( float *xb_out,  const float *q_dev,  const uint16_t *kv_k,  const uint16_t *kv_v,  int layer_ordinal, int start_pos, int n_tokens, int n_heads, int n_kv_heads, int head_dim, int max_seq_len, size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes, size_t kv_head_stride_v_bytes, int tile_q, int n_swa, int kv_type);
 
 /* dot2 variant: same signature, only defined when FAST_FP16_AVAILABLE

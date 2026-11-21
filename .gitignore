@@ -67,3 +67,6 @@ picolm/*.o.tmp
 picolm/check_r4_gemv
 picolm/check_iq3xxs_r4
 check_iq_gemv
+picolm/test_q8_gemm_gpu
+picolm/test_attn_hmma_gpu
+picolm/test_attn_decode_gpu

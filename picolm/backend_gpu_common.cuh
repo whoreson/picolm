@@ -64,6 +64,7 @@
 #define gpuMalloc hipMalloc
 #define gpuFree hipFree
 #define gpuMemcpy hipMemcpy
+#define gpuMemcpy2D hipMemcpy2D
 #define gpuMemcpyKind hipMemcpyKind
 #define gpuMemcpyHostToDevice hipMemcpyHostToDevice
 #define gpuMemcpyDeviceToHost hipMemcpyDeviceToHost
@@ -156,6 +157,7 @@ typedef hipEvent_t gpuEvent_t;
 #define gpuMalloc cudaMalloc
 #define gpuFree cudaFree
 #define gpuMemcpy cudaMemcpy
+#define gpuMemcpy2D cudaMemcpy2D
 #define gpuMemcpyKind cudaMemcpyKind
 #define gpuMemcpyHostToDevice cudaMemcpyHostToDevice
 #define gpuMemcpyDeviceToHost cudaMemcpyDeviceToHost
@@ -378,6 +380,8 @@ typedef struct {
      * has_imma: NVIDIA Turing+ (sm_80+) INT8 Tensor Cores (m16n8k32).
      *   Not available on HIP or Metal (no PTX). */
     int has_imma;
+    /* has_hmma: Volta (sm_70) fp16 Tensor Cores (mma.m8n8k4), for Q8_0 prefill. */
+    int has_hmma;
     float *x, *y, *gate, *up;
     size_t x_cap, y_cap, gate_cap, up_cap;
     float *host_x, *host_y;
