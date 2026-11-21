@@ -139,6 +139,8 @@ __global__ void picolm_q6_K_gemv(float *y, const int8_t *xq, const float *xd, co
  * bit-exact. For S=1 (decode) reduces to one tile of size 1. */
 
 __global__ void picolm_q8_q8_matmul_tiled(float *y, const int8_t *xq, const float *xd, const void *weights, int S, int I, int O, int row_bytes, int y_stride);
+/* Q8_0 x Q8_0 GEMM without IMMA; bit-identical to _tiled. grid ((O+7)/8, (S+7)/8), 256 threads. */
+__global__ void picolm_q8_q8_matmul_dp4a(float *y, const int8_t *xq, const float *xd, const void *weights, int S, int I, int O, int row_bytes, int y_stride);
 
 __global__ void picolm_q8_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
                                           const void *weights, int S, int I, int O,

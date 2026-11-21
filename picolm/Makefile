@@ -518,6 +518,10 @@ CUDAFLAGS   ?= -O3 --fmad=false -std=c++11 -Xcompiler="-fPIC"
 # CUDA: compile each GPU host .cu independently
 CUDA_OBJS := $(GPU_SRCS:%.cu=%-cuda.o)
 
+# GPU check: the DP4A Q8_0 GEMM must match the tiled kernel bit for bit.
+test-q8-gemm-gpu: tests/test_q8_gemm_gpu.cu backend_gpu_kernels-cuda.o
+	$(NVCC) $(CUDAFLAGS) $(CUDA_GENCODE) -DPICOLM_GPU=1 -o test_q8_gemm_gpu $^ -I.
+
 .PHONY: cuda
 cuda: $(CUDA_OBJS) gpu-clean-objs
 	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) $(NATIVE_MARCH) $(call simd_defines_for,$(NATIVE_MARCH)) -DPICOLM_GPU=1 -DPICOLM_CUDA=1 -I$(CUDA_INC)" GPU_OBJS="$(CUDA_OBJS)" GPU_LIBS="-L$(CUDA_LIB) -lcudart -lstdc++ -Wl,-rpath,$(CUDA_LIB)"
