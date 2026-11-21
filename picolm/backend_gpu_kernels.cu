@@ -1823,6 +1823,147 @@ picolm_q8_q8_matmul_hmma(float *y, const int8_t *xq, const float *xd,
             }
 }
 
+/* ---- IQ6_K x Q8_K GEMM on Volta tensor cores (prefill) ----
+ *
+ * Same scheme as picolm_q8_q8_matmul_hmma: an IQ6_K weight is the integer
+ * iq6nl_lut[q] - 128 + mn (|w| <= 128, exact in fp16), a Q8_K activation is
+ * an int8, so the 16-term dot product of one IQ6_K group is exact in the f32
+ * accumulator. It is then scaled like the CPU's vec_dot_iq6_k_q8_k:
+ * sum += dot * (d * scales[g]) * q8_K.d, group by group.
+ *
+ * A stage is one 64-value sub-block (ib64) of a super-block: weights are
+ * decoded through iq6nl_lut_dev into fp16 in shared memory, the matching
+ * Q8_K activations converted to fp16. Tile, warp layout and mma.m8n8k4
+ * fragments as in picolm_q8_q8_matmul_hmma. Max error vs a double CPU
+ * reference ~3e-7 of sum |terms| (make test-q8-gemm-gpu). */
+#define I6H_TO 64
+#define I6H_TS 128
+#define I6H_WG 4
+#define I6H_WH 2
+#define I6H_WR (I6H_TO / (16 * I6H_WG))
+#define I6H_THREADS (32 * I6H_WR * (I6H_TS / (16 * I6H_WH)))   /* 128 */
+#define I6H_LD (64 + 4)   /* halves per staged row: 34 words, no bank conflicts */
+
+__global__ void __launch_bounds__(I6H_THREADS)
+picolm_iq6_k_q8_K_matmul_hmma(float *y, const int8_t *xq, const float *xd,
+                              const void *weights,
+                              int S, int I, int O, int row_bytes, int y_stride) {
+    __shared__ __align__(16) __half w_sh[I6H_TO][I6H_LD];
+    __shared__ __align__(16) __half x_sh[I6H_TS][I6H_LD];
+    __shared__ float ws_sh[I6H_TO][4];   /* d * scales[g] for this stage */
+    __shared__ float xd_sh[I6H_TS];
+    __shared__ uint8_t lut_sh[64];
+
+    int tid = gpuThreadIdx_x, lane = tid & 31, warp = tid >> 5;
+    int o0 = gpuBlockIdx_x * I6H_TO, s0 = gpuBlockIdx_y * I6H_TS;
+    int ys = y_stride > 0 ? y_stride : O;
+    int n_super = I / 256;
+    if (tid < 64) lut_sh[tid] = iq6nl_lut_dev[tid];
+
+    int qp = (lane >> 2) & 3, r = (lane & 3) + 4 * (lane >> 4);
+    int wr = (warp % I6H_WR) * 16 * I6H_WG, wc = (warp / I6H_WR) * 16 * I6H_WH;
+    int arow[I6H_WG], bcol[I6H_WH], drow[I6H_WG][2], dcol[I6H_WH][4];
+    for (int g = 0; g < I6H_WG; g++) {
+        arow[g] = wr + 16 * g + 8 * (qp & 1) + r;
+        for (int u = 0; u < 2; u++)
+            drow[g][u] = wr + 16 * g + 8 * (qp & 1) + (lane & 1) + 2 * u + 4 * (lane >> 4);
+    }
+    for (int h = 0; h < I6H_WH; h++) {
+        bcol[h] = wc + 16 * h + 8 * (qp >> 1) + r;
+        for (int u = 0; u < 4; u++)
+            dcol[h][u] = wc + 16 * h + 8 * (qp >> 1) + (u & 1) + 2 * ((lane >> 1) & 1) + 4 * (u >> 1);
+    }
+
+    float sum[I6H_WG][I6H_WH][8];
+    for (int g = 0; g < I6H_WG; g++)
+        for (int h = 0; h < I6H_WH; h++)
+            for (int j = 0; j < 8; j++) sum[g][h][j] = 0.0f;
+
+    for (int k0 = 0; k0 < I; k0 += 64) {
+        int sb = k0 / 256, ib64 = (k0 / 64) & 3;
+        gpuSyncthreads();   /* lut_sh written / previous stage consumed */
+        /* Weights: one thread per (row, 16-value group). */
+        for (int it = tid; it < I6H_TO * 4; it += I6H_THREADS) {
+            int rr = it >> 2, gg = it & 3, o = o0 + rr;
+            __half *dst = &w_sh[rr][16 * gg];
+            if (o < O) {
+                const uint8_t *b = (const uint8_t *)weights + (size_t)o * row_bytes + (size_t)sb * 212;
+                float d = gpu_fp16_to_fp32((uint16_t)(b[0] | (b[1] << 8)));
+                int mn = ((b[2] | (b[3] << 8)) >> (4 * ib64 + gg)) & 1;
+                ws_sh[rr][gg] = d * (float)(int8_t)b[4 + 4 * ib64 + gg];
+                const uint8_t *qs = b + 20 + 32 * ib64 + 16 * (gg & 1);
+                const uint8_t *qh = b + 148 + 32 * (ib64 >> 1) + 16 * (gg & 1);
+                int shift = 4 * (ib64 & 1) + 2 * (gg >> 1);
+                for (int j = 0; j < 16; j++) {
+                    int lo = gg < 2 ? (qs[j] & 0x0F) : (qs[j] >> 4);
+                    int q = lo | (((qh[j] >> shift) & 3) << 4);
+                    dst[j] = __int2half_rn((int)lut_sh[q] - 128 + mn);
+                }
+            } else {
+                ws_sh[rr][gg] = 0.0f;
+                for (int j = 0; j < 16; j++) dst[j] = __int2half_rn(0);
+            }
+        }
+        /* Activations: one thread per token, 64 int8. */
+        for (int ls = tid; ls < I6H_TS; ls += I6H_THREADS) {
+            int s = s0 + ls;
+            uint32_t q[16];
+            if (s < S) {
+                const int4 *p = (const int4 *)(xq + (size_t)s * I + k0);
+                for (int i = 0; i < 4; i++) ((int4 *)q)[i] = p[i];
+                xd_sh[ls] = xd[(size_t)s * n_super + sb];
+            } else {
+                for (int i = 0; i < 16; i++) q[i] = 0;
+                xd_sh[ls] = 0.0f;
+            }
+            for (int i = 0; i < 16; i++) q8h_cvt4((__half2 *)&x_sh[ls][4 * i], q[i]);
+        }
+        gpuSyncthreads();
+
+        for (int gg = 0; gg < 4; gg++) {
+            float acc[I6H_WG][I6H_WH][8];
+            for (int g = 0; g < I6H_WG; g++)
+                for (int h = 0; h < I6H_WH; h++)
+                    for (int j = 0; j < 8; j++) acc[g][h][j] = 0.0f;
+#pragma unroll
+            for (int k = 16 * gg; k < 16 * gg + 16; k += 4) {
+                uint2 a[I6H_WG], b[I6H_WH];
+                for (int g = 0; g < I6H_WG; g++) a[g] = *(const uint2 *)&w_sh[arow[g]][k];
+                for (int h = 0; h < I6H_WH; h++) b[h] = *(const uint2 *)&x_sh[bcol[h]][k];
+                for (int g = 0; g < I6H_WG; g++)
+                    for (int h = 0; h < I6H_WH; h++) {
+                        float *c = acc[g][h];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && !defined(__HIP__)
+                        asm volatile("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
+                            "{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, "
+                            "{%0,%1,%2,%3,%4,%5,%6,%7};"
+                            : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]),
+                              "+f"(c[4]), "+f"(c[5]), "+f"(c[6]), "+f"(c[7])
+                            : "r"(a[g].x), "r"(a[g].y), "r"(b[h].x), "r"(b[h].y));
+#endif
+                    }
+            }
+            float wsv[I6H_WG][2], xs[I6H_WH][4];
+            for (int g = 0; g < I6H_WG; g++)
+                for (int u = 0; u < 2; u++) wsv[g][u] = ws_sh[drow[g][u]][gg];
+            for (int h = 0; h < I6H_WH; h++)
+                for (int u = 0; u < 4; u++) xs[h][u] = xd_sh[dcol[h][u]];
+            for (int g = 0; g < I6H_WG; g++)
+                for (int h = 0; h < I6H_WH; h++)
+                    for (int j = 0; j < 8; j++)
+                        sum[g][h][j] += acc[g][h][j] * wsv[g][(j >> 1) & 1] * xs[h][(j & 1) | (j >> 2) << 1];
+        }
+    }
+
+    for (int g = 0; g < I6H_WG; g++)
+        for (int h = 0; h < I6H_WH; h++)
+            for (int j = 0; j < 8; j++) {
+                int o = o0 + drow[g][(j >> 1) & 1], s = s0 + dcol[h][(j & 1) | (j >> 2) << 1];
+                if (o < O && s < S) y[(size_t)s * ys + o] = sum[g][h][j];
+            }
+}
+
+
 /* ---- FP16 tiled matmul kernel ----
  *
  * Loads each FP16 weight row into shared memory once per tile of F16_TILE_S
