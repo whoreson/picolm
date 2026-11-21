@@ -1,6 +1,7 @@
 /* test_q8_gemm_gpu: picolm_q8_q8_matmul_dp4a must match
  * picolm_q8_q8_matmul_tiled bit for bit (and both must be close to a
- * double-precision CPU reference). Random Q8_0 weights and activations over
+ * double-precision CPU reference). On Volta, picolm_q8_q8_matmul_hmma must
+ * be within 1e-6 of that reference (relative to the sum of |terms|). Random Q8_0 weights and activations over
  * shapes that hit every tail: K not a multiple of 1024, K > 8192 (slots with
  * two terms), O and S not multiples of the tiles.
  *
@@ -12,6 +13,7 @@
 #include <math.h>
 
 static uint32_t rng = 12345;
+static int g_hmma;   /* Volta: also test picolm_q8_q8_matmul_hmma */
 static uint32_t rnd(void) { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; return rng; }
 
 static uint16_t f32_to_f16(float f) {   /* normal range only, round toward zero */
@@ -33,6 +35,7 @@ static int run(int S, int I, int O) {
     float *xd = (float *)malloc((size_t)S * nb * sizeof(float));
     float *y0 = (float *)malloc((size_t)S * O * sizeof(float));
     float *y1 = (float *)malloc((size_t)S * O * sizeof(float));
+    float *y2 = (float *)calloc((size_t)S * O, sizeof(float));
 
     for (int o = 0; o < O; o++)
         for (int b = 0; b < nb; b++) {
@@ -59,9 +62,15 @@ static int run(int S, int I, int O) {
     picolm_q8_q8_matmul_dp4a<<<dim3((O + 7) / 8, (S + 7) / 8), 256>>>(
         dy, dxq, dxd, dw, S, I, O, row_bytes, O);
     cudaMemcpy(y1, dy, (size_t)S * O * sizeof(float), cudaMemcpyDeviceToHost);
+    if (g_hmma) {
+        cudaMemset(dy, 0xFF, (size_t)S * O * sizeof(float));
+        picolm_q8_q8_matmul_hmma<<<dim3((O + 63) / 64, (S + 127) / 128), 128>>>(
+            dy, dxq, dxd, dw, S, I, O, row_bytes, O);
+        cudaMemcpy(y2, dy, (size_t)S * O * sizeof(float), cudaMemcpyDeviceToHost);
+    }
     cudaError_t err = cudaDeviceSynchronize();
 
-    int diff = 0; double max_rel = 0.0;
+    int diff = 0; double max_rel = 0.0, max_rel2 = 0.0;
     for (int s = 0; s < S; s++)
         for (int o = 0; o < O; o++) {
             size_t k = (size_t)s * O + o;
@@ -76,13 +85,16 @@ static int run(int S, int I, int O) {
             }
             double rel = fabs(y1[k] - ref) / mag;   /* relative to sum |terms| */
             if (rel > max_rel) max_rel = rel;
+            rel = fabs(y2[k] - ref) / mag;
+            if (g_hmma && rel > max_rel2) max_rel2 = rel;
         }
-    printf("S=%-4d I=%-6d O=%-5d  differing=%d/%d  max_err_vs_cpu=%.1e  %s\n",
-           S, I, O, diff, S * O, max_rel,
-           err != cudaSuccess ? cudaGetErrorString(err) : (diff || max_rel > 1e-6) ? "FAIL" : "ok");
+    int fail = err != cudaSuccess || diff || max_rel > 1e-6 || max_rel2 > 1e-6;
+    printf("S=%-4d I=%-6d O=%-5d  differing=%d/%d  max_err_vs_cpu=%.1e  hmma=%.1e  %s\n",
+           S, I, O, diff, S * O, max_rel, max_rel2,
+           err != cudaSuccess ? cudaGetErrorString(err) : fail ? "FAIL" : "ok");
     cudaFree(dw); cudaFree(dxq); cudaFree(dxd); cudaFree(dy);
-    free(w); free(xq); free(xd); free(y0); free(y1);
-    return err != cudaSuccess || diff || max_rel > 1e-6;
+    free(w); free(xq); free(xd); free(y0); free(y1); free(y2);
+    return fail;
 }
 
 int main(void) {
@@ -90,9 +102,12 @@ int main(void) {
         {1, 32, 1}, {5, 96, 7}, {33, 4096, 13}, {64, 4096, 256}, {37, 5120, 129},
         {128, 14336, 64}, {19, 8192 + 160, 9}, {200, 1024, 4096}, {512, 4096, 1024},
     };
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, 0);
+    g_hmma = prop.major == 7 && prop.minor == 0;
     int fail = 0;
     for (size_t i = 0; i < sizeof shapes / sizeof shapes[0]; i++)
         fail |= run(shapes[i][0], shapes[i][1], shapes[i][2]);
-    printf(fail ? "FAILED\n" : "all bit-identical\n");
+    printf(fail ? "FAILED\n" : g_hmma ? "all bit-identical, hmma within 1e-6\n" : "all bit-identical\n");
     return fail;
 }

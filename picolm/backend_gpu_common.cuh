@@ -378,6 +378,8 @@ typedef struct {
      * has_imma: NVIDIA Turing+ (sm_80+) INT8 Tensor Cores (m16n8k32).
      *   Not available on HIP or Metal (no PTX). */
     int has_imma;
+    /* has_hmma: Volta (sm_70) fp16 Tensor Cores (mma.m8n8k4), for Q8_0 prefill. */
+    int has_hmma;
     float *x, *y, *gate, *up;
     size_t x_cap, y_cap, gate_cap, up_cap;
     float *host_x, *host_y;

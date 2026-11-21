@@ -83,6 +83,13 @@ static int picolm_gpu_no_sm_imma(void) {
 /* Q8_0 prefill without IMMA: the DP4A GEMM, unless PICOLM_NO_Q8_DP4A asks
  * for the old tiled kernel (same output, bit for bit). CUDA only: the
  * kernel is written for 32-lane warps. */
+/* PICOLM_NO_Q8_HMMA: on Volta, use the DP4A kernel instead of the tensor
+ * core one for Q8_0 prefill. */
+static int picolm_gpu_q8_hmma(void) {
+    static int cached = -1;
+    if (cached < 0) cached = !picolm_gpu_env_flag("PICOLM_NO_Q8_HMMA");
+    return cached;
+}
 static int picolm_gpu_q8_dp4a(void) {
 #ifdef __HIP__
     return 0;
@@ -282,6 +289,7 @@ int picolm_gpu_init(const int *devices, int count) {
         ctx->has_imma = 0;  /* HIP: no NVIDIA PTX IMMA support */
 #else
         ctx->has_imma = (prop.major >= 8);  /* NVIDIA: Turing+ sm_80 */
+        ctx->has_hmma = (prop.major == 7 && prop.minor == 0);  /* Volta */
 #endif
         if (!gpu_ok(gpuStreamCreateWithFlags(&ctx->stream,
 #ifdef __HIP__
@@ -954,6 +962,11 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
             dim3 grid((unsigned)((O + 7) / 8), (unsigned)((S + 15) / 16));
             picolm_q8_q8_matmul_imma<<<grid, 32, 0, ctx->stream>>>(
                 ctx->y, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, O);
+        } else if (S > 1 && t->row_bytes + 2048 <= 49152 && ctx->has_hmma && picolm_gpu_q8_hmma()) {
+            gpu_dispatch_print("matmul_hmma_host");
+            dim3 grid((unsigned)((O + 63) / 64), (unsigned)((S + 127) / 128));
+            picolm_q8_q8_matmul_hmma<<<grid, 128, 0, ctx->stream>>>(
+                ctx->y, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, O);
         } else if (S > 1 && t->row_bytes + 2048 <= 49152 && picolm_gpu_q8_dp4a()) {
             gpu_dispatch_print("matmul_dp4a_host");
             dim3 grid((unsigned)((O + 7) / 8), (unsigned)((S + 7) / 8));
@@ -1583,6 +1596,11 @@ matmul_dev_impl(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
             gpu_dispatch_print("matmul_imma_dev");
             dim3 grid((unsigned)((O + 7) / 8), (unsigned)((S + 15) / 16));
             picolm_q8_q8_matmul_imma<<<grid, 32, 0, ctx->stream>>>(
+                y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, ys);
+        } else if (S >= Q8_TILE_S && t->row_bytes + 2048 <= 49152 && ctx->has_hmma && picolm_gpu_q8_hmma()) {
+            gpu_dispatch_print("matmul_hmma_dev");
+            dim3 grid((unsigned)((O + 63) / 64), (unsigned)((S + 127) / 128));
+            picolm_q8_q8_matmul_hmma<<<grid, 128, 0, ctx->stream>>>(
                 y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, ys);
         } else if (S >= Q8_TILE_S && t->row_bytes + 2048 <= 49152 && picolm_gpu_q8_dp4a()) {
             gpu_dispatch_print("matmul_dp4a_dev");
@@ -2313,6 +2331,11 @@ static int imma_dev_q8(picolm_gpu_tensor_t *t, float *y_dev,
         gpu_dispatch_print("matmul_imma_dev");
         dim3 grid((unsigned)((O + 7) / 8), (unsigned)((S + 15) / 16));
         picolm_q8_q8_matmul_imma<<<grid, 32, 0, ctx->stream>>>(
+            y_dev, xq, xd, t->weights, S, I, O, (int)t->row_bytes, ys);
+    } else if (S >= Q8_TILE_S && t->row_bytes + 2048 <= 49152 && ctx->has_hmma && picolm_gpu_q8_hmma()) {
+        gpu_dispatch_print("matmul_hmma_dev");
+        dim3 grid((unsigned)((O + 63) / 64), (unsigned)((S + 127) / 128));
+        picolm_q8_q8_matmul_hmma<<<grid, 128, 0, ctx->stream>>>(
             y_dev, xq, xd, t->weights, S, I, O, (int)t->row_bytes, ys);
     } else if (S >= Q8_TILE_S && t->row_bytes + 2048 <= 49152 && picolm_gpu_q8_dp4a()) {
         gpu_dispatch_print("matmul_dp4a_dev");

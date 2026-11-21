@@ -1677,6 +1677,152 @@ picolm_q8_q8_matmul_dp4a(float *y, const int8_t *xq, const float *xd,
         }
 }
 
+/* ---- Q8_0 x Q8_0 GEMM on Volta tensor cores (mma.m8n8k4, f16 in, f32 acc) ----
+ *
+ * Volta has no int8 MMA, but int8 values are exact in fp16, their products
+ * are exact, and the 32-term dot product of one Q8_0 block (|sum| < 2^19)
+ * is exact in the f32 accumulator. So each block's integer dot product is
+ * computed on the tensor cores exactly, and only then scaled:
+ * sum += dot * wd * xd in f32, block by block, like the CPU.
+ *
+ * mma.m8n8k4 runs four independent 8x8x4 products, one per quad-pair
+ * qp = (lane >> 2) & 3. With r = (lane & 3) + 4 * (lane >> 4), a lane feeds
+ * row r of A and column r of B (k = 0..3), and gets D[j] at
+ *   row (lane & 1) + 2 * ((j >> 1) & 1) + 4 * (lane >> 4),
+ *   col (j & 1) + 2 * ((lane >> 1) & 1) + 4 * (j >> 2)
+ * (measured on a V100). Quad-pairs are laid out 2 x 2, so one instruction
+ * covers 16 rows x 16 tokens; a warp does Q8H_WG x Q8H_WH of those.
+ *
+ * Not bit-identical to the DP4A/tiled kernels (f32, not double, across
+ * blocks); max error vs a double CPU reference ~3e-7 of sum |terms|. */
+#define Q8H_TO 64   /* weight rows per thread block */
+#define Q8H_TS 128  /* tokens per thread block */
+#define Q8H_KB 2    /* Q8_0 blocks staged at a time */
+#define Q8H_WG 4    /* 16-row groups per warp: a warp does 64 rows x 32 tokens */
+#define Q8H_WH 2    /* 16-token groups per warp */
+#define Q8H_WR (Q8H_TO / (16 * Q8H_WG))          /* warps along rows */
+#define Q8H_THREADS (32 * Q8H_WR * (Q8H_TS / (16 * Q8H_WH)))  /* 128 */
+#define Q8H_LD (Q8H_KB * 32 + 4)  /* halves per staged row: 2 mod 32 words, no bank conflicts */
+
+/* Four int8 (one 32-bit word) to two exact half2: bias to 0..255, put each
+ * byte under the exponent of 1024.0 (0x64xx = 1024 + byte), subtract 1152. */
+__device__ static inline void q8h_cvt4(__half2 *dst, uint32_t v) {
+    v ^= 0x80808080u;
+    uint32_t lo = __byte_perm(v, 0x64646464u, 0x4140);
+    uint32_t hi = __byte_perm(v, 0x64646464u, 0x4342);
+    __half2 bias = __float2half2_rn(1152.0f);
+    dst[0] = __hsub2(*(__half2 *)&lo, bias);
+    dst[1] = __hsub2(*(__half2 *)&hi, bias);
+}
+
+__global__ void __launch_bounds__(Q8H_THREADS)
+picolm_q8_q8_matmul_hmma(float *y, const int8_t *xq, const float *xd,
+                         const void *weights,
+                         int S, int I, int O, int row_bytes, int y_stride) {
+    __shared__ __align__(16) __half w_sh[Q8H_TO][Q8H_LD];
+    __shared__ __align__(16) __half x_sh[Q8H_TS][Q8H_LD];
+    __shared__ float wd_sh[Q8H_KB][Q8H_TO];
+    __shared__ float xd_sh[Q8H_KB][Q8H_TS];
+
+    int tid = gpuThreadIdx_x, lane = tid & 31, warp = tid >> 5;
+    int o0 = gpuBlockIdx_x * Q8H_TO, s0 = gpuBlockIdx_y * Q8H_TS;
+    int ys = y_stride > 0 ? y_stride : O;
+    int n_blocks = I / 32;
+
+    int qp = (lane >> 2) & 3;
+    int r = (lane & 3) + 4 * (lane >> 4);                 /* A row / B col */
+    int wr = (warp % Q8H_WR) * 16 * Q8H_WG, wc = (warp / Q8H_WR) * 16 * Q8H_WH;  /* warp tile */
+    int arow[Q8H_WG], bcol[Q8H_WH];
+    for (int g = 0; g < Q8H_WG; g++) arow[g] = wr + 16 * g + 8 * (qp & 1) + r;
+    for (int h = 0; h < Q8H_WH; h++) bcol[h] = wc + 16 * h + 8 * (qp >> 1) + r;
+    int drow[Q8H_WG][2], dcol[Q8H_WH][4];   /* rows/tokens of this lane's D values */
+    for (int g = 0; g < Q8H_WG; g++)
+        for (int u = 0; u < 2; u++)
+            drow[g][u] = wr + 16 * g + 8 * (qp & 1) + (lane & 1) + 2 * u + 4 * (lane >> 4);
+    for (int h = 0; h < Q8H_WH; h++)
+        for (int u = 0; u < 4; u++)
+            dcol[h][u] = wc + 16 * h + 8 * (qp >> 1) + (u & 1) + 2 * ((lane >> 1) & 1) + 4 * (u >> 1);
+
+    float sum[Q8H_WG][Q8H_WH][8];
+    for (int g = 0; g < Q8H_WG; g++)
+        for (int h = 0; h < Q8H_WH; h++)
+            for (int j = 0; j < 8; j++) sum[g][h][j] = 0.0f;
+
+    for (int b0 = 0; b0 < n_blocks; b0 += Q8H_KB) {
+        /* Stage: one thread per (row or token, block); 2 x 256 units. */
+        for (int it = tid; it < (Q8H_TO + Q8H_TS) * Q8H_KB; it += Q8H_THREADS) {
+            int kb = it % Q8H_KB, rr = it / Q8H_KB, bi = b0 + kb;
+            uint32_t q[8];
+            float d = 0.0f;
+            if (rr < Q8H_TO) {
+                int o = o0 + rr;
+                if (o < O && bi < n_blocks) {
+                    const uint16_t *p = (const uint16_t *)((const uint8_t *)weights
+                        + (size_t)o * row_bytes + (size_t)bi * GPU_BLOCK_Q8_0_SIZE);
+                    d = gpu_fp16_to_fp32(p[0]);
+                    for (int i = 0; i < 8; i++) q[i] = (uint32_t)p[1 + 2 * i] | ((uint32_t)p[2 + 2 * i] << 16);
+                } else for (int i = 0; i < 8; i++) q[i] = 0;
+                wd_sh[kb][rr] = d;
+                for (int i = 0; i < 8; i++) q8h_cvt4((__half2 *)&w_sh[rr][kb * 32 + 4 * i], q[i]);
+            } else {
+                int ls = rr - Q8H_TO, s = s0 + ls;
+                if (s < S && bi < n_blocks) {
+                    const int4 *p = (const int4 *)(xq + (size_t)s * I + (size_t)bi * 32);
+                    ((int4 *)q)[0] = p[0]; ((int4 *)q)[1] = p[1];
+                    d = xd[(size_t)s * n_blocks + bi];
+                } else for (int i = 0; i < 8; i++) q[i] = 0;
+                xd_sh[kb][ls] = d;
+                for (int i = 0; i < 8; i++) q8h_cvt4((__half2 *)&x_sh[ls][kb * 32 + 4 * i], q[i]);
+            }
+        }
+        gpuSyncthreads();
+
+        for (int kb = 0; kb < Q8H_KB; kb++) {
+            float acc[Q8H_WG][Q8H_WH][8];
+            for (int g = 0; g < Q8H_WG; g++)
+                for (int h = 0; h < Q8H_WH; h++)
+                    for (int j = 0; j < 8; j++) acc[g][h][j] = 0.0f;
+#pragma unroll
+            for (int k = kb * 32; k < kb * 32 + 32; k += 4) {
+                uint2 a[Q8H_WG], b[Q8H_WH];
+                for (int g = 0; g < Q8H_WG; g++) a[g] = *(const uint2 *)&w_sh[arow[g]][k];
+                for (int h = 0; h < Q8H_WH; h++) b[h] = *(const uint2 *)&x_sh[bcol[h]][k];
+                for (int g = 0; g < Q8H_WG; g++)
+                    for (int h = 0; h < Q8H_WH; h++) {
+                        float *c = acc[g][h];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && !defined(__HIP__)
+                        asm volatile("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
+                            "{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, "
+                            "{%0,%1,%2,%3,%4,%5,%6,%7};"
+                            : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]),
+                              "+f"(c[4]), "+f"(c[5]), "+f"(c[6]), "+f"(c[7])
+                            : "r"(a[g].x), "r"(a[g].y), "r"(b[h].x), "r"(b[h].y));
+#endif
+                    }
+            }
+            /* acc holds exact integer dot products; scale them in. D[j] sits
+             * at row drow[g][(j >> 1) & 1], token dcol[h][(j & 1) | (j >> 2) << 1]. */
+            float wd[Q8H_WG][2], xs[Q8H_WH][4];
+            for (int g = 0; g < Q8H_WG; g++)
+                for (int u = 0; u < 2; u++) wd[g][u] = wd_sh[kb][drow[g][u]];
+            for (int h = 0; h < Q8H_WH; h++)
+                for (int u = 0; u < 4; u++) xs[h][u] = xd_sh[kb][dcol[h][u]];
+            for (int g = 0; g < Q8H_WG; g++)
+                for (int h = 0; h < Q8H_WH; h++)
+                    for (int j = 0; j < 8; j++)
+                        sum[g][h][j] += acc[g][h][j] * (wd[g][(j >> 1) & 1] * xs[h][(j & 1) | (j >> 2) << 1]);
+        }
+        gpuSyncthreads();
+    }
+
+    for (int g = 0; g < Q8H_WG; g++)
+        for (int h = 0; h < Q8H_WH; h++)
+            for (int j = 0; j < 8; j++) {
+                int o = o0 + drow[g][(j >> 1) & 1], s = s0 + dcol[h][(j & 1) | (j >> 2) << 1];
+                if (o < O && s < S) y[(size_t)s * ys + o] = sum[g][h][j];
+            }
+}
+
 /* ---- FP16 tiled matmul kernel ----
  *
  * Loads each FP16 weight row into shared memory once per tile of F16_TILE_S
