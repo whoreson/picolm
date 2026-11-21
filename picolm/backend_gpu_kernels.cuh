@@ -290,13 +290,13 @@ __global__ void picolm_gpu_attention_decode_kernel( float *xb_out, const float *
 /* Decode attention, warp per key: split-K partials for the merge kernel.
  * Launches picolm_gpu_attention_decode_warp_kernel<G, DPL> on grid
  * (n_kv_heads, n_splits), 128 threads; 0 if kv_mul > 8 or head_dim is not
- * 64/128/256. F16 KV cache only. */
+ * 64/128/256. F16, Q8_0 or Q4_0 KV cache. */
 int picolm_gpu_attention_decode_warp_launch(dim3 grid, gpuStream_t stream,
     float *partial_max, float *partial_sum, float *partial_acc, const float *q_dev,
     const uint16_t *kv_k, const uint16_t *kv_v, int layer_ordinal, int pos,
     int n_heads, int n_kv_heads, int head_dim, int max_seq_len,
     size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes, size_t kv_head_stride_v_bytes,
-    int n_splits, int chunk_size, int n_swa);
+    int n_splits, int chunk_size, int n_swa, int kv_type);
 
 /* Partial state layout (flat float buffer, sized by the host wrapper):
  *   partial_max: [n_heads][n_splits]
@@ -338,12 +338,12 @@ __global__ void picolm_gpu_attention_prefill_kernel( float *xb_out,  const float
  * for the correctness argument (why the two reductions are bit-identical).
  * Legacy block-wide-reduce kernel available via PICOLM_ATTN_SLOW_SCALAR=1. */
 #define ATTN_WARPGRP_SIZE 32
-/* Volta tensor-core attention prefill: head_dim 128, F16 KV cache.
+/* Volta tensor-core attention prefill: head_dim 128, F16/Q8_0/Q4_0 KV cache.
  * grid (n_heads, (n_tokens+63)/64), 128 threads, static shared memory. */
 __global__ void picolm_gpu_attention_prefill_hmma_kernel(
     float *xb_out, const float *q_dev, const uint16_t *kv_k, const uint16_t *kv_v,
     int layer_ordinal, int start_pos, int n_tokens, int n_heads, int n_kv_heads, int max_seq_len,
-    size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes, size_t kv_head_stride_v_bytes, int n_swa);
+    size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes, size_t kv_head_stride_v_bytes, int n_swa, int kv_type);
 __global__ void picolm_gpu_attention_prefill_warpgrp_kernel( float *xb_out,  const float *q_dev,  const uint16_t *kv_k,  const uint16_t *kv_v,  int layer_ordinal, int start_pos, int n_tokens, int n_heads, int n_kv_heads, int head_dim, int max_seq_len, size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes, size_t kv_head_stride_v_bytes, int tile_q, int n_swa, int kv_type);
 
 /* dot2 variant: same signature, only defined when FAST_FP16_AVAILABLE

@@ -722,27 +722,9 @@ static void kv_strides_for(int device, int is_k, int n_kv_heads, int head_dim,
  * exactly -- no regression risk for short contexts) vs split-K (grid=
  * n_kv_heads*n_splits + a merge pass) based on how many KV positions
  * there are to walk. xb_dev/q_dev must already be device pointers. */
-/* Decode attention on picolm_gpu_attention_decode_warp_kernel: F16 KV cache,
- * head_dim 64/128/256, kv_mul <= 8, CUDA (32-lane warps).
- * PICOLM_NO_ATTN_DECODE_WARP=1 keeps the single-pass/split kernels.
- *
- * The kv_type test is a HARD REQUIREMENT, not a conservative gate:
- * picolm_gpu_attention_decode_warp_kernel takes the cache as
- * `const uint16_t *` and casts straight to `__half` with no dequantisation
- * step at all (it never even receives kv_type). Pointing it at a q4_0 or q8_0
- * cache would read 2 bytes where 18/34 are packed and produce garbage, not a
- * slower answer.
- *
- * TODO(kv-quant): the same is true of picolm_gpu_attention_prefill_hmma_kernel
- * (Volta prefill attention), which likewise takes `const uint16_t *kv_k/v` and
- * assumes F16. So on Volta, QUANTISED KV CACHES (-ctk q4_0/q8_0) get neither
- * the tensor-core prefill attention nor the warp decode attention, and fall
- * back to the scalar/split kernels -- which is the configuration that matters
- * for long context, since q4_0 KV is what makes 120k fit in 24 GB. Reaching
- * parity there needs both kernels taught the kv_row_dequant()/kv_row_load_f16()
- * path the other six attention kernels already use (see
- * backend_gpu_dequant.cuh), plus a kv_type argument plumbed through.
- * Not testable here: no Volta hardware. */
+/* Decode attention on picolm_gpu_attention_decode_warp_kernel: F16, Q8_0 or Q4_0
+ * KV cache, head_dim 64/128/256, kv_mul <= 8, CUDA (32-lane warps).
+ * PICOLM_NO_ATTN_DECODE_WARP=1 keeps the single-pass/split kernels. */
 static int attn_decode_warp_ok(int head_dim, int kv_mul, int kv_type) {
 #ifdef __HIP__
     (void)head_dim; (void)kv_mul; (void)kv_type;
@@ -750,8 +732,7 @@ static int attn_decode_warp_ok(int head_dim, int kv_mul, int kv_type) {
 #else
     static int off = -1;
     if (off < 0) off = getenv("PICOLM_NO_ATTN_DECODE_WARP") ? 1 : 0;
-    /* kv_type 0 == F16; the warp kernel has no quantised-KV read path. */
-    return !off && kv_type == 0 && (head_dim == 64 || head_dim == 128 || head_dim == 256) && kv_mul <= 8;
+    return !off && kv_type >= 0 && kv_type <= 2 && (head_dim == 64 || head_dim == 128 || head_dim == 256) && kv_mul <= 8;
 #endif
 }
 
@@ -851,7 +832,7 @@ attn_decode_dispatch(float *xb_dev, const float *q_dev,
             partial_max, partial_sum, partial_acc,
             q_dev, g_kv_k_dev[device], g_kv_v_dev[device],
             layer_ordinal, pos, n_heads, n_kv_heads, head_dim, max_seq_len,
-            kv_pos_stride_bytes, kv_head_stride_bytes, kv_head_stride_v_bytes, n_splits, chunk_size, n_swa);
+            kv_pos_stride_bytes, kv_head_stride_bytes, kv_head_stride_v_bytes, n_splits, chunk_size, n_swa, kv_type);
     } else
     picolm_gpu_attention_decode_split_kernel<<<grid_split, 256, (unsigned)shared_bytes, ctx->stream>>>(
         partial_max, partial_sum, partial_acc,
@@ -1017,27 +998,12 @@ ensure_attn_fa2_shared_mem(size_t bytes) {
  * no reduce_sh buffer (reduction is warp-local now), so this is 1KB+8B
  * smaller for the same head_dim/tile_q -- more headroom before the
  * dynamic-shared-memory opt-in kicks in. */
-/* Volta tensor-core attention prefill: has_hmma, head_dim 128, F16 KV cache.
- * PICOLM_NO_ATTN_HMMA=1 (or PICOLM_FORCE_SCALAR_ATTN) keeps the scalar kernels.
- *
- * The kv_type test is a HARD REQUIREMENT: picolm_gpu_attention_prefill_hmma_kernel
- * takes `const uint16_t *kv_k/v` and casts to __half, with no dequantisation and
- * no kv_type parameter at all.
- *
- * TODO(kv-quant): QUANTISED KV IS UNSUPPORTED HERE. With -ctk q4_0/q8_0 on
- * Volta this declines silently and the model runs the scalar prefill attention
- * instead -- which is precisely the configuration long context needs, since a
- * quantised cache is what makes 120k tokens fit in 24 GB of VRAM. Both Volta
- * kernels (this one and picolm_gpu_attention_decode_warp_kernel) need the same
- * kv_row_dequant()/kv_row_load_f16() treatment the other six attention kernels
- * already have (backend_gpu_dequant.cuh), plus a kv_type argument. Until then
- * Volta + quantised KV is correct but leaves both fast paths on the table.
- * Cannot be exercised or verified here: no Volta hardware available. */
+/* Volta tensor-core attention prefill: has_hmma, head_dim 128, F16/Q8_0/Q4_0 KV
+ * cache. PICOLM_NO_ATTN_HMMA=1 (or PICOLM_FORCE_SCALAR_ATTN) keeps the scalar kernels. */
 static int picolm_gpu_attn_hmma(const gpu_device_ctx_t *ctx, int n_tokens, int head_dim, int kv_type) {
     static int off = -1;
     if (off < 0) off = getenv("PICOLM_NO_ATTN_HMMA") || getenv("PICOLM_FORCE_SCALAR_ATTN");
-    /* kv_type 0 == F16; the HMMA prefill kernel has no quantised-KV read path. */
-    return !off && ctx->has_hmma && n_tokens >= 64 && head_dim == 128 && kv_type == 0;
+    return !off && ctx->has_hmma && n_tokens >= 64 && head_dim == 128 && kv_type >= 0 && kv_type <= 2;
 }
 
 static size_t
@@ -1176,7 +1142,7 @@ picolm_gpu_attention_prefill(float *xb_out, const float *q_host,
             ctx->y, ctx->x,
             g_kv_k_dev[device], g_kv_v_dev[device],
             layer_ordinal, start_pos, n_tokens, n_heads, n_kv_heads, max_seq_len,
-            kv_pos_stride_bytes, kv_head_stride_bytes, kv_head_stride_v_bytes, n_swa);
+            kv_pos_stride_bytes, kv_head_stride_bytes, kv_head_stride_v_bytes, n_swa, kv_type);
         if (!gpu_ok(gpuGetLastError(), "attn prefill hmma (host)")) return 0;
         use_fa2 = 1;   /* done: skip the scalar kernels below */
     }
@@ -1316,7 +1282,7 @@ attn_prefill_dev_impl(float *xb_out_dev, const float *q_dev,
             xb_out_dev, q_dev,
             g_kv_k_dev[device], g_kv_v_dev[device],
             layer_ordinal, start_pos, n_tokens, n_heads, n_kv_heads, max_seq_len,
-            kv_pos_stride_bytes, kv_head_stride_bytes, kv_head_stride_v_bytes, n_swa);
+            kv_pos_stride_bytes, kv_head_stride_bytes, kv_head_stride_v_bytes, n_swa, kv_type);
         if (!gpu_ok(gpuGetLastError(), "attn prefill hmma (dev)")) return 0;
         return 1;
     }
