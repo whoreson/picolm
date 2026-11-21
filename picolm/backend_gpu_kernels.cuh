@@ -328,6 +328,12 @@ __global__ void picolm_gpu_attention_prefill_kernel( float *xb_out,  const float
  * for the correctness argument (why the two reductions are bit-identical).
  * Legacy block-wide-reduce kernel available via PICOLM_ATTN_SLOW_SCALAR=1. */
 #define ATTN_WARPGRP_SIZE 32
+/* Volta tensor-core attention prefill: head_dim 128, F16 KV cache.
+ * grid (n_heads, (n_tokens+63)/64), 128 threads, static shared memory. */
+__global__ void picolm_gpu_attention_prefill_hmma_kernel(
+    float *xb_out, const float *q_dev, const uint16_t *kv_k, const uint16_t *kv_v,
+    int layer_ordinal, int start_pos, int n_tokens, int n_heads, int n_kv_heads, int max_seq_len,
+    size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes, size_t kv_head_stride_v_bytes, int n_swa);
 __global__ void picolm_gpu_attention_prefill_warpgrp_kernel( float *xb_out,  const float *q_dev,  const uint16_t *kv_k,  const uint16_t *kv_v,  int layer_ordinal, int start_pos, int n_tokens, int n_heads, int n_kv_heads, int head_dim, int max_seq_len, size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes, size_t kv_head_stride_v_bytes, int tile_q, int n_swa, int kv_type);
 
 /* dot2 variant: same signature, only defined when FAST_FP16_AVAILABLE

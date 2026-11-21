@@ -5868,6 +5868,166 @@ picolm_gpu_attention_prefill_kernel(
     }
 }
 
+/* ---- Volta tensor-core attention prefill (FlashAttention-2 style) ----
+ *
+ * For has_hmma (sm_70) GPUs, head_dim 128, F16 KV cache. One thread block
+ * is one query head x 64 queries; each of the 4 warps owns 16 queries and
+ * walks the KV positions in tiles of 32:
+ *   S = Q K^T on the tensor cores (fp16 in, f32 out), scaled and masked
+ *   (causal + sliding window); online softmax per row over the whole tile
+ *   (one rescale per tile, not per key); P = exp(S - max) to fp16;
+ *   O += P V on the tensor cores.
+ * mma.m8n8k4 fragment layout: see picolm_q8_q8_matmul_hmma.
+ *
+ * Not bit-identical to the scalar kernels (fp16 Q and P, tile-wise softmax),
+ * the same class of rounding as picolm_gpu_attention_prefill_fa2_kernel. */
+#define FAV_D   128             /* head_dim */
+#define FAV_TQ  64              /* queries per thread block (4 warps x 16) */
+#define FAV_TK  32              /* KV positions per tile */
+#define FAV_LDQ (FAV_D + 4)     /* halves per row: 66 words, no bank conflicts */
+#define FAV_LDV (FAV_TK + 4)    /* halves per transposed V row: 18 words */
+
+__device__ static inline void fav_mma(float *c, uint2 a, uint2 b) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && !defined(__HIP__)
+    asm volatile("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, {%0,%1,%2,%3,%4,%5,%6,%7};"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]), "+f"(c[4]), "+f"(c[5]), "+f"(c[6]), "+f"(c[7])
+        : "r"(a.x), "r"(a.y), "r"(b.x), "r"(b.y));
+#endif
+}
+
+__global__ void __launch_bounds__(128)
+picolm_gpu_attention_prefill_hmma_kernel(
+        float *xb_out, const float *q_dev,
+        const uint16_t *kv_k, const uint16_t *kv_v,
+        int layer_ordinal, int start_pos, int n_tokens,
+        int n_heads, int n_kv_heads, int max_seq_len,
+        size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes, size_t kv_head_stride_v_bytes,
+        int n_swa)
+{
+    __shared__ __align__(16) __half q_sh[FAV_TQ][FAV_LDQ];
+    __shared__ __align__(16) __half k_sh[FAV_TK][FAV_LDQ];
+    __shared__ __align__(16) __half vt_sh[FAV_D][FAV_LDV];
+    __shared__ __align__(16) __half p_sh[4][16][FAV_LDV];
+
+    int h = gpuBlockIdx_x, q0 = gpuBlockIdx_y * FAV_TQ;
+    int tid = gpuThreadIdx_x, lane = tid & 31, warp = tid >> 5;
+    int kv_h = h / (n_heads / n_kv_heads);
+    float scale = 1.0f / sqrtf((float)FAV_D);
+    size_t layer_base = (size_t)layer_ordinal * max_seq_len * (kv_pos_stride_bytes / 2);
+    const uint16_t *kbase = kv_k + layer_base + (size_t)kv_h * (kv_head_stride_bytes / 2);
+    const uint16_t *vbase = kv_v + layer_base + (size_t)kv_h * (kv_head_stride_v_bytes / 2);
+    size_t pos_stride = kv_pos_stride_bytes / 2;
+
+    int qp = (lane >> 2) & 3;
+    int r = (lane & 3) + 4 * (lane >> 4);                  /* A row / B col */
+    int arow = 8 * (qp & 1) + r;                           /* within the warp's 16 rows */
+    int drow[2];                                           /* rows of this lane's D */
+    for (int u = 0; u < 2; u++) drow[u] = 8 * (qp & 1) + (lane & 1) + 2 * u + 4 * (lane >> 4);
+    int dcol[4];                                           /* D columns within a 16-wide group */
+    for (int u = 0; u < 4; u++) dcol[u] = 8 * (qp >> 1) + (u & 1) + 2 * ((lane >> 1) & 1) + 4 * (u >> 1);
+#define FAV_COL(j) dcol[((j) & 1) | ((j) >> 2) << 1]
+
+    for (int i = tid; i < FAV_TQ * FAV_D; i += 128) {
+        int qi = i / FAV_D, d = i % FAV_D, q = q0 + qi;
+        float v = q < n_tokens ? q_dev[((size_t)q * n_heads + h) * FAV_D + d] : 0.0f;
+        q_sh[qi][d] = __float2half(v);
+    }
+
+    float o[FAV_D / 16][8], m[2], l[2];
+    for (int n = 0; n < FAV_D / 16; n++)
+        for (int j = 0; j < 8; j++) o[n][j] = 0.0f;
+    for (int u = 0; u < 2; u++) { m[u] = -INFINITY; l[u] = 0.0f; }
+    int qpos[2];
+    for (int u = 0; u < 2; u++) qpos[u] = start_pos + q0 + warp * 16 + drow[u];
+
+    int kv_end = min(start_pos + n_tokens, start_pos + q0 + FAV_TQ);
+    int kv_begin = n_swa > 0 ? max(0, start_pos + q0 - n_swa + 1) / FAV_TK * FAV_TK : 0;
+    for (int t0 = kv_begin; t0 < kv_end; t0 += FAV_TK) {
+        gpuSyncthreads();   /* previous tile's k_sh/vt_sh reads are done */
+        for (int i = tid; i < FAV_TK * FAV_D / 8; i += 128) {
+            int t = i / (FAV_D / 8), d = (i % (FAV_D / 8)) * 8;
+            uint4 kq = make_uint4(0, 0, 0, 0), vq = kq;
+            if (t0 + t < kv_end) {
+                kq = *(const uint4 *)(kbase + (size_t)(t0 + t) * pos_stride + d);
+                vq = *(const uint4 *)(vbase + (size_t)(t0 + t) * pos_stride + d);
+            }
+            *(uint2 *)&k_sh[t][d] = make_uint2(kq.x, kq.y);
+            *(uint2 *)&k_sh[t][d + 4] = make_uint2(kq.z, kq.w);
+            const __half *vh = (const __half *)&vq;
+            for (int e = 0; e < 8; e++) vt_sh[d + e][t] = vh[e];
+        }
+        gpuSyncthreads();
+
+        /* S = Q K^T for this warp's 16 queries x 32 keys. */
+        float s[FAV_TK / 16][8];
+        for (int n = 0; n < FAV_TK / 16; n++)
+            for (int j = 0; j < 8; j++) s[n][j] = 0.0f;
+#pragma unroll 8
+        for (int k = 0; k < FAV_D; k += 4) {
+            uint2 a = *(const uint2 *)&q_sh[warp * 16 + arow][k];
+            for (int n = 0; n < FAV_TK / 16; n++)
+                fav_mma(s[n], a, *(const uint2 *)&k_sh[16 * n + 8 * (qp >> 1) + r][k]);
+        }
+
+        /* Scale, mask, row max. A row is spread over the 4 lanes that
+         * differ in lane bits 1 and 3. */
+        float mt[2] = {-INFINITY, -INFINITY};
+        for (int n = 0; n < FAV_TK / 16; n++)
+            for (int j = 0; j < 8; j++) {
+                int u = (j >> 1) & 1, key = t0 + 16 * n + FAV_COL(j);
+                float v = s[n][j] * scale;
+                if (key > qpos[u] || key >= kv_end || (n_swa > 0 && key < qpos[u] - n_swa + 1)) v = -INFINITY;
+                s[n][j] = v;
+                mt[u] = fmaxf(mt[u], v);
+            }
+        float alpha[2], mn[2], ls[2] = {0.0f, 0.0f};
+        for (int u = 0; u < 2; u++) {
+            mt[u] = fmaxf(mt[u], gpuShflXorSync(0xFFFFFFFFu, mt[u], 2));
+            mt[u] = fmaxf(mt[u], gpuShflXorSync(0xFFFFFFFFu, mt[u], 8));
+            mn[u] = fmaxf(m[u], mt[u]);
+            alpha[u] = mn[u] == -INFINITY ? 0.0f : expf(m[u] - mn[u]);
+            m[u] = mn[u];
+        }
+        /* P = exp(S - max) as fp16 into this warp's p_sh, for the A operand. */
+        for (int n = 0; n < FAV_TK / 16; n++)
+            for (int j = 0; j < 8; j++) {
+                int u = (j >> 1) & 1;
+                float p = mn[u] == -INFINITY ? 0.0f : expf(s[n][j] - mn[u]);
+                ls[u] += p;
+                p_sh[warp][drow[u]][16 * n + FAV_COL(j)] = __float2half(p);
+            }
+        for (int u = 0; u < 2; u++) {
+            ls[u] += gpuShflXorSync(0xFFFFFFFFu, ls[u], 2);
+            ls[u] += gpuShflXorSync(0xFFFFFFFFu, ls[u], 8);
+            l[u] = l[u] * alpha[u] + ls[u];
+        }
+        for (int n = 0; n < FAV_D / 16; n++)
+            for (int j = 0; j < 8; j++) o[n][j] *= alpha[(j >> 1) & 1];
+        __syncwarp();
+
+        /* O += P V. */
+#pragma unroll
+        for (int k = 0; k < FAV_TK; k += 4) {
+            uint2 a = *(const uint2 *)&p_sh[warp][arow][k];
+            for (int n = 0; n < FAV_D / 16; n++)
+                fav_mma(o[n], a, *(const uint2 *)&vt_sh[16 * n + 8 * (qp >> 1) + r][k]);
+        }
+        __syncwarp();   /* p_sh is rewritten next tile */
+    }
+
+    for (int u = 0; u < 2; u++) {
+        int q = q0 + warp * 16 + drow[u];
+        if (q >= n_tokens) continue;
+        float inv = l[u] > 0.0f ? 1.0f / l[u] : 0.0f;
+        float *out = xb_out + ((size_t)q * n_heads + h) * FAV_D;
+        for (int n = 0; n < FAV_D / 16; n++)
+            for (int j = 0; j < 8; j++)
+                if (((j >> 1) & 1) == u) out[16 * n + FAV_COL(j)] = o[n][j] * inv;
+    }
+#undef FAV_COL
+}
+
 /* ---- Broadcast lane 0's value to every lane in a `width`-wide subgroup.
  * Used below to replace the old kernel's "thread 0 decides -> shared
  * scalar -> syncthreads -> everyone reads" pattern with a register-only

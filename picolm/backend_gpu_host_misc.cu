@@ -947,6 +947,14 @@ ensure_attn_fa2_shared_mem(size_t bytes) {
  * no reduce_sh buffer (reduction is warp-local now), so this is 1KB+8B
  * smaller for the same head_dim/tile_q -- more headroom before the
  * dynamic-shared-memory opt-in kicks in. */
+/* Volta tensor-core attention prefill: has_hmma, head_dim 128, F16 KV cache.
+ * PICOLM_NO_ATTN_HMMA=1 (or PICOLM_FORCE_SCALAR_ATTN) keeps the scalar kernels. */
+static int picolm_gpu_attn_hmma(const gpu_device_ctx_t *ctx, int n_tokens, int head_dim, int kv_type) {
+    static int off = -1;
+    if (off < 0) off = getenv("PICOLM_NO_ATTN_HMMA") || getenv("PICOLM_FORCE_SCALAR_ATTN");
+    return !off && ctx->has_hmma && n_tokens >= 64 && head_dim == 128 && kv_type == 0;
+}
+
 static size_t
 attn_prefill_warpgrp_shared_bytes(int head_dim, int tile_q) {
     /* Q tile (FP16) + K tile (FP16) + V tile (FP16) + acc (FP32) + max/sum (FP32) */
@@ -1076,6 +1084,18 @@ picolm_gpu_attention_prefill(float *xb_out, const float *q_host,
         }
     }
 
+    if (!use_fa2 && picolm_gpu_attn_hmma(ctx, n_tokens, head_dim, kv_type)) {
+        gpu_dispatch_print("attn_prefill_hmma_host");
+        dim3 grid((unsigned)n_heads, (unsigned)((n_tokens + 63) / 64), 1);
+        picolm_gpu_attention_prefill_hmma_kernel<<<grid, 128, 0, ctx->stream>>>(
+            ctx->y, ctx->x,
+            g_kv_k_dev[device], g_kv_v_dev[device],
+            layer_ordinal, start_pos, n_tokens, n_heads, n_kv_heads, max_seq_len,
+            kv_pos_stride_bytes, kv_head_stride_bytes, kv_head_stride_v_bytes, n_swa);
+        if (!gpu_ok(gpuGetLastError(), "attn prefill hmma (host)")) return 0;
+        use_fa2 = 1;   /* done: skip the scalar kernels below */
+    }
+
     /* TODO(perf, head_dim=256): on NVIDIA IMMA GPUs, the warpgrp path below
      * is pure scalar F32 and does not use tensor cores. For Qwen3.5/3.6
      * (head_dim=256), FA2 falls through here because its shared memory
@@ -1202,6 +1222,18 @@ picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
             if (!gpu_ok(gpuGetLastError(), "attn prefill fa2 (dev)")) return 0;
             return 1;
         }
+    }
+
+    if (picolm_gpu_attn_hmma(ctx, n_tokens, head_dim, kv_type)) {
+        gpu_dispatch_print("attn_prefill_hmma_dev");
+        dim3 grid((unsigned)n_heads, (unsigned)((n_tokens + 63) / 64), 1);
+        picolm_gpu_attention_prefill_hmma_kernel<<<grid, 128, 0, ctx->stream>>>(
+            xb_out_dev, q_dev,
+            g_kv_k_dev[device], g_kv_v_dev[device],
+            layer_ordinal, start_pos, n_tokens, n_heads, n_kv_heads, max_seq_len,
+            kv_pos_stride_bytes, kv_head_stride_bytes, kv_head_stride_v_bytes, n_swa);
+        if (!gpu_ok(gpuGetLastError(), "attn prefill hmma (dev)")) return 0;
+        return 1;
     }
 
     int tile_q = ATTN_TILE_Q;
