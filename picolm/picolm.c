@@ -329,6 +329,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "\nGeneration options:\n");
     fprintf(stderr, "  -p <prompt>    Input prompt (or pipe via stdin)\n");
     fprintf(stderr, "  -pf <prompt>   Like -p, but wraps prompt in model-appropriate chat template\n");
+    fprintf(stderr, "  --prompt-file <path>  Read the prompt from a file (for prompts too long for argv)\n");
     fprintf(stderr, "  -n <int>       Max tokens to generate (default: 256)\n");
     fprintf(stderr, "  -t <float>     Temperature (default: 0.8, 0=greedy)\n");
     fprintf(stderr, "  -k <float>     Top-p / nucleus sampling (default: 0.9)\n");
@@ -1518,6 +1519,32 @@ int main(int argc, char **argv) {
             if (!prompt_buf) { fprintf(stderr, "strdup failed\n"); return 1; }
 #endif
             unescape_prompt(prompt_buf);
+            prompt = prompt_buf;
+        } else if (strcmp(argv[i], "--prompt-file") == 0 && i + 1 < argc) {
+            /* Read the prompt from a file. Needed because a long-context
+             * benchmark prompt (tens of KB) exceeds the Windows/MSYS argument
+             * limit, which fails as "Argument list too long" from the shell
+             * before PicoLM ever starts. */
+            const char *pf_path = argv[++i];
+            FILE *pf = fopen(pf_path, "rb");
+            if (!pf) { fprintf(stderr, "ERROR: cannot open prompt file '%s'\n", pf_path); return 1; }
+            size_t cap = 1 << 16, len = 0;
+            char *buf = (char *)malloc(cap);
+            if (!buf) { fclose(pf); fprintf(stderr, "OOM reading prompt file\n"); return 1; }
+            for (;;) {
+                if (len + 4096 + 1 > cap) {
+                    size_t ncap = cap * 2;
+                    char *nb = (char *)realloc(buf, ncap);
+                    if (!nb) { free(buf); fclose(pf); fprintf(stderr, "OOM reading prompt file\n"); return 1; }
+                    buf = nb; cap = ncap;
+                }
+                size_t got = fread(buf + len, 1, 4096, pf);
+                len += got;
+                if (got < 4096) break;
+            }
+            fclose(pf);
+            buf[len] = '\0';
+            prompt_buf = buf;
             prompt = prompt_buf;
         } else if (strcmp(argv[i], "-pf") == 0 && i + 1 < argc) {
             prompt_flag_f = 1;
