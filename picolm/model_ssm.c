@@ -6795,7 +6795,7 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
         }
         if (n_attn_ord > 0) {
             picolm_gpu_kv_flush_to_cpu(s->key_cache, s->val_cache,
-                                            n_attn_ord, c->max_seq_len, n_tokens,
+                                            n_attn_ord, c->max_seq_len, start_pos + n_tokens,
                                             s->kv_row_size_k, s->kv_row_size_v,
                                             gpu_dev);
         }

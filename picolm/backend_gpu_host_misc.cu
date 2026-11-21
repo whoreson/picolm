@@ -2036,23 +2036,25 @@ picolm_gpu_pipeline_logits_alloc(size_t bytes, int device) {
     return 1;
 }
 
-/* KV cache flush to CPU -- no-op on CUDA/HIP (KV cache IS CPU memory). */
+/* KV cache flush to CPU: copy positions [0, n_pos) of every layer
+ * ([layer][pos] rows, layers max_seq rows apart). n_pos outside 1..max_seq
+ * copies the whole cache. This used to copy all max_seq rows every time:
+ * 1.5 GB per prefill for an 11B model at 8K context. */
 extern "C" int
 picolm_gpu_kv_flush_to_cpu(uint8_t *cpu_k, uint8_t *cpu_v,
     int n_attn_ord, int max_seq, int n_pos,
     size_t row_sz_k, size_t row_sz_v, int device) {
-    (void)n_pos;
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!ctx || !select_ctx(ctx)) return 0;
     if (!g_kv_k_dev[device] || !g_kv_v_dev[device]) return 0;
     if (!cpu_k || !cpu_v) return 0;
-    size_t flush_bytes_k = (size_t)n_attn_ord * (size_t)max_seq * row_sz_k;
-    size_t flush_bytes_v = (size_t)n_attn_ord * (size_t)max_seq * row_sz_v;
-    if (!gpu_ok(gpuMemcpy(cpu_k, g_kv_k_dev[device], flush_bytes_k, gpuMemcpyDeviceToHost),
-                "kv flush K D2H")) return 0;
-    if (!gpu_ok(gpuMemcpy(cpu_v, g_kv_v_dev[device], flush_bytes_v, gpuMemcpyDeviceToHost),
-                "kv flush V D2H")) return 0;
-    return 1;
+    if (n_pos < 1 || n_pos > max_seq) n_pos = max_seq;
+    /* One strided copy per cache: n_attn_ord rows of n_pos * row_sz bytes,
+     * max_seq * row_sz apart on both sides. */
+    return gpu_ok(gpuMemcpy2D(cpu_k, (size_t)max_seq * row_sz_k, g_kv_k_dev[device], (size_t)max_seq * row_sz_k,
+                              (size_t)n_pos * row_sz_k, (size_t)n_attn_ord, gpuMemcpyDeviceToHost), "kv flush K D2H") &&
+           gpu_ok(gpuMemcpy2D(cpu_v, (size_t)max_seq * row_sz_v, g_kv_v_dev[device], (size_t)max_seq * row_sz_v,
+                              (size_t)n_pos * row_sz_v, (size_t)n_attn_ord, gpuMemcpyDeviceToHost), "kv flush V D2H");
 }
 
 /* Upload CPU KV cache to GPU KV cache (H2D).

@@ -64,6 +64,7 @@
 #define gpuMalloc hipMalloc
 #define gpuFree hipFree
 #define gpuMemcpy hipMemcpy
+#define gpuMemcpy2D hipMemcpy2D
 #define gpuMemcpyKind hipMemcpyKind
 #define gpuMemcpyHostToDevice hipMemcpyHostToDevice
 #define gpuMemcpyDeviceToHost hipMemcpyDeviceToHost
@@ -156,6 +157,7 @@ typedef hipEvent_t gpuEvent_t;
 #define gpuMalloc cudaMalloc
 #define gpuFree cudaFree
 #define gpuMemcpy cudaMemcpy
+#define gpuMemcpy2D cudaMemcpy2D
 #define gpuMemcpyKind cudaMemcpyKind
 #define gpuMemcpyHostToDevice cudaMemcpyHostToDevice
 #define gpuMemcpyDeviceToHost cudaMemcpyDeviceToHost
