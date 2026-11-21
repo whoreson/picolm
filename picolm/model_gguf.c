@@ -100,28 +100,41 @@ static int key_has_suffix(gguf_str_t s, const char *suffix) {
     return s.len >= n && memcmp(s.str + (s.len - n), suffix, n) == 0;
 }
 
-/* GLM-5.3-Flash arch prefix normalization.
+/* Arch key-prefix normalization.
  * The GGUF spec puts general.architecture first, so by the time any
- * arch-prefixed key arrives we know cfg->is_glm5. Both spellings
- * ("glm5next" and "glm5-next") are canonicalised to "glm5next" so the
- * existing str_eq chains only need one spelling. Returns a pointer to
- * a static buffer when rewriting is needed, else the original. */
-static char glm5_keybuf[256];
-static gguf_str_t glm5_normalize_key(gguf_str_t key, int is_glm5) {
-    if (!is_glm5) return key;
-    if (key.len >= 10 && memcmp(key.str, "glm5-next.", 10) == 0) {
+ * arch-prefixed key arrives the is_* flags are known. Both GLM-5
+ * spellings ("glm5next" and "glm5-next") are canonicalised to
+ * "glm5next" so the existing str_eq chains only need one spelling.
+ * SenseNova-Loop shares the Qwen3.5 hybrid layout (GDN + fused Q|gate
+ * attention + post-norm + rope sections), so its keys are rewritten to
+ * "qwen35." and fall through to the existing qwen35 matchers. Keys
+ * with no qwen35 equivalent (mhc.*, attention.recurrent_layers,
+ * full_attention_interval) are matched separately on the raw key.
+ * Returns a pointer to a static buffer when rewriting, else original. */
+static char arch_keybuf[256];
+static gguf_str_t arch_normalize_key(gguf_str_t key, int is_glm5, int is_sensenova) {
+    if (is_glm5 && key.len >= 10 && memcmp(key.str, "glm5-next.", 10) == 0) {
         size_t rest = key.len - 9; /* "glm5-next." -> "glm5next." loses 1 char */
-        if (rest < sizeof(glm5_keybuf) - 1) {
-            memcpy(glm5_keybuf, "glm5next.", 9);
-            memcpy(glm5_keybuf + 9, key.str + 10, key.len - 10);
-            glm5_keybuf[9 + key.len - 10] = 0;
-            gguf_str_t out; out.str = glm5_keybuf; out.len = 9 + key.len - 10;
+        if (rest < sizeof(arch_keybuf) - 1) {
+            memcpy(arch_keybuf, "glm5next.", 9);
+            memcpy(arch_keybuf + 9, key.str + 10, key.len - 10);
+            arch_keybuf[9 + key.len - 10] = 0;
+            gguf_str_t out; out.str = arch_keybuf; out.len = 9 + key.len - 10;
+            return out;
+        }
+    }
+    if (is_sensenova && key.len >= 15 && memcmp(key.str, "sensenova_loop.", 15) == 0) {
+        size_t rest = key.len - 15;
+        if (rest < sizeof(arch_keybuf) - 8) {
+            memcpy(arch_keybuf, "qwen35.", 7);
+            memcpy(arch_keybuf + 7, key.str + 15, rest);
+            arch_keybuf[7 + rest] = 0;
+            gguf_str_t out; out.str = arch_keybuf; out.len = 7 + rest;
             return out;
         }
     }
     return key;
 }
-
 /* Forward declarations */
 static uint64_t skip_meta_value(reader_t *r, uint32_t vtype, int *is_numeric);
 static int gguf_format_value(char *buf, int buflen, reader_t *r, uint32_t vtype);
@@ -177,6 +190,27 @@ static int gguf_format_value(char *buf, int buflen, reader_t *r, uint32_t vtype)
         }
         default: return snprintf(buf, buflen, "<type %u>", vtype);
     }
+}
+
+/* Format an ARRAY metadata value in full (all elements) into buf.
+ * Used by model_list_kv() for per-layer arrays (recurrent_layers,
+ * mhc.layer_kinds, rope sections, ...) where the truncated 3-element
+ * preview of gguf_format_value() hides the information that matters.
+ * Caller must have skipped the array type/length header already? No --
+ * like gguf_format_value(), this reads the header itself. Returns the
+ * number of chars written. */
+static int gguf_format_array_full(char *buf, int buflen, reader_t *r) {
+    uint32_t arr_type = read_u32(r);
+    uint64_t arr_len  = read_u64(r);
+    int written = snprintf(buf, (size_t)buflen, "[");
+    for (uint64_t i = 0; i < arr_len && written < buflen - 8; i++) {
+        char valbuf[64];
+        gguf_format_value(valbuf, (int)sizeof(valbuf), r, arr_type);
+        written += snprintf(buf + written, (size_t)(buflen - written), "%s%s",
+                            i > 0 ? ", " : "", valbuf);
+    }
+    written += snprintf(buf + written, (size_t)(buflen - written), "]");
+    return written;
 }
 
 /* Read a feed_forward_length value: scalar or array of scalars.
@@ -1169,9 +1203,27 @@ int model_list_kv(const char *path) {
               keybuf[klen-3] = '.'; keybuf[klen-2] = '.'; keybuf[klen-1] = '.';
           }
 
-          /* Format the value (use large buffer for chat templates etc.) */
+          /* Format the value (use large buffer for chat templates etc.)
+          * Numeric/bool arrays are expanded in FULL: the per-layer config
+          * arrays (attention.recurrent_layers, mhc.layer_kinds,
+          * rope.dimension_sections, head_count_kv patterns, ...) carry one
+          * entry per layer, and the truncated 3-element preview hides the
+          * pattern that actually matters. String arrays (vocab, merges,
+          * chat_template) keep the truncated preview. */
           char valbuf[65536];
-          gguf_format_value(valbuf, (int)sizeof(valbuf), &r, vtype);
+          if (vtype == GGUF_META_ARRAY) {
+              /* element type = the u32 right after the key; peek without
+               * consuming (gguf_format_array_full re-reads it) */
+              uint32_t at;
+              { reader_t save = r; at = read_u32(&r); r = save; }
+              if (at != GGUF_META_STRING) {
+                  gguf_format_array_full(valbuf, (int)sizeof(valbuf), &r);
+              } else {
+                  gguf_format_value(valbuf, (int)sizeof(valbuf), &r, vtype);
+              }
+          } else {
+              gguf_format_value(valbuf, (int)sizeof(valbuf), &r, vtype);
+          }
 
           /* Replace newlines in value with \\n for single-line display, or print multiline */
           /* Check if multiline */
@@ -1284,7 +1336,7 @@ int parse_gguf(model_t *m, int max_seq_len) {
         /* Canonicalise "glm5-next." prefix to "glm5next." so the str_eq
          * chains below only need one spelling. No-op for other arches and
          * for the already-canonical "glm5next." spelling. */
-        key = glm5_normalize_key(key, cfg->is_glm5);
+        key = arch_normalize_key(key, cfg->is_glm5, cfg->is_sensenova_loop);
 
         if (str_eq(key, "general.architecture")) {
             int dummy;
@@ -1329,6 +1381,15 @@ int parse_gguf(model_t *m, int max_seq_len) {
                 if ((arch.len == 8 && memcmp(arch.str, "glm5next", 8) == 0) ||
                     (arch.len == 9 && memcmp(arch.str, "glm5-next", 9) == 0)) {
                     cfg->is_glm5 = 1;
+                }
+                /* Check for SenseNova-Loop: "sensenova_loop" */
+                if (arch.len == 14 && memcmp(arch.str, "sensenova_loop", 14) == 0) {
+                    cfg->is_sensenova_loop = 1;
+                    /* Same post-norm, fused Q|gate, GDN hybrid family as
+                     * qwen35: qwen35 BPE tokenizer, NEOX half-split rope,
+                     * GDN linear-attention layers. */
+                    cfg->is_qwen = 1;
+                    cfg->has_ssm = 1;
                 }
                 /* Check for Spark-X2.5: "spark2_5" */
                 if (arch.len == 8 && memcmp(arch.str, "spark2_5", 8) == 0) {
@@ -1491,12 +1552,11 @@ int parse_gguf(model_t *m, int max_seq_len) {
                         else r.pos += 4;
                     }
                 }
-                cfg->rope_dim *= 2; /* each section is a pair */
-                /* NOTE: rope.dimension_sections is for MTP multi-rope, not for
-                 * the main transformer. The main transformer applies RoPE to the
-                 * full head_dim. We store rope_dim for future MTP support but
-                 * use head_dim for RoPE in model_forward(). Reset to 0 so the
-                 * (c->rope_dim > 0) ? c->rope_dim : head_dim fallback gives head_dim. */
+                /* rope.dimension_sections [11,11,10,0] sums to 32, *2 = 64 =
+                 * rope_dim. For qwen35 this matcher resets rope_dim to 0 so
+                 * the full head_dim rotates (MTP multi-rope preparation); the
+                 * SenseNova-Loop derive block re-reads dimension_count (64)
+                 * AFTER this since it comes later in the GGUF KV stream. */
                 cfg->rope_dim = 0;
             } else {
                 skip_meta_value_warn(&r, vtype, key.str);
@@ -1622,6 +1682,56 @@ int parse_gguf(model_t *m, int max_seq_len) {
             int dummy; cfg->ssm_dt_rank = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "qwen35.ssm.inner_size") || str_eq(key, "qwen35moe.ssm.inner_size") || str_eq(key, "qwen3.ssm.inner_size")) {
             int dummy; cfg->ssm_d_inner = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (str_eq(key, "qwen35.attention.recurrent_layers")) {
+            /* SenseNova-Loop: bool[n_layers], 1 = GDN/recurrent layer.
+             * Authoritative layer-type source when present (the
+             * attn_k-tensor-presence fallback also works: attention blocks
+             * carry attn_k, GDN blocks carry attn_qkv without attn_k). */
+            if (vtype == GGUF_META_ARRAY) {
+                uint32_t et = read_u32(&r);
+                uint64_t n = read_u64(&r);
+                cfg->mhc_recurrent_len = (n > (uint64_t)MAX_LAYERS) ? MAX_LAYERS : (int)n;
+                for (uint64_t ei = 0; ei < n; ei++) {
+                    if (et == GGUF_META_BOOL || et == GGUF_META_UINT8 || et == GGUF_META_INT8) {
+                        uint8_t v = read_u8(&r);
+                        if (ei < (uint64_t)MAX_LAYERS) cfg->layer_type[ei] = v ? 1 : 0;
+                    } else {
+                        int dummy; skip_meta_value(&r, et, &dummy);
+                    }
+                }
+            } else {
+                skip_meta_value_warn(&r, vtype, key.str);
+            }
+        } else if (str_eq(key, "qwen35.full_attention_interval")) {
+            /* Fallback GDN/attention period when recurrent_layers is absent:
+             * layer i is GDN iff (i+1) % interval != 0. */
+            int dummy; cfg->full_attention_interval = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (str_eq(key, "qwen35.mhc.streams")) {
+            int dummy; cfg->n_mhc_streams = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (str_eq(key, "qwen35.mhc.layer_kinds")) {
+            /* i32[n_layers]: 0=plain block, 1=mHC enter (seed both streams
+             * from the residual), 4=mHC interior (carry streams),
+             * 2=mHC exit (merge streams back, average). The looped segment
+             * is stored once and re-entered: layer_kinds[28..51] repeats
+             * layer_kinds[4..27] while those layers own no tensors. */
+            if (vtype == GGUF_META_ARRAY) {
+                uint32_t et = read_u32(&r);
+                uint64_t n = read_u64(&r);
+                for (uint64_t ei = 0; ei < n; ei++) {
+                    uint8_t kind = 0;
+                    if (et == GGUF_META_INT32 || et == GGUF_META_UINT32) {
+                        int v = (et == GGUF_META_INT32) ? read_i32(&r) : (int)read_u32(&r);
+                        kind = (uint8_t)(v == 1 ? 1 : (v == 2 ? 2 : (v == 0 ? 0 : 4)));
+                    } else if (et == GGUF_META_BOOL || et == GGUF_META_UINT8 || et == GGUF_META_INT8) {
+                        kind = read_u8(&r) ? 4 : 0;
+                    } else {
+                        int dummy; skip_meta_value(&r, et, &dummy);
+                    }
+                    if (ei < (uint64_t)MAX_LAYERS) cfg->mhc_layer_kinds[ei] = kind;
+                }
+            } else {
+                skip_meta_value_warn(&r, vtype, key.str);
+            }
         /* Gemma-3n specific config */
         } else if (str_eq(key, "gemma3n.altup.num_inputs")) {
             int dummy; cfg->n_altup = (int)skip_meta_value(&r, vtype, &dummy);
@@ -2366,6 +2476,19 @@ int parse_gguf(model_t *m, int max_seq_len) {
                 } else if (!cfg->is_glm5 && strcmp(suffix, "ssm_out.weight") == 0) {
                     lw->ssm_out = ptr; lw->type_ssm_out = qtype;
                 }
+                /* ---- SenseNova-Loop mHC routers (F32, [2*n_embd, 8]) ----
+                 * Present on every mHC block (layer_kinds != 0); absent on
+                 * plain blocks (kind 0). Always F32 and tiny (8192x8), so
+                 * no quant type is recorded. */
+                else if (cfg->is_sensenova_loop && strcmp(suffix, "mhc_attn.weight") == 0) {
+                    lw->mhc_attn_w = ptr;
+                } else if (cfg->is_sensenova_loop && strcmp(suffix, "mhc_attn.bias") == 0) {
+                    lw->mhc_attn_b = ptr;
+                } else if (cfg->is_sensenova_loop && strcmp(suffix, "mhc_ffn.weight") == 0) {
+                    lw->mhc_ffn_w = ptr;
+                } else if (cfg->is_sensenova_loop && strcmp(suffix, "mhc_ffn.bias") == 0) {
+                    lw->mhc_ffn_b = ptr;
+                }
                 /* ---- GLM-5.3-Flash (glm5next) per-layer tensors ----
                  * KDA conv/gate tensors use ssm_* names that clash with the
                  * Qwen SSM fields, so intercept them into the glm5 slots.
@@ -2715,6 +2838,92 @@ int parse_gguf(model_t *m, int max_seq_len) {
         }
     }
 
+    /* ---- SenseNova-Loop derive: layer types, loop aliasing ----
+     * The 24-block mHC segment is stored ONCE in the GGUF and executed
+     * TWICE: blocks [first, first+shift) own tensors, blocks
+     * [start2, start2+shift) alias them (struct copy = pointer aliasing,
+     * zero extra RAM). layer_type[] is taken from the
+     * attention.recurrent_layers KV when present, else from tensor
+     * presence (attn_k => attention, else GDN). */
+    if (cfg->is_sensenova_loop) {
+        int first_enter = -1, n_enter = 0;
+        cfg->mhc_loop_first = -1;
+        cfg->mhc_loop_start2 = -1;
+        cfg->mhc_loop_shift = 0;
+        for (int i = 0; i < cfg->n_layers && i < MAX_LAYERS; i++) {
+            if (cfg->mhc_layer_kinds[i] == 1) {
+                if (n_enter == 0) {
+                    first_enter = i;
+                } else if (n_enter == 1) {
+                    cfg->mhc_loop_start2 = i;
+                    cfg->mhc_loop_shift = i - first_enter;
+                    break;
+                }
+                n_enter++;
+            }
+        }
+        cfg->mhc_loop_first = first_enter;
+        /* Layer type fallback from tensor presence when the KV is absent */
+        if (cfg->mhc_recurrent_len <= 0) {
+            int interval = cfg->full_attention_interval > 0 ?
+                           cfg->full_attention_interval : 4;
+            for (int i = 0; i < cfg->n_layers && i < MAX_LAYERS; i++) {
+                cfg->layer_type[i] = ((i + 1) % interval != 0) ? 1 : 0;
+            }
+        }
+        /* Loop aliasing: layers [start2, start2+shift) point at the first
+         * visit's weights. Runs BEFORE the cross-check below, because the
+         * cross-check reads tensor presence and aliased layers only have
+         * tensors after the aliasing copy. */
+        if (cfg->mhc_loop_start2 > 0 && cfg->mhc_loop_shift > 0) {
+            for (int i = cfg->mhc_loop_start2;
+                 i < cfg->mhc_loop_start2 + cfg->mhc_loop_shift && i < cfg->n_layers &&
+                 i < MAX_LAYERS; i++) {
+                int src = i - cfg->mhc_loop_shift;
+                if (src < 0 || src >= MAX_LAYERS) continue;
+                w->layers[i] = w->layers[src];
+            }
+            fprintf(stderr, "sensenova_loop: %d layers, mHC streams=%d, loop blocks %d..%d "
+                    "alias %d..%d (shift %d)\n",
+                    cfg->n_layers, cfg->n_mhc_streams,
+                    cfg->mhc_loop_start2, cfg->mhc_loop_start2 + cfg->mhc_loop_shift - 1,
+                    cfg->mhc_loop_first, cfg->mhc_loop_first + cfg->mhc_loop_shift - 1,
+                    cfg->mhc_loop_shift);
+        }
+        /* Cross-check KV vs tensor presence; tensor presence wins for the
+         * aliased range (blocks 28..51 carry no tensors of their own but
+         * alias 4..27, so their attn_k presence is decided by the source).
+         * Runs AFTER the aliasing above for exactly that reason. */
+        int mism = 0;
+        for (int i = 0; i < cfg->n_layers && i < MAX_LAYERS; i++) {
+            int attn_by_tensor = w->layers[i].attn_k != NULL;
+            int attn_by_kv = cfg->mhc_recurrent_len > 0 ? !cfg->layer_type[i] : attn_by_tensor;
+            if (attn_by_tensor != attn_by_kv) {
+                if (mism < 4)
+                    fprintf(stderr, "sensenova: layer %d recurrent_layers=%d "
+                            "but has attn_k=%d (tensor presence wins)\n",
+                            i, cfg->mhc_recurrent_len > 0 ? (int)!cfg->layer_type[i] : -1,
+                            attn_by_tensor);
+                mism++;
+                cfg->layer_type[i] = attn_by_tensor ? 0 : 1;
+            }
+        }
+        if (cfg->n_mhc_streams != 2)
+            fprintf(stderr, "sensenova_loop: WARNING mhc.streams=%d != 2; "
+                    "only 2-stream routing is implemented\n", cfg->n_mhc_streams);
+        /* rope.dimension_sections [11,11,10,0] sums to 32, *2 = 64 = rope_dim.
+         * The qwen35 sections matcher resets rope_dim to 0 (MTP multi-rope
+         * preparation, full head_dim rotates), but SenseNova rotates only
+         * the first 64 of the 256-dim head. In the GGUF KV stream
+         * rope.dimension_count (=64) comes AFTER rope.dimension_sections, so
+         * the dimension_count matcher wins and rope_dim ends up 64. Assert
+         * that here so a key-order change cannot silently break it. */
+        if (cfg->is_sensenova_loop && cfg->rope_dim != 64) {
+            fprintf(stderr, "sensenova_loop: rope_dim=%d (expected 64 from "
+                    "rope.dimension_count); sections [11,11,10,0] sum to 32*2\n",
+                    cfg->rope_dim);
+        }
+    }
     /* Verify required tensors for StableLM */
     if (cfg->is_stablelm) {
         for (int l = 0; l < cfg->n_layers; l++) {

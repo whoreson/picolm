@@ -1196,6 +1196,18 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
             + ssm_d_state*n_v_heads_ssm*4  /* sk + d_vals + ssm_output + final_output */;
         s->ssm_tmp = p;
         p += ssm_tmp_size;
+
+    }
+    /* SenseNova-Loop mHC buffers: second residual stream + router scratch.
+     * mhc_packed holds the router output: branch (2*n_embd packed as
+     * n_embd, since str_a/str_b are kept separately) + 6 scalars
+     * (post0, post1, m00, m01, m10, m11). We allocate 2*n_embd + 8 to
+     * keep the reference packed layout in one buffer. */
+    if (c->is_sensenova_loop) {
+        s->mhc_str_b = p;
+        p += (size_t)c->n_embd * sizeof(float);
+        s->mhc_packed = p;
+        p += ((size_t)c->n_embd + 8) * sizeof(float);
     }
 
     /* Gemma-3n buffer carving */
@@ -2647,6 +2659,8 @@ static void repack_model_weights_q4_0x8(model_t *m) {
 float *model_forward_gemma3n(model_t *m, int token, int pos);
 float *model_forward_glm5(model_t *m, int token, int pos);
 float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens, int start_pos, volatile int *interrupt);
+/* ---- SenseNova-Loop forward pass (mHC 2-stream routing + looped blocks) ---- */
+float *model_forward_sensenova(model_t *m, int token, int pos);
 
 /* ---- GPT-2 forward pass (specialized) ---- */
 /* PICOLM_DBG_LAYER=<pos> / PICOLM_DBG_LAYER_N=<n>: dump the per-layer residual
@@ -3448,6 +3462,10 @@ float *model_forward_range(model_t *m, int token, int pos, int l_lo, int l_hi,
     /* GLM-5.3-Flash: mHC + KDA/MLA hybrid */
     if (m->config.is_glm5) {
         return model_forward_glm5(m, token, pos);
+    }
+    /* SenseNova-Loop: mHC 2-stream routing + looped weight-reuse blocks */
+    if (m->config.is_sensenova_loop) {
+        return model_forward_sensenova(m, token, pos);
     }
     /* Spark-X2.5: fused QKV, head-wise sigmoid gate, GeGLU FFN, SWA */
     if (m->config.is_spark25) {
@@ -5645,6 +5663,18 @@ float *model_forward_prefill_range(model_t *m, const int *tokens, int n_tokens, 
 
     /* TODO: Gemma-3n batched prefill not yet implemented -- falls back to per-token forward */
     if (m->config.is_gemma3n) {
+        g_is_prefill = 1;
+        for (int i = 0; i < n_tokens; i++) {
+            if (interrupt && *interrupt) break;
+            (void)model_forward(m, tokens[i], start_pos + i);
+        }
+        g_is_prefill = 0;
+        return m->state.logits;
+    }
+    /* SenseNova-Loop: batched prefill not yet implemented -- per-token
+     * fallback (mHC routing is per-token stateful across layers; batching
+     * needs the route/merge hoisted into the batch loop). */
+    if (m->config.is_sensenova_loop) {
         g_is_prefill = 1;
         for (int i = 0; i < n_tokens; i++) {
             if (interrupt && *interrupt) break;

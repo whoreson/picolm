@@ -190,6 +190,19 @@ typedef struct {
     float glm5_ln_eps;          /* attention.layer_norm_epsilon (1e-6), DSA indexer LayerNorm */
     int glm5_n_mla;             /* derived: count of MLA trunk layers (11) */
     int glm5_n_kda;             /* derived: count of KDA trunk layers (34) */
+    /* ---- SenseNova-Loop (sensenova_loop) ----
+     * Qwen3Next-style GDN+attention hybrid with mHC (manifold Hyper-
+     * Connections) 2-stream residual routing and a looped weight-reuse
+     * segment: a 24-block span is stored once in the GGUF and executed
+     * twice (blocks 28..51 alias blocks 4..27). */
+    int is_sensenova_loop;      /* 1 if model architecture is sensenova_loop */
+    int n_mhc_streams;          /* mhc.streams (2); 0 = no mHC routing */
+    uint8_t mhc_layer_kinds[MAX_LAYERS]; /* per layer: 0=plain, 1=enter, 4=interior, 2=exit */
+    int mhc_loop_first;         /* index of the first kind==1 block */
+    int mhc_loop_start2;        /* index of the second kind==1 block (loop re-entry) */
+    int mhc_loop_shift;         /* start2 - first (24); layers [start2, start2+shift) alias [first, start2) */
+    int mhc_recurrent_len;      /* entries parsed from attention.recurrent_layers */
+    int full_attention_interval; /* fallback GDN/attention period (4) */
 } model_config_t;
 
 /* ---- GPU-resident weight handles (compiled in only with PICOLM_GPU) ---- */
@@ -366,6 +379,14 @@ typedef struct {
     const void *rope_factors_long;
     const void *rope_factors_short;
     const void *rope_freqs;
+    /* ---- SenseNova-Loop mHC router weights (F32, kind!=0 layers) ----
+     * W is [n_streams*n_embd, 2*n_streams + n_streams*n_streams] row-major;
+     * row k packs [a_weights (n_embd), b_weights (n_embd)]. For streams=2:
+     * [8192, 8]: 8 logits = pre0,pre1,post0,post1 + 2x2 sinkhorn matrix. */
+    const void *mhc_attn_w;     /* blk.N.mhc_attn.weight [2*n_embd, 8] F32 */
+    const void *mhc_attn_b;     /* blk.N.mhc_attn.bias   [8] F32 */
+    const void *mhc_ffn_w;      /* blk.N.mhc_ffn.weight  [2*n_embd, 8] F32 */
+    const void *mhc_ffn_b;      /* blk.N.mhc_ffn.bias    [8] F32 */
 } layer_weights_t;
 
 /* ---- GLM-5.3-Flash (glm5next) per-layer weights ----
@@ -640,10 +661,15 @@ typedef struct {
     float *ssm_conv_state[MAX_LAYERS]; /* [(d_conv-1) * conv_dim] per SSM layer */
     float *ssm_state[MAX_LAYERS];      /* [ssm_d_state * ssm_d_inner] per SSM layer */
     float *ssm_tmp;                    /* scratch for ssm_forward */
-    /* Pre-dequantized small SSM arrays */
-    float *ssm_a_w[MAX_LAYERS];        /* [dt_rank] F32 */
-    float *ssm_dt_w[MAX_LAYERS];       /* [dt_rank] F32 */
+    /* SenseNova-Loop mHC (manifold Hyper-Connections) streams. str_b is the
+     * second residual stream [n_embd]; str_a lives in s->x (the residual).
+     * mhc_packed is the router scratch [2*n_embd + 8]: branch + 6 gates. */
+    float *mhc_str_b;                  /* [n_embd] second mHC stream */
+    float *mhc_packed;                 /* [2*n_embd + 8] router output scratch */
+    int mhc_sublayer_only;             /* SenseNova mHC: ssm_forward stops after the SSM out-proj; caller merges + FFNs */
     float *ssm_norm_w[MAX_LAYERS];     /* [head_v_dim] F32 */
+    float *ssm_dt_w[MAX_LAYERS];       /* [dt_rank] F32 */
+    float *ssm_a_w[MAX_LAYERS];        /* [dt_rank] F32 */
     float *ssm_conv1d_w[MAX_LAYERS];   /* [d_conv * conv_dim] F32 */
 
     /* Gemma-3n runtime state */

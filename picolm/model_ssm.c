@@ -2763,6 +2763,11 @@ void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     #ifdef DEBUG_SSM
     if (il == 0 && pos == 0) dbg_vec("residual[:8]", residual, 8, 8);
 #endif
+    /* SenseNova mHC: the caller merges the sublayer output into its two
+     * streams and runs the FFN sublayer itself, so stop here: leave the
+     * SSM output projection result in `residual` and skip both the
+     * residual add and the post-norm FFN. */
+    if (s->mhc_sublayer_only) return;
     /* 20. Residual add */
     vec_add(x, residual, dim);
 
