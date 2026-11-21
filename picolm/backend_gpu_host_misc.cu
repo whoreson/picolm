@@ -639,20 +639,40 @@ picolm_gpu_kv_store_rows(int is_k, int layer_ordinal, int start_pos, int n_posit
 
 /* Bulk upload: copy all n_positions for one layer from host F16 cache to device.
  * host_rows: [n_positions][n_kv_heads][head_dim] contiguous uint16_t. */
+/* Defined below; needed here for the cache row stride. */
+static void kv_strides_for(int device, int is_k, int n_kv_heads, int head_dim,
+                            size_t *pos_stride_out, size_t *head_stride_out, int *kv_type_out);
+
 extern "C" int
 picolm_gpu_kv_upload_layer(int is_k, int layer_ordinal, int n_positions,
-                            const uint16_t *host_rows, int n_kv_heads,
+                            const void *host_rows, int n_kv_heads,
                             int head_dim, int max_seq_len, int device) {
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!ctx || !select_ctx(ctx)) return 0;
     if (!g_kv_k_dev[device] || !g_kv_v_dev[device]) return 0;
 
-    size_t row_bytes = (size_t)n_kv_heads * head_dim * sizeof(uint16_t);
-    uint16_t *dst_base = is_k ? g_kv_k_dev[device] : g_kv_v_dev[device];
+    /* Row size comes from the CACHE's own layout, not from head_dim*2.
+     *
+     * This used to hardcode sizeof(uint16_t) per element, i.e. F16 only, and
+     * the caller in picolm.c consequently gated the whole restore path on
+     * "-ctk f16 -ctv f16". With a q4_0 cache a row is 0.5625 bytes/element, so
+     * the old version would have written 3.5x too many bytes per row and
+     * silently corrupted every position past the first. Reading the stride
+     * back out also keeps this correct for the case where K and V differ,
+     * which the decode kernels already support. */
+    size_t pos_stride_k = 0, head_stride_k = 0, pos_stride_v = 0, head_stride_v = 0;
+    int kv_type_k = 0, kv_type_v = 0;
+    kv_strides_for(device, 1, n_kv_heads, head_dim, &pos_stride_k, &head_stride_k, &kv_type_k);
+    kv_strides_for(device, 0, n_kv_heads, head_dim, &pos_stride_v, &head_stride_v, &kv_type_v);
+    (void)head_stride_k; (void)head_stride_v; (void)kv_type_k; (void)kv_type_v;
+
+    size_t row_bytes = is_k ? pos_stride_k : pos_stride_v;
+    uint8_t *dst_base = (uint8_t *)(is_k ? g_kv_k_dev[device] : g_kv_v_dev[device]);
     size_t layer_off_bytes = (size_t)layer_ordinal * max_seq_len * row_bytes;
-    uint8_t *dst = (uint8_t *)dst_base + layer_off_bytes;
+    uint8_t *dst = dst_base + layer_off_bytes;
 
     size_t copy_bytes = (size_t)n_positions * row_bytes;
+    if (copy_bytes == 0) return 1;
     if (!gpu_ok(gpuMemcpyAsync(dst, host_rows, copy_bytes,
                                gpuMemcpyHostToDevice, ctx->stream),
                 "kv_upload_layer async copy"))

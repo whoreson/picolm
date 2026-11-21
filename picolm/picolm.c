@@ -397,6 +397,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "                  growing cached context. Outputs CSV: ctx_size,prefill_tok/s,gen_tok/s\n");
 #ifdef PICOLM_GPU
     fprintf(stderr, "\nGPU debug options:\n");
+    fprintf(stderr, "  --gpu-q8diff <I>    Compare the GPU vs CPU Q8_0 activation quantiser\n");
     fprintf(stderr, "  --gpu-diff <S> I O  Diff GPU kernels (IMMA vs scalar) on random input\n");
     fprintf(stderr, "                  S=seq_len, I=input_dim, O=output_dim (must be multiples of 16/8/32)\n");
     fprintf(stderr, "                  Example: --gpu-diff 32 512 1024\n");
@@ -1077,6 +1078,28 @@ struct picolm_gpu_tensor {
 #ifdef PICOLM_CUDA
 /* GPU kernel diff test: quantize random input to Q8_0, run IMMA and scalar
  * matmul on the same data, diff outputs. Used to validate kernel correctness. */
+/* --gpu-q8diff <I>: does the GPU activation quantiser produce the SAME Q8_0
+ * bytes as the CPU's quantize_row_q8_0 for the same input row?
+ *
+ * This exists because it decides the shape of the next large piece of work.
+ * The GPU has only a Q8_0 activation quantiser (32-value blocks with an fp16
+ * scale) while the CPU's K-quant matmuls use Q8_K (256-value super-blocks with
+ * per-sub-block scales). That is a documented, accepted difference -- but at
+ * 9848 tokens of context GPU and CPU prefill produce different argmaxes, and
+ * the accumulated drift is the leading explanation.
+ *
+ *   if the int8 payloads and the d values agree EXACTLY -> the Q8_0 quantiser
+ *      is not the divergence, a device Q8_K would NOT fix long context, and it
+ *      is purely a performance item.
+ *   if they differ -> one root cause behind both the correctness problem and
+ *      the prefill cost, and the device Q8_K work is unambiguously worth it.
+ */
+static void gpu_q8_quant_diff(int I) {
+    extern int picolm_gpu_q8_quant_diff(int I);
+    int rc = picolm_gpu_q8_quant_diff(I);
+    exit(rc == 0 ? 0 : 1);
+}
+
 static void gpu_matmul_diff(int S, int I, int O) {
     if (I % 32 != 0) { fprintf(stderr, "I must be multiple of 32\n"); exit(1); }
     if (S % 16 != 0) { fprintf(stderr, "S must be multiple of 16\n"); exit(1); }
@@ -1460,6 +1483,7 @@ int main(int argc, char **argv) {
     rope_cli_overrides_t rope_ov;
     memset(&rope_ov, 0, sizeof(rope_ov));
     int    gpu_diff = 0;    /* --gpu-diff S I O */
+    int    gpu_q8_diff = 0; /* --gpu-q8diff I */
 #ifdef PICOLM_CUDA
     int    gpu_diff_S = 32, gpu_diff_I = 512, gpu_diff_O = 1024;
 #endif
@@ -1658,6 +1682,8 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--slot-save-path") == 0 && i + 1 < argc) {
             slot_save_path = argv[++i];
 #ifdef PICOLM_CUDA
+        } else if (strcmp(argv[i], "--gpu-q8diff") == 0 && i + 1 < argc) {
+            gpu_q8_diff = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--gpu-diff") == 0 && i + 3 < argc) {
             gpu_diff = 1;
             gpu_diff_S = atoi(argv[++i]);
@@ -1764,6 +1790,13 @@ int main(int argc, char **argv) {
     }
 #endif
 
+    /* --gpu-q8diff: standalone GPU-vs-CPU activation quantiser comparison. */
+#ifdef PICOLM_CUDA
+    if (gpu_q8_diff > 0) {
+        gpu_q8_quant_diff(gpu_q8_diff);
+        return 0;   /* gpu_q8_quant_diff() exits */
+    }
+#endif
     /* --gpu-diff: standalone GPU kernel diff test, no model needed */
 #ifdef PICOLM_CUDA
     if (gpu_diff) {
@@ -2168,14 +2201,19 @@ int main(int argc, char **argv) {
          * kernels would see whatever garbage was left from model init. */
 #ifdef PICOLM_GPU
         if (cache_pos > 0 && model.gpu.kv_active && model.gpu.device >= 0) {
-            if (model.state.kv_type_k == KV_CACHE_F16 &&
-                model.state.kv_type_v == KV_CACHE_F16) {
+            /* No longer gated on F16. picolm_gpu_kv_upload_layer() derives the
+             * row size from the cache's own layout, and the host cache that
+             * kvcache_load() filled is already in that same format, so a q4_0
+             * or q8_0 cache restores byte-for-byte too. The old F16-only gate
+             * meant "--cache" silently did nothing for exactly the
+             * q4_0-KV configuration that makes long context fit in VRAM. */
+            {
                 for (int l = 0; l < model.config.n_layers; l++) {
                     if (!model.weights.layers[l].is_attn_layer) continue;
                     int ao = model.state.kv_layer_ordinal[l];
-                    const uint16_t *k_rows = (const uint16_t *)(model.state.key_cache +
+                    const void *k_rows = (const void *)(model.state.key_cache +
                         (size_t)ao * model.config.max_seq_len * model.state.kv_row_size_k);
-                    const uint16_t *v_rows = (const uint16_t *)(model.state.val_cache +
+                    const void *v_rows = (const void *)(model.state.val_cache +
                         (size_t)ao * model.config.max_seq_len * model.state.kv_row_size_v);
                     picolm_gpu_kv_upload_layer(1, ao, cache_pos,
                         k_rows, model.config.n_kv_heads, model.config.head_dim,

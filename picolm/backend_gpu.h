@@ -465,12 +465,14 @@ int picolm_gpu_kv_upload_from_cpu(const uint8_t *cpu_k, const uint8_t *cpu_v,
                                    size_t row_sz_k, size_t row_sz_v,
                                    int device);
 
-/* Bulk KV cache upload from host F16 cache.
- * Copies all n_positions for a single layer from host_rows (contiguous
- * F16 rows) to device KV cache starting at pos 0.
+/* Bulk KV cache upload from the host cache.
+ * Copies all n_positions for a single layer from host_rows (contiguous rows,
+ * already in whatever format the device cache uses) to the device KV cache
+ * starting at pos 0. The row size is taken from the cache's own layout, so
+ * this works for F16 and for the quantised types (q4_0/q8_0) alike.
  * Used for KV cache restoration from file. */
 int picolm_gpu_kv_upload_layer(int is_k, int layer_ordinal, int n_positions,
-                                const uint16_t *host_rows, int n_kv_heads,
+                                const void *host_rows, int n_kv_heads,
                                 int head_dim, int max_seq_len, int device);
 
 /* Debug: read KV cache from device to host. dst must have space for n_elements. */
