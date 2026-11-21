@@ -2585,19 +2585,26 @@ int picolm_gpu_ssm_chunked_recurrence_dev(const float *conv_dev, const float *al
      * against 16 attention layers costing ~50 ms in total). */
     int _ssmps = picolm_gpu_prof_slot("ssm_chunk_rec");
     picolm_gpu_prof_begin(device);
+    /* This function returns early from ~16 places inside the open region.
+     * Each of those would leave the profiler's open-region stack unbalanced,
+     * and prof_flush_ring() then DROPS later pairs by design -- which is how
+     * pf_matmul_q6_K silently stopped appearing in the profile at all while
+     * matmul_q6_imma_mt_dev was demonstrably still running.
+     * Every return now goes through this macro. */
+    #define SSMCR_RET(_v) do { picolm_gpu_prof_end(_ssmps); return (_v); } while (0)
 #ifndef PICOLM_SSM_CHUNKED_GPU_VALIDATED
     (void)conv_dev;(void)alpha_dev;(void)beta_dev;(void)state_dev;(void)xb2_dev;
     (void)n_tokens;(void)value_dim;(void)xb2_stride;(void)d_state;(void)n_k_heads;
     (void)n_v_heads;(void)head_v_dim;(void)repeat;(void)cs;(void)device;
     picolm_gpu_prof_end(_ssmps);
-    return 0;
+    SSMCR_RET(0);
 #else
-    if(d_state!=head_v_dim) return 0;
+    if(d_state!=head_v_dim) SSMCR_RET(0);
     if(cs<=0) cs=64; if(cs>n_tokens) cs=n_tokens;
     int nc=(n_tokens+cs-1)/cs; if(nc<1) nc=1;
     int d=d_state, qk_dim=d_state*n_k_heads;
     gpu_device_ctx_t *ctx = find_ctx(device);
-    if(!ctx||!select_ctx(ctx)) return 0;
+    if(!ctx||!select_ctx(ctx)) SSMCR_RET(0);
     int n_threads=256;
     /* Persistent scratch buffers: must be static so they survive across
      * calls (one per SSM layer per layer loop). ssm_batch_scratch_ensure
@@ -2632,22 +2639,22 @@ int picolm_gpu_ssm_chunked_recurrence_dev(const float *conv_dev, const float *al
         ok&=ssm_batch_scratch_ensure((void**)ptrs[i],&caps[i],szs[i]);
         if(ok) ok&=gpu_ok(gpuMemsetAsync(*(void**)ptrs[i],0,szs[i],ctx->stream),"scratch zero");
     }
-    if(!ok) return 0;
+    if(!ok) SSMCR_RET(0);
     for(int ci=0;ci<nc&&ok;ci++){
       int ca=(ci==nc-1)?(n_tokens-ci*cs):cs; if(ca<=0)break;
       int co2=ci*cs;
       { int _pk = picolm_gpu_prof_slot("gather_qk"); picolm_gpu_prof_begin(device);
               ssm_chunk_gather_qk_kernel<<<n_k_heads,n_threads,0,ctx->stream>>>((float*)d_cq,(float*)d_ck,conv_dev,co2,ca,xb2_stride,qk_dim,d_state,n_k_heads);
         picolm_gpu_prof_end(_pk); }
-      if(!gpu_ok(gpuGetLastError(),"gather_qk"))return 0;
+      if(!gpu_ok(gpuGetLastError(),"gather_qk"))SSMCR_RET(0);
       { int _pk = picolm_gpu_prof_slot("gather_v"); picolm_gpu_prof_begin(device);
               ssm_chunk_gather_v_kernel<<<n_v_heads,n_threads,0,ctx->stream>>>((float*)d_cv,(float*)d_cb,(float*)d_gl,conv_dev,alpha_dev,beta_dev,co2,ca,xb2_stride,qk_dim,head_v_dim,n_v_heads,xb2_stride);
         picolm_gpu_prof_end(_pk); }
-      if(!gpu_ok(gpuGetLastError(),"gather_v"))return 0;
+      if(!gpu_ok(gpuGetLastError(),"gather_v"))SSMCR_RET(0);
       { int _pk = picolm_gpu_prof_slot("decay"); picolm_gpu_prof_begin(device);
               ssm_chunk_decay_kernel<<<n_v_heads,n_threads,0,ctx->stream>>>((float*)d_cg,(float*)d_qd,(float*)d_dm,(float*)d_gl,n_v_heads,ca,ca);
         picolm_gpu_prof_end(_pk); }
-      if(!gpu_ok(gpuGetLastError(),"decay"))return 0;
+      if(!gpu_ok(gpuGetLastError(),"decay"))SSMCR_RET(0);
 #ifdef PICOLM_GPU
       if (getenv("PICOLM_SSM_STEP_VERIFY") && ci == 0) {
           /* D2H decay_mask and gate_log scratch */
@@ -2667,27 +2674,27 @@ int picolm_gpu_ssm_chunked_recurrence_dev(const float *conv_dev, const float *al
       { int _pk = picolm_gpu_prof_slot("masked_gemm"); picolm_gpu_prof_begin(device);
               ssm_chunk_masked_gemm_kernel<<<n_v_heads,n_threads,0,ctx->stream>>>((float*)d_M,(const float*)d_ck,(const float*)d_ck,(const float*)d_dm,n_v_heads,repeat,ca,d);
         picolm_gpu_prof_end(_pk); }
-      if(!gpu_ok(gpuGetLastError(),"M_gemm"))return 0;
+      if(!gpu_ok(gpuGetLastError(),"M_gemm"))SSMCR_RET(0);
       { int _pk = picolm_gpu_prof_slot("matvec"); picolm_gpu_prof_begin(device);
               ssm_chunk_matvec_kernel<<<dim3(n_v_heads,MV_SPLIT),n_threads,0,ctx->stream>>>((float*)d_sk,state_dev,(const float*)d_ck,n_v_heads,repeat,ca,d);
         picolm_gpu_prof_end(_pk); }
-      if(!gpu_ok(gpuGetLastError(),"sk_matvec"))return 0;
+      if(!gpu_ok(gpuGetLastError(),"sk_matvec"))SSMCR_RET(0);
       { int _pk = picolm_gpu_prof_slot("veff"); picolm_gpu_prof_begin(device);
               ssm_chunk_veff_kernel<<<n_v_heads,n_threads,0,ctx->stream>>>((float*)d_ve,(const float*)d_cv,(const float*)d_sk,(const float*)d_qd,(const float*)d_cb,n_v_heads,ca,d);
         picolm_gpu_prof_end(_pk); }
-      if(!gpu_ok(gpuGetLastError(),"veff"))return 0;
+      if(!gpu_ok(gpuGetLastError(),"veff"))SSMCR_RET(0);
       { int _pk = picolm_gpu_prof_slot("trisolve"); picolm_gpu_prof_begin(device);
               {int tr=d<1024?d:1024; ssm_chunk_trisolve_kernel<<<n_v_heads,tr,0,ctx->stream>>>((float*)d_vh,(const float*)d_ve,(const float*)d_M,(const float*)d_cb,n_v_heads,ca,d);}
-      if(!gpu_ok(gpuGetLastError(),"trisolve"))return 0;
+      if(!gpu_ok(gpuGetLastError(),"trisolve"))SSMCR_RET(0);
         picolm_gpu_prof_end(_pk); }
       ssm_chunk_matvec_kernel<<<dim3(n_v_heads,MV_SPLIT),n_threads,0,ctx->stream>>>((float*)d_sq,state_dev,(const float*)d_cq,n_v_heads,repeat,ca,d);
-      if(!gpu_ok(gpuGetLastError(),"sq_matvec"))return 0;
+      if(!gpu_ok(gpuGetLastError(),"sq_matvec"))SSMCR_RET(0);
       ssm_chunk_masked_gemm_kernel<<<n_v_heads,n_threads,0,ctx->stream>>>((float*)d_kq,(const float*)d_cq,(const float*)d_ck,(const float*)d_dm,n_v_heads,repeat,ca,d);
-      if(!gpu_ok(gpuGetLastError(),"kq_gemm"))return 0;
+      if(!gpu_ok(gpuGetLastError(),"kq_gemm"))SSMCR_RET(0);
       { int _pk = picolm_gpu_prof_slot("chunk_out"); picolm_gpu_prof_begin(device);
               ssm_chunk_output_kernel<<<n_v_heads,n_threads,0,ctx->stream>>>((float*)d_co,(const float*)d_sq,(const float*)d_qd,(const float*)d_kq,(const float*)d_vh,n_v_heads,ca,d);
         picolm_gpu_prof_end(_pk); }
-      if(!gpu_ok(gpuGetLastError(),"output"))return 0;
+      if(!gpu_ok(gpuGetLastError(),"output"))SSMCR_RET(0);
 #ifdef PICOLM_GPU
       if (getenv("PICOLM_SSM_STEP_VERIFY") && ci == 0) {
           /* D2H v_eff[0][0..3] and v_hat[0][0..3] for head 0 */
@@ -2703,11 +2710,11 @@ int picolm_gpu_ssm_chunked_recurrence_dev(const float *conv_dev, const float *al
       { int _pk = picolm_gpu_prof_slot("scatter"); picolm_gpu_prof_begin(device);
               ssm_chunk_scatter_kernel<<<n_v_heads,n_threads,0,ctx->stream>>>(xb2_dev,(const float*)d_co,co2,ca,xb2_stride,head_v_dim,n_v_heads);
         picolm_gpu_prof_end(_pk); }
-      if(!gpu_ok(gpuGetLastError(),"scatter"))return 0;
+      if(!gpu_ok(gpuGetLastError(),"scatter"))SSMCR_RET(0);
       { int _pk = picolm_gpu_prof_slot("state_up"); picolm_gpu_prof_begin(device);
               ssm_chunk_state_update_kernel<<<dim3(n_v_heads,MV_SPLIT),n_threads,(unsigned)((ca<1024?ca:1024)*sizeof(float)),ctx->stream>>>(state_dev,(const float*)d_vh,(const float*)d_ck,(const float*)d_cg,n_v_heads,repeat,ca,d);
         picolm_gpu_prof_end(_pk); }
-      if(!gpu_ok(gpuGetLastError(),"state_up"))return 0;
+      if(!gpu_ok(gpuGetLastError(),"state_up"))SSMCR_RET(0);
     }
     picolm_gpu_prof_end(_ssmps);
     return ok;
