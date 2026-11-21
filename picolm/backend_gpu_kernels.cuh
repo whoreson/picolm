@@ -27,6 +27,7 @@ __global__ void picolm_q5_k_q8_matmul_imma_mt(float *y, const int8_t *xq, const 
  * AND 3.4% of compute at the same time. */
 #define Q5KW_WARPS 8
 __global__ void picolm_q5_k_q8_matmul_imma_w8(float *y, const int8_t *xq, const float *xd, const void *weights, int S, int I, int O, int row_bytes, int y_stride);
+__global__ void picolm_q5_k_q8_matmul_imma_cs(float *y, const int8_t *xq, const float *xd, const void *weights, int S, int I, int O, int row_bytes, int y_stride);
 __global__ void picolm_q4_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd, const void *weights, int S, int I, int O, int row_bytes, int y_stride);
 __global__ void picolm_q3_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd, const void *weights, int S, int I, int O, int row_bytes, int y_stride);
 __global__ void picolm_q2_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd, const void *weights, int S, int I, int O, int row_bytes, int y_stride);
@@ -46,6 +47,14 @@ __global__ void picolm_q2_k_q8_matmul_imma(float *y, const int8_t *xq, const flo
  * Each block quantizes one 32-element chunk of one input row. */
 
 __global__ void picolm_quantize_q8_0(int8_t *qs_out, float *d_out, const float *x, int I, int S);
+
+/* Warp-per-block Q8_0 activation quantiser: identical output, but one warp per
+ * 32 values with a shuffle reduction instead of one 32-thread block per 32
+ * values with 5 block-wide barriers. The barrier version measured 1.6 GB/s
+ * (0.2% of the card) and dominated prefill. */
+#define Q8Q_WARPS 8
+__global__ void picolm_quantize_q8_0_fast(int8_t *qs_out, float *d_out, const float *x, int I, int S);
+__global__ void picolm_quantize_q8_0_fast_strided(int8_t *qs_out, float *d_out, const float *x, int I, int S, int x_stride);
 
 /* Strided variant: x_stride > 0 overrides the default s*I stride.
  * Output is always contiguous [S][I]. Only called when x_stride != I. */

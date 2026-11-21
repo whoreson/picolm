@@ -322,6 +322,100 @@ picolm_quantize_q8_0(int8_t *qs_out, float *d_out,
             gpu_fp16_to_fp32((int)gpu_fp32_to_fp16(d));
 }
 
+/* picolm_quantize_q8_0_fast -- same result as picolm_quantize_q8_0, done by a
+ * WARP per 32-value block instead of a 32-thread BLOCK per 32-value block.
+ *
+ * Why this exists, and it is the whole prefill story:
+ *   The scalar version allocates one CUDA block per 32 values and reduces the
+ *   abs-max through __shared__ with FIVE gpuSyncthreads() per block. For the
+ *   27B at S=423 that is a grid of (160, 423) = 67680 blocks, each 32 threads,
+ *   each with 5 block-wide barriers -- 338400 barriers to quantise 2.17 MB.
+ *   Measured: 688 ms for 248 calls, i.e. ~1.6 GB/s, 0.2% of the card.
+ *
+ *   That cost was previously attributed to the q5_K matmul because the
+ *   profiler's slot wraps picolm_gpu_matmul_dev(), which includes the
+ *   quantize. Proof: building the matmul with an EMPTY inner loop left the
+ *   q5_K slot at 688 ms while prefill speed did not move.
+ *
+ * This version: Q8Q_WARPS warps per block, one warp per 32 values, warp
+ * shuffle reduction (no shared memory, no barriers), and grid 8x smaller.
+ * Same arithmetic and the same fp16 rounding of d, so the output is
+ * bit-identical -- verified with --gpu-q8diff and PICOLM_DUMP_LOGITS.
+ */
+#define Q8Q_WARPS 8
+
+__global__ void
+picolm_quantize_q8_0_fast(int8_t *qs_out, float *d_out,
+                           const float *x, int I, int S) {
+    int n_blocks = (I + 31) >> 5;
+    int wid  = (int)(gpuThreadIdx_x >> 5);          /* warp within block  */
+    int lane = (int)(gpuThreadIdx_x & 31);
+
+    /* Flatten (row, block) across the whole grid so there is no 2-D launch
+     * limit and every warp gets exactly one 32-value block. */
+    long long gid = (long long)gpuBlockIdx_x * Q8Q_WARPS + wid;
+    long long total = (long long)S * n_blocks;
+    if (gid >= total) return;
+
+    int s = (int)(gid / n_blocks);
+    int blk = (int)(gid % n_blocks);
+    const float *xb = x + (size_t)s * (size_t)I + (size_t)blk * 32;
+
+    float v = xb[lane];
+    float amax = fabsf(v);
+    /* butterfly max across the warp -- no shared memory, no barriers */
+    for (int off = 16; off > 0; off >>= 1) {
+        float o = gpuShflXorSync(0xffffffffu, amax, off);
+        amax = fmaxf(amax, o);
+    }
+
+    float d  = amax / 127.0f;
+    float id = (amax > 0.0f) ? 127.0f / amax : 0.0f;
+    int q = (int)lroundf(v * id);
+    if (q > 127) q = 127;
+    if (q < -127) q = -127;
+
+    qs_out[(size_t)s * (size_t)n_blocks * 32 + (size_t)blk * 32 + lane] = (int8_t)q;
+    if (lane == 0)
+        d_out[(size_t)s * (size_t)n_blocks + blk] =
+            gpu_fp16_to_fp32((int)gpu_fp32_to_fp16(d));
+}
+
+/* Strided variant: the activation row is x[s*x_stride ...], same otherwise. */
+__global__ void
+picolm_quantize_q8_0_fast_strided(int8_t *qs_out, float *d_out,
+                                   const float *x, int I, int S, int x_stride) {
+    int n_blocks = (I + 31) >> 5;
+    int wid  = (int)(gpuThreadIdx_x >> 5);
+    int lane = (int)(gpuThreadIdx_x & 31);
+
+    long long gid = (long long)gpuBlockIdx_x * Q8Q_WARPS + wid;
+    long long total = (long long)S * n_blocks;
+    if (gid >= total) return;
+
+    int s = (int)(gid / n_blocks);
+    int blk = (int)(gid % n_blocks);
+    const float *xb = x + (size_t)s * (size_t)x_stride + (size_t)blk * 32;
+
+    float v = xb[lane];
+    float amax = fabsf(v);
+    for (int off = 16; off > 0; off >>= 1) {
+        float o = gpuShflXorSync(0xffffffffu, amax, off);
+        amax = fmaxf(amax, o);
+    }
+
+    float d  = amax / 127.0f;
+    float id = (amax > 0.0f) ? 127.0f / amax : 0.0f;
+    int q = (int)lroundf(v * id);
+    if (q > 127) q = 127;
+    if (q < -127) q = -127;
+
+    qs_out[(size_t)s * (size_t)n_blocks * 32 + (size_t)blk * 32 + lane] = (int8_t)q;
+    if (lane == 0)
+        d_out[(size_t)s * (size_t)n_blocks + blk] =
+            gpu_fp16_to_fp32((int)gpu_fp32_to_fp16(d));
+}
+
 /* Quantize F32/BF16 weight rows to Q8_0 block format.
  * Each block handles one weight row (one head).
  * Output: contiguous block_q8_0 layout [n_heads][n_blocks*GPU_BLOCK_Q8_0_SIZE].
@@ -3282,6 +3376,229 @@ picolm_q6_k_q8_matmul_imma_mt(float *y, const int8_t *xq, const float *xd,
     }
 }
 
+/* Q5_K x Q8_0 IMMA kernel, COALESCED shared-memory weight staging.
+ *
+ * WHY (this is the prefill root cause, measured):
+ *   The per-warp weight read in every other Q5_K kernel is 8-row strided. With
+ *   gid = lane/4 selecting the output row, the 32 lanes of a warp read 8
+ *   segments of 16 contiguous bytes, each row_bytes (3520 B for ffn_gate)
+ *   apart. That touches 8 different pages per k-block step and uses 16 of
+ *   every 128-byte cache line -- 12.5%.
+ *
+ *     measured      23.5 GB in 695 ms =  34 GB/s  (3% of 1008 GB/s)
+ *     decode GEMV   on the SAME weights          = 805 GB/s
+ *
+ *   The GEMV wins because all 4 warps of a block cooperate on ONE row, so its
+ *   reads are contiguous. This kernel applies the same idea to the GEMM: the
+ *   whole block loads the 176-byte Q5_K block for each of its 8 output rows
+ *   with a LINEAR, coalesced read into shared memory, then each warp unpacks
+ *   its own row from shared memory into the mma fragments.
+ *
+ *   8 rows x 176 B = 1408 B staged per k-block by 256 threads = 5.5 B/thread,
+ *   i.e. one coalesced 128-byte transaction per row per 32 threads.
+ *
+ * Arithmetic is unchanged -- same nibble/high-bit decode, same min-correction,
+ * same fp32 epilogue -- so the output must stay bit-identical. Validate with
+ * PICOLM_DUMP_LOGITS and --gpu-q8diff before believing any speed number.
+ *
+ * Shared memory: weight stage 8*176 = 1408 B (double-buffered: 2816 B), plus
+ * the accumulator block Q5KW_WARPS*32*Q5K_TILES_S*4 floats = 64 KB at TILES=16,
+ * which needs the cudaFuncSetAttribute opt-in (see the dispatch).
+ */
+__global__ void
+picolm_q5_k_q8_matmul_imma_cs(float *y, const int8_t *xq, const float *xd,
+                               const void *weights, int S, int I, int O,
+                               int row_bytes, int y_stride) {
+    const int warp = (int)(gpuThreadIdx_x >> 5);
+    const int lane = (int)(gpuThreadIdx_x & 31);
+    const int tIdx = (int)gpuThreadIdx_x;
+    const int nThreads = (int)gpuBlockDim_x;
+    int gid = lane / 4;
+    int tid = lane % 4;
+
+    int tile_o = (int)gpuBlockIdx_x * (8 * Q5KW_WARPS) + warp * 8;
+    int tile_s0 = (int)gpuBlockIdx_y * (16 * Q5K_TILES_S);
+    int ys = y_stride > 0 ? y_stride : O;
+    int n_blocks = I / 32;
+    const uint8_t *w = (const uint8_t *)weights;
+
+    int n_tiles = (S - tile_s0 + 15) >> 4;
+    if (n_tiles > Q5K_TILES_S) n_tiles = Q5K_TILES_S;
+    if (n_tiles <= 0) return;
+
+    extern __shared__ float cs_smem[];
+    /* [accumulators][staged weight block: 8 rows x 176 B] */
+    float *sum_sh = cs_smem;
+    const int acc_floats = Q5KW_WARPS * 32 * Q5K_TILES_S * 4;
+    uint8_t *wstage = (uint8_t *)(sum_sh + acc_floats);   /* Q5KW_WARPS * 176 */
+
+    {
+        int total = Q5KW_WARPS * 32 * Q5K_TILES_S * 4;
+        for (int i = tIdx; i < total; i += nThreads) sum_sh[i] = 0.0f;
+        /* zero the stage so the tail rows (col >= O) are deterministic */
+        int wtotal = Q5KW_WARPS * GPU_BLOCK_Q5_K_SIZE;
+        for (int i = tIdx; i < wtotal; i += nThreads) wstage[i] = 0;
+    }
+    gpuSyncthreads();
+
+    float *mysum = sum_sh + ((size_t)warp * 32 + lane) * 4;
+
+    for (int kb = 0; kb < n_blocks; kb++) {
+        int q5_block = kb / 8;
+        int g = kb % 8;
+
+        /* ---- COALESCED staged load of this k-block for all 8 rows ----
+         * Each of the block's 256 threads copies a 176/warps-worth slice of one
+         * row: total 8*176 = 1408 bytes, read as consecutive bytes. */
+        {
+            const int per = GPU_BLOCK_Q5_K_SIZE;              /* 176 */
+            int total = Q5KW_WARPS * per;
+            for (int i = tIdx; i < total; i += nThreads) {
+                int r = i / per;             /* which of the 8 output rows */
+                int off = i - r * per;       /* byte within the Q5_K block  */
+                int col = tile_o + r;
+                if (col < O)
+                    wstage[(size_t)r * per + off] =
+                        ((const uint8_t *)weights)[(size_t)col * row_bytes
+                                                   + (size_t)q5_block * GPU_BLOCK_Q5_K_SIZE + off];
+            }
+        }
+        gpuSyncthreads();
+
+        /* ---- from here on this is the multi-warp kernel, reading shared ---- */
+        const uint8_t *wb = wstage + (size_t)warp * GPU_BLOCK_Q5_K_SIZE;
+
+        int b0, b1;
+        {
+            int group = g >> 1;
+            int sub = g & 1;
+            const uint8_t *qs_base = wb + 48 + group * 32;
+            const uint8_t *qh_base = wb + 16;
+            int bit_shift = 2 * group + sub;
+            uint32_t b0_val = 0, b1_val = 0;
+            for (int e = 0; e < 4; e++) {
+                int l = tid * 4 + e;
+                uint8_t qs_byte = qs_base[l];
+                uint8_t nibble = sub ? (qs_byte >> 4) : (qs_byte & 0xF);
+                uint8_t high = ((qh_base[l] >> bit_shift) & 1) ? 16 : 0;
+                b0_val |= (uint32_t)(nibble + high) << (e * 8);
+
+                int l1 = 16 + tid * 4 + e;
+                uint8_t qs1 = qs_base[l1];
+                uint8_t nib1 = sub ? (qs1 >> 4) : (qs1 & 0xF);
+                uint8_t hi1 = ((qh_base[l1] >> bit_shift) & 1) ? 16 : 0;
+                b1_val |= (uint32_t)(nib1 + hi1) << (e * 8);
+            }
+            b0 = (int)b0_val;
+            b1 = (int)b1_val;
+        }
+
+        float wds0, wdmn0, wds1, wdmn1;
+        {
+            /* per-OUTPUT-COLUMN scales: each has its own row, so these still
+             * come from global memory; they are 4 bytes per row per k-block,
+             * a 16th of the weight traffic, so they are not the bottleneck. */
+            size_t wb0_off = (size_t)(tile_o + tid * 2) * row_bytes + q5_block * GPU_BLOCK_Q5_K_SIZE;
+            const uint8_t *wb0 = w + wb0_off;
+            float wd0 = gpu_fp16_to_fp32((uint16_t)(wb0[0] | (wb0[1] << 8)));
+            float wdm0 = gpu_fp16_to_fp32((uint16_t)(wb0[2] | (wb0[3] << 8)));
+            uint8_t sc0, mn0;
+            { const uint8_t *s0 = wb0 + 4;
+              if (g < 4) { sc0 = s0[g] & 63; mn0 = s0[g + 4] & 63; }
+              else { sc0 = (uint8_t)((s0[g + 4] & 0xF) | ((s0[g - 4] >> 6) << 4));
+                      mn0 = (uint8_t)((s0[g + 4] >> 4) | ((s0[g] >> 6) << 4)); } }
+            wds0 = wd0 * (float)sc0;
+            wdmn0 = wdm0 * (float)mn0;
+
+            size_t wb1_off = (size_t)(tile_o + tid * 2 + 1) * row_bytes + q5_block * GPU_BLOCK_Q5_K_SIZE;
+            const uint8_t *wb1 = w + wb1_off;
+            float wd1 = gpu_fp16_to_fp32((uint16_t)(wb1[0] | (wb1[1] << 8)));
+            float wdm1 = gpu_fp16_to_fp32((uint16_t)(wb1[2] | (wb1[3] << 8)));
+            uint8_t sc1, mn1;
+            { const uint8_t *s1 = wb1 + 4;
+              if (g < 4) { sc1 = s1[g] & 63; mn1 = s1[g + 4] & 63; }
+              else { sc1 = (uint8_t)((s1[g + 4] & 0xF) | ((s1[g - 4] >> 6) << 4));
+                      mn1 = (uint8_t)((s1[g + 4] >> 4) | ((s1[g] >> 6) << 4)); } }
+            wds1 = wd1 * (float)sc1;
+            wdmn1 = wdm1 * (float)mn1;
+        }
+
+        for (int t = 0; t < n_tiles; t++) {
+            int tile_s = tile_s0 + t * 16;
+
+            int a0, a1, a2, a3;
+            {
+                int c0 = tid * 4;
+                int c2 = c0 + 16;
+                int row0 = tile_s + gid;
+                int row1 = tile_s + gid + 8;
+                if (row0 >= S) row0 = S - 1;
+                if (row1 >= S) row1 = S - 1;
+                int src0 = row0 * I + kb * 32 + c0;
+                int src1 = row1 * I + kb * 32 + c0;
+                int src2 = row0 * I + kb * 32 + c2;
+                int src3 = row1 * I + kb * 32 + c2;
+                int32_t *p;
+                p = (int32_t *)(const int8_t *)(&xq[src0]); a0 = p[0];
+                p = (int32_t *)(const int8_t *)(&xq[src1]); a1 = p[0];
+                p = (int32_t *)(const int8_t *)(&xq[src2]); a2 = p[0];
+                p = (int32_t *)(const int8_t *)(&xq[src3]); a3 = p[0];
+            }
+
+            int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIP__)
+            asm volatile(
+                "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                : "+r"(d0), "+r"(d1), "+r"(d2), "+r"(d3)
+                : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
+
+            int sq0 = 0, sq1 = 0;
+            {
+                int8_t *av;
+                av = (int8_t *)&a0; sq0 += av[0] + av[1] + av[2] + av[3];
+                av = (int8_t *)&a2; sq0 += av[0] + av[1] + av[2] + av[3];
+                av = (int8_t *)&a1; sq1 += av[0] + av[1] + av[2] + av[3];
+                av = (int8_t *)&a3; sq1 += av[0] + av[1] + av[2] + av[3];
+            }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 300
+            {
+                const unsigned mask = 0xFFFFFFFFu;
+                sq0 += gpuShflDownSync(mask, sq0, 2, 4);
+                sq1 += gpuShflDownSync(mask, sq1, 2, 4);
+                sq0 += gpuShflDownSync(mask, sq0, 1, 4);
+                sq1 += gpuShflDownSync(mask, sq1, 1, 4);
+                sq0 = gpuShflSync(mask, sq0, 0, 4);
+                sq1 = gpuShflSync(mask, sq1, 0, 4);
+            }
+#endif
+
+            const int row_a = tile_s + gid;
+            const int row_b = tile_s + gid + 8;
+            float dx0 = (row_a < S) ? xd[(size_t)row_a * n_blocks + kb] : 0.0f;
+            float dx1 = (row_b < S) ? xd[(size_t)row_b * n_blocks + kb] : 0.0f;
+
+            { float *S4 = mysum + (size_t)t * Q5KW_WARPS * 32 * 4;
+              S4[0] += wds0 * dx0 * (float)d0 - wdmn0 * dx0 * (float)sq0;
+              S4[2] += wds0 * dx1 * (float)d2 - wdmn0 * dx1 * (float)sq1;
+              S4[1] += wds1 * dx0 * (float)d1 - wdmn1 * dx0 * (float)sq0;
+              S4[3] += wds1 * dx1 * (float)d3 - wdmn1 * dx1 * (float)sq1; }
+        }
+        gpuSyncthreads();   /* stage is reused next k-block */
+    }
+
+    for (int t = 0; t < n_tiles; t++) {
+        int tile_s = tile_s0 + t * 16;
+        for (int f = 0; f < 4; f++) {
+            int row = tile_s + ((f < 2) ? gid : gid + 8);
+            int col = tile_o + tid * 2 + (f % 2);
+            if (row < S && col < O)
+                y[(size_t)row * ys + (size_t)col] = mysum[(size_t)t * Q5KW_WARPS * 32 * 4 + f];
+        }
+    }
+}
+
 /* Q5_K x Q8_0 IMMA kernel, MULTI-WARP x MULTI-TILE.
  *
  * WHY: measured on the 27B at S=423, the multi-tile kernel above runs at
@@ -3326,6 +3643,14 @@ picolm_q5_k_q8_matmul_imma_w8(float *y, const int8_t *xq, const float *xd,
     int n_blocks = I / 32;
     const uint8_t *w = (const uint8_t *)weights;
 
+#ifdef PICOLM_ABL_DEAD_KERNEL
+    /* ABLATION ONLY: the whole kernel body is gone -- no loop, no loads, no
+     * shared memory init. What is left is launch + scheduling + the empty
+     * grid. Compare against a build where the launch is skipped entirely
+     * (PICOLM_ABL_NO_Q5_LAUNCH) to separate launch cost from work. */
+    if (y) y[0] = y[0];
+    return;
+#endif
     int n_tiles = (S - tile_s0 + 15) >> 4;
     if (n_tiles > Q5K_TILES_S) n_tiles = Q5K_TILES_S;
     if (n_tiles <= 0) return;
@@ -3460,7 +3785,7 @@ picolm_q5_k_q8_matmul_imma_w8(float *y, const int8_t *xq, const float *xd,
             float dx0 = (row_a < S) ? xd[(size_t)row_a * n_blocks + kb] : 0.0f;
             float dx1 = (row_b < S) ? xd[(size_t)row_b * n_blocks + kb] : 0.0f;
 
-            { float *S4 = mysum + (size_t)t * 32 * 4;
+            { float *S4 = mysum + (size_t)t * Q5KW_WARPS * 32 * 4;
               S4[0] += wds0 * dx0 * (float)d0 - wdmn0 * dx0 * (float)sq0;
               S4[2] += wds0 * dx1 * (float)d2 - wdmn0 * dx1 * (float)sq1;
               S4[1] += wds1 * dx0 * (float)d1 - wdmn1 * dx0 * (float)sq0;
@@ -3474,7 +3799,7 @@ picolm_q5_k_q8_matmul_imma_w8(float *y, const int8_t *xq, const float *xd,
             int row = tile_s + ((f < 2) ? gid : gid + 8);
             int col = tile_o + tid * 2 + (f % 2);
             if (row < S && col < O)
-                y[(size_t)row * ys + (size_t)col] = mysum[(size_t)t * 32 * 4 + f];
+                y[(size_t)row * ys + (size_t)col] = mysum[(size_t)t * Q5KW_WARPS * 32 * 4 + f];
         }
     }
 }
