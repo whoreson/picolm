@@ -706,6 +706,20 @@ static void kv_strides_for(int device, int is_k, int n_kv_heads, int head_dim,
  * exactly -- no regression risk for short contexts) vs split-K (grid=
  * n_kv_heads*n_splits + a merge pass) based on how many KV positions
  * there are to walk. xb_dev/q_dev must already be device pointers. */
+/* Decode attention on picolm_gpu_attention_decode_warp_kernel: F16 KV cache,
+ * head_dim a multiple of 32 up to 256, kv_mul <= 8, CUDA (32-lane warps).
+ * PICOLM_NO_ATTN_DECODE_WARP=1 keeps the single-pass/split kernels. */
+static int attn_decode_warp_ok(int head_dim, int kv_mul, int kv_type) {
+#ifdef __HIP__
+    (void)head_dim; (void)kv_mul; (void)kv_type;
+    return 0;
+#else
+    static int off = -1;
+    if (off < 0) off = getenv("PICOLM_NO_ATTN_DECODE_WARP") ? 1 : 0;
+    return !off && kv_type == 0 && head_dim % 32 == 0 && head_dim <= 256 && kv_mul <= 8;
+#endif
+}
+
 static int
 attn_decode_dispatch(float *xb_dev, const float *q_dev,
                       int layer_ordinal, int pos,
@@ -743,6 +757,13 @@ attn_decode_dispatch(float *xb_dev, const float *q_dev,
     int n_splits = (total_kv + ATTN_DECODE_TARGET_CHUNK - 1) / ATTN_DECODE_TARGET_CHUNK;
     if (n_splits > ATTN_DECODE_MAX_SPLITS) n_splits = ATTN_DECODE_MAX_SPLITS;
     if (n_splits < 1) n_splits = 1;
+    int warp_kernel = attn_decode_warp_ok(head_dim, kv_mul, kv_type);
+    if (warp_kernel) {
+        /* ~240 blocks fill the GPU; keep at least 16 keys per split. */
+        n_splits = (240 + n_kv_heads - 1) / n_kv_heads;
+        if (n_splits > (total_kv + 15) / 16) n_splits = (total_kv + 15) / 16;
+        if (n_splits < 1) n_splits = 1;
+    }
 
     size_t shared_bytes = 2 * head_dim * sizeof(uint16_t) + 256 * sizeof(float)
                          + (size_t)kv_mul * head_dim * sizeof(float)
@@ -750,7 +771,7 @@ attn_decode_dispatch(float *xb_dev, const float *q_dev,
                          + (size_t)kv_mul * sizeof(float)
                          + 2 * sizeof(float); /* rescale_sh + weight_sh */
 
-    if (n_splits <= 1) {
+    if (n_splits <= 1 && !warp_kernel) {
         gpu_dispatch_print("attn_decode");
         int _ps = picolm_gpu_prof_slot("attn_decode");
         picolm_gpu_prof_begin(device);
@@ -775,7 +796,7 @@ attn_decode_dispatch(float *xb_dev, const float *q_dev,
     float *partial_sum = partial_max + (size_t)n_heads * n_splits;
     float *partial_acc = partial_sum + (size_t)n_heads * n_splits;
 
-    gpu_dispatch_print("attn_decode_split");
+    if (!warp_kernel) gpu_dispatch_print("attn_decode_split");
     /* The split-K path had NO prof slot, so every time context grew past
      * ATTN_DECODE_MIN_CHUNK the decode attention's cost simply left the
      * accounting and inflated the "unexplained" gap. That is precisely the
@@ -783,6 +804,14 @@ attn_decode_dispatch(float *xb_dev, const float *q_dev,
     int _ps_split = picolm_gpu_prof_slot("attn_decode_split");
     picolm_gpu_prof_begin(device);
     dim3 grid_split((unsigned)n_kv_heads, (unsigned)n_splits, 1);
+    if (warp_kernel) {
+        gpu_dispatch_print("attn_decode_warp");
+        picolm_gpu_attention_decode_warp_kernel<<<grid_split, 128, 0, ctx->stream>>>(
+            partial_max, partial_sum, partial_acc,
+            q_dev, g_kv_k_dev[device], g_kv_v_dev[device],
+            layer_ordinal, pos, n_heads, n_kv_heads, head_dim, max_seq_len,
+            kv_pos_stride_bytes, kv_head_stride_bytes, kv_head_stride_v_bytes, n_splits, chunk_size, n_swa);
+    } else
     picolm_gpu_attention_decode_split_kernel<<<grid_split, 256, (unsigned)shared_bytes, ctx->stream>>>(
         partial_max, partial_sum, partial_acc,
         q_dev, g_kv_k_dev[device], g_kv_v_dev[device],

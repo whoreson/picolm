@@ -287,6 +287,14 @@ __global__ void picolm_gpu_attention_decode_kernel( float *xb_out, const float *
  * [1, ATTN_DECODE_MAX_SPLITS]. Larger context therefore means more blocks
  * rather than longer serial scans. */
 #define ATTN_DECODE_TARGET_CHUNK 64
+/* Decode attention, warp per key: split-K partials for the merge kernel.
+ * grid (n_kv_heads, n_splits), 128 threads. F16 KV, head_dim % 32 == 0, <= 256, kv_mul <= 8. */
+__global__ void picolm_gpu_attention_decode_warp_kernel(
+    float *partial_max, float *partial_sum, float *partial_acc, const float *q_dev,
+    const uint16_t *kv_k, const uint16_t *kv_v, int layer_ordinal, int pos,
+    int n_heads, int n_kv_heads, int head_dim, int max_seq_len,
+    size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes, size_t kv_head_stride_v_bytes,
+    int n_splits, int chunk_size, int n_swa);
 
 /* Partial state layout (flat float buffer, sized by the host wrapper):
  *   partial_max: [n_heads][n_splits]

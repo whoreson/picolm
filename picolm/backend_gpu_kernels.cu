@@ -5480,6 +5480,117 @@ picolm_gpu_attention_decode_split_kernel(
         partial_acc[(size_t)idx_base * head_dim + i] = acc_sh[i];
 }
 
+/* ---- Decode attention, warp per key (split-K partials for the merge kernel) ----
+ *
+ * The split kernel above walks its keys one at a time with the whole block:
+ * load the K/V row, sync, score on one warp, sync, update the softmax on
+ * thread 0, sync, accumulate V -- three barriers per key and query head.
+ * Here each of the 4 warps of a block takes every 4th key of the split on
+ * its own. Lane l holds head_dim/32 consecutive dimensions of Q (all kv_mul
+ * query heads of this KV head, pre-scaled), K and V; a score is a
+ * warp-wide sum, and each warp keeps its own online softmax per query
+ * head. At the end the 4 warps are combined and written in the split
+ * kernel's partial format, so picolm_gpu_attention_decode_merge_kernel
+ * finishes the job unchanged.
+ *
+ * F16 KV cache, head_dim a multiple of 32 up to 256, kv_mul <= 8, 32-lane
+ * warps (CUDA). Not bit-identical to the split kernel (different summation
+ * order); decode attention is validated to a tolerance, see above. */
+#define ADW_G   8    /* max query heads per KV head */
+#define ADW_DPL 8    /* max dimensions per lane (head_dim 256) */
+
+__global__ void __launch_bounds__(128)
+picolm_gpu_attention_decode_warp_kernel(
+        float *partial_max, float *partial_sum, float *partial_acc,
+        const float *q_dev,
+        const uint16_t *kv_k, const uint16_t *kv_v,
+        int layer_ordinal, int pos,
+        int n_heads, int n_kv_heads, int head_dim, int max_seq_len,
+        size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes, size_t kv_head_stride_v_bytes,
+        int n_splits, int chunk_size, int n_swa)
+{
+    __shared__ float wm[4][ADW_G], wl[4][ADW_G];
+    __shared__ float wacc[4][ADW_G * ADW_DPL * 32];
+
+    int kv_h = gpuBlockIdx_x, split = gpuBlockIdx_y;
+    int tid = gpuThreadIdx_x, lane = tid & 31, warp = tid >> 5;
+    int kv_mul = n_heads / n_kv_heads, first_qh = kv_h * kv_mul;
+    int dpl = head_dim / 32, d0 = lane * dpl;
+
+    int t0 = split * chunk_size, t1 = min(t0 + chunk_size, pos + 1);
+    if (n_swa > 0) t0 = max(t0, pos - n_swa + 1);
+
+    size_t pos_stride = kv_pos_stride_bytes / 2;
+    size_t layer_base = (size_t)layer_ordinal * max_seq_len * pos_stride;
+    const __half *kb = (const __half *)kv_k + layer_base + (size_t)kv_h * (kv_head_stride_bytes / 2) + d0;
+    const __half *vb = (const __half *)kv_v + layer_base + (size_t)kv_h * (kv_head_stride_v_bytes / 2) + d0;
+
+    float scale = 1.0f / sqrtf((float)head_dim);
+    float q[ADW_G][ADW_DPL], acc[ADW_G][ADW_DPL], m[ADW_G], l[ADW_G];
+#pragma unroll
+    for (int g = 0; g < ADW_G; g++) {
+        m[g] = -1e30f; l[g] = 0.0f;
+#pragma unroll
+        for (int i = 0; i < ADW_DPL; i++) {
+            acc[g][i] = 0.0f;
+            q[g][i] = g < kv_mul && i < dpl ? q_dev[(size_t)(first_qh + g) * head_dim + d0 + i] * scale : 0.0f;
+        }
+    }
+
+    for (int t = t0 + warp; t < t1; t += 4) {
+        float k[ADW_DPL], v[ADW_DPL];
+#pragma unroll
+        for (int i = 0; i < ADW_DPL; i++) {
+            k[i] = i < dpl ? __half2float(kb[(size_t)t * pos_stride + i]) : 0.0f;
+            v[i] = i < dpl ? __half2float(vb[(size_t)t * pos_stride + i]) : 0.0f;
+        }
+#pragma unroll
+        for (int g = 0; g < ADW_G; g++) {
+            if (g >= kv_mul) break;
+            float s = 0.0f;
+#pragma unroll
+            for (int i = 0; i < ADW_DPL; i++) s = fmaf(q[g][i], k[i], s);
+            for (int off = 16; off > 0; off >>= 1) s += gpuShflXorSync(0xFFFFFFFFu, s, off);
+            if (s > m[g]) {
+                float r = expf(m[g] - s);
+                l[g] = l[g] * r + 1.0f;
+#pragma unroll
+                for (int i = 0; i < ADW_DPL; i++) acc[g][i] = fmaf(acc[g][i], r, v[i]);
+                m[g] = s;
+            } else {
+                float w = expf(s - m[g]);
+                l[g] += w;
+#pragma unroll
+                for (int i = 0; i < ADW_DPL; i++) acc[g][i] = fmaf(w, v[i], acc[g][i]);
+            }
+        }
+    }
+
+    /* Combine the 4 warps into this split's partial. */
+#pragma unroll
+    for (int g = 0; g < ADW_G; g++) {
+        if (g >= kv_mul) break;
+        if (lane == 0) { wm[warp][g] = m[g]; wl[warp][g] = l[g]; }
+#pragma unroll
+        for (int i = 0; i < ADW_DPL; i++)
+            if (i < dpl) wacc[warp][g * head_dim + d0 + i] = acc[g][i];
+    }
+    gpuSyncthreads();
+    int idx_base = (kv_h * n_splits + split) * kv_mul;
+    for (int e = tid; e < kv_mul * head_dim; e += 128) {
+        int g = e / head_dim;
+        float mx = fmaxf(fmaxf(wm[0][g], wm[1][g]), fmaxf(wm[2][g], wm[3][g]));
+        float a = 0.0f, s = 0.0f;
+        for (int w = 0; w < 4; w++) {
+            float f = expf(wm[w][g] - mx);
+            a += f * wacc[w][e];
+            s += f * wl[w][g];
+        }
+        partial_acc[(size_t)idx_base * head_dim + e] = a;
+        if (e % head_dim == 0) { partial_max[idx_base + g] = mx; partial_sum[idx_base + g] = s; }
+    }
+}
+
 /* lines 737-789 from backend_gpu_kernels.cuh */
 __global__ void
 picolm_gpu_attention_decode_merge_kernel(
