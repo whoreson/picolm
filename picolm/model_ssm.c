@@ -2900,9 +2900,12 @@ ssm_forward_gpu(model_t *m, run_state_t *s, float *x, float *residual,
     /* 3b. Head permute xb2 (GGUF v-head reorder) */
     float *xb2_src = ssm_xb2;
     if (do_remap) {
+        int _ps = picolm_gpu_prof_slot("ssm_permute");
+        picolm_gpu_prof_begin(device);
         if (!picolm_gpu_ssm_head_permute_dev(ssm_xb2_remap, ssm_xb2,
                 head_map_dev, head_v_dim, n_v_heads, device)) {
             return 0; }
+        picolm_gpu_prof_end(_ps);
         xb2_src = ssm_xb2_remap;
     }
 
@@ -2920,6 +2923,8 @@ ssm_forward_gpu(model_t *m, run_state_t *s, float *x, float *residual,
         picolm_gpu_memcpy(dbg_qkv_raw, ssm_qkv_raw, conv_dim * sizeof(float), -1, device);
         picolm_gpu_memcpy(dbg_conv_w, gw->ssm_conv1d_dev[il], d_conv * conv_dim * sizeof(float), -1, device);
     }
+    int _ps_conv = picolm_gpu_prof_slot("ssm_conv1d");
+    picolm_gpu_prof_begin(device);
     if (!picolm_gpu_ssm_conv1d_dev(ssm_conv_out,
             (float *)gw->ssm_conv_state_dev[il],
             ssm_qkv_raw,
@@ -2930,6 +2935,7 @@ ssm_forward_gpu(model_t *m, run_state_t *s, float *x, float *residual,
                 "CPU fallback.\n", il, pos);
         abort();
     }
+    picolm_gpu_prof_end(_ps_conv);
 
     /* DEBUG: compare GPU conv1d output with CPU reference */
     if (il == 0 && pos < 40 && _SSM_DBG) {
@@ -2973,23 +2979,33 @@ ssm_forward_gpu(model_t *m, run_state_t *s, float *x, float *residual,
      * before the recurrence, on every token of every layer.
      * Fixed: K gets extra_scale=1.0 (identity, normalize only). */
     float q_scale = 1.0f / sqrtf((float)d_state);
+    {
+    int _ps = picolm_gpu_prof_slot("ssm_l2norm");
+    picolm_gpu_prof_begin(device);
     if (!picolm_gpu_ssm_l2norm_dev(q_dev, d_state, n_k_heads, 1e-12f, q_scale, device) ||
         !picolm_gpu_ssm_l2norm_dev(k_dev, d_state, n_k_heads, 1e-12f, 1.0f, device)) {
         fprintf(stderr, "FATAL: GPU SSM L2 norm failed for layer %d, pos %d.\n", il, pos);
         abort();
     }
+    picolm_gpu_prof_end(_ps);
+    }
 
     /* 8. Head permute V (if GGUF reorders) */
     if (do_remap) {
+        int _ps = picolm_gpu_prof_slot("ssm_permute");
+        picolm_gpu_prof_begin(device);
         if (!picolm_gpu_ssm_head_permute_dev(ssm_v_remap, v_dev,
                 head_map_dev, head_v_dim, n_v_heads, device)) {
             fprintf(stderr, "FATAL: GPU SSM V head-permute failed for layer %d, pos %d.\n", il, pos);
             abort();
         }
+        picolm_gpu_prof_end(_ps);
         v_dev = ssm_v_remap;
     }
 
     /* 9. Alpha vecdot -- type already validated at top of function */
+    int _ps_vec = picolm_gpu_prof_slot("ssm_vecdot");
+    picolm_gpu_prof_begin(device);
     {
         gguf_type_t alpha_type = lw->type_ssm_alpha;
         size_t row_bytes = gguf_type_row_size(alpha_type, dim);
@@ -3011,9 +3027,13 @@ ssm_forward_gpu(model_t *m, run_state_t *s, float *x, float *residual,
             fprintf(stderr, "FATAL: GPU SSM beta vecdot failed for layer %d, pos %d.\n", il, pos);
             abort();
         }
+        picolm_gpu_prof_end(_ps_vec);
     }
 
     /* 11. Softplus(alpha)+gate + sigmoid(beta) */
+    {
+    int _ps = picolm_gpu_prof_slot("ssm_gate_beta");
+    picolm_gpu_prof_begin(device);
     if (!picolm_gpu_ssm_gate_beta_dev(ssm_gate_exp, ssm_beta_d,
             ssm_alpha_raw, ssm_beta_raw,
             (float *)gw->ssm_a_dev[il],
@@ -3022,10 +3042,15 @@ ssm_forward_gpu(model_t *m, run_state_t *s, float *x, float *residual,
         fprintf(stderr, "FATAL: GPU SSM gate/beta activation failed for layer %d, pos %d.\n", il, pos);
         abort();
     }
+    picolm_gpu_prof_end(_ps);
+    }
 
     /* 12. SSM recurrence (thread-0 kernel by default -- bit-exact with
      * CPU NEON; warp-shuffle only if PICOLM_SSM_WARP_KERNEL_VALIDATED).
      * This mutates gw->ssm_state_dev[il], persistent per-token state. */
+    {
+    int _ps = picolm_gpu_prof_slot("ssm_recurrence");
+    picolm_gpu_prof_begin(device);
     if (!picolm_gpu_ssm_recurrence_pipeline_dev(gw->ssm_state_dev[il],
             q_dev, k_dev, v_dev,
             ssm_gate_exp, ssm_beta_d,
@@ -3034,6 +3059,8 @@ ssm_forward_gpu(model_t *m, run_state_t *s, float *x, float *residual,
                 "with device-resident state already mutated -- "
                 "aborting rather than risk corrupting generation.\n", il, pos);
         abort();
+    }
+    picolm_gpu_prof_end(_ps);
     }
 
     /* DEBUG: dump recurrence output (dim-major ssm_output) for comparison */
@@ -3048,6 +3075,8 @@ ssm_forward_gpu(model_t *m, run_state_t *s, float *x, float *residual,
 
     /* 13. Gated normalization (fuses RMSNorm of dim-major ssm_output
      *     with silu(xb2) gating, writes head-major with GGUF reorder) */
+    int _ps_gn = picolm_gpu_prof_slot("ssm_gated_norm");
+    picolm_gpu_prof_begin(device);
     if (!picolm_gpu_ssm_gated_norm_dev(ssm_final_output, ssm_output, xb2_src,
             (float *)gw->ssm_norm_dev[il],
             head_map_dev,
@@ -3055,6 +3084,7 @@ ssm_forward_gpu(model_t *m, run_state_t *s, float *x, float *residual,
         fprintf(stderr, "FATAL: GPU SSM gated norm failed for layer %d, pos %d.\n", il, pos);
         abort();
     }
+    picolm_gpu_prof_end(_ps_gn);
 
     /* 14. SSM output projection: pipe_xb = ssm_out @ ssm_final_output */
     if (!picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ssm_out,
@@ -5217,6 +5247,7 @@ void model_ssm_state_reset_gpu(model_t *m) {
  * The elementwise kernels (gpu_rmsnorm, gpu_rope_apply,
  * gpu_residual_add) are implemented in backend_gpu.cu. */
 float *model_forward_gpu(model_t *m, int token, int pos) {
+    double _dec_t0 = ssm_now_ms();
     /* Phase 2: GPU-pipelined forward pass.
      * Keeps activations on-device across all layers.
      * Falls back to model_forward() if pipeline not ready. */    model_config_t *c = &m->config;
@@ -5330,7 +5361,6 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
      * is what the prefill path already does, and it keeps the reported
      * per-layer figure meaningful (it is the average layer cost). */
     double _gpu_layer_t0 = ssm_now_ms();
-
     /* 2. Per-layer pipeline. Only layers [0, n_gpu_layers) run here; the tail
      * is handed to the CPU after the loop (PICOLM_NGL hybrid split). With full
      * offload n_gpu_layers == c->n_layers and this is unchanged. */
@@ -5341,6 +5371,7 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
             picolm_gpu_batch_end(gpu_dev);
             picolm_gpu_batch_begin(gpu_dev);
         }
+        picolm_gpu_set_dbg_layer(l);
         layer_weights_t *lw = &w->layers[l];
         gl = &gw->layers[l];
         int did_cpu_ssm = 0;
@@ -5839,6 +5870,17 @@ decode_done:
         }
     }
 
+    {
+        static int dec_tmr = -1;
+        if (dec_tmr < 0) dec_tmr = getenv("PICOLM_DEC_TMR") ? 1 : 0;
+        if (dec_tmr) {
+            static double acc = 0.0; static long n = 0;
+            acc += ssm_now_ms() - _dec_t0; n++;
+            if ((n % 10) == 0)
+                fprintf(stderr, "[DECTMR] %ld tokens, %.2f ms/token end-to-end in model_forward_gpu\n",
+                        n, acc / (double)n);
+        }
+    }
     return s->logits;
 }
 
@@ -5893,6 +5935,7 @@ static int _prefill_gpu_ubatch(model_t *m, run_state_t *s, gpu_weights_t *gw,
         }
         if (interrupt && *interrupt) return -1;
         { char _ts_label[64]; snprintf(_ts_label, 64, "LAYER_%d_START", l); picolm_gpu_ts_write(_ts_label); }
+        picolm_gpu_set_dbg_layer(l);
 
         layer_weights_t *lw = &w->layers[l];
         gl = &gw->layers[l];
