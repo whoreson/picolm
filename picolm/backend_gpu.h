@@ -63,6 +63,17 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t,
  * success. */
 int picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t,
                            float *y_dev, const float *x_dev, int S, int device, int y_stride, int x_stride);
+/* Debug-only: names the layer running right now, so PICOLM_GEMV_DBG lines can
+ * be attributed. Not used by any dispatch decision. */
+void picolm_gpu_set_dbg_layer(int l);
+
+/* PICOLM_GPU_PROF: named timing slots for the GPU pipeline. Every launch in the
+ * _dev pipeline goes on one stream with no internal sync, so a start/end event
+ * pair around a class of launches attributes time with no synchronisation. The
+ * report is printed at exit. No-ops when the env var is unset. */
+int  picolm_gpu_prof_slot(const char *name);
+void picolm_gpu_prof_begin(int device);
+void picolm_gpu_prof_end(int slot);
 int picolm_gpu_matmul_dev_strided(picolm_gpu_tensor_t *t, float *y_dev,
                                    const float *x_dev, int S, int device, int x_stride, int y_stride);
 /* Output projection on GPU (S=1, Q8_0 weights).

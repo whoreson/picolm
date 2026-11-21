@@ -714,7 +714,13 @@ attn_decode_dispatch(float *xb_dev, const float *q_dev,
 
     int total_kv = pos + 1;
     if (n_swa > 0 && n_swa < total_kv) total_kv = n_swa; /* SWA shrinks the split-K work estimate */
-    int n_splits = (total_kv + ATTN_DECODE_MIN_CHUNK - 1) / ATTN_DECODE_MIN_CHUNK;
+    /* Split so each block scans ~ATTN_DECODE_TARGET_CHUNK keys. Using
+     * ATTN_DECODE_MIN_CHUNK (16) here would ask for 615 splits at 9848 keys,
+     * which is pointless: the merge cost and the partial buffer both grow
+     * linearly while the scan per block is already tiny. 64 keys/split keeps
+     * blocks plentiful (context/64 * n_kv_heads blocks) without making merge
+     * dominate. */
+    int n_splits = (total_kv + ATTN_DECODE_TARGET_CHUNK - 1) / ATTN_DECODE_TARGET_CHUNK;
     if (n_splits > ATTN_DECODE_MAX_SPLITS) n_splits = ATTN_DECODE_MAX_SPLITS;
     if (n_splits < 1) n_splits = 1;
 
@@ -750,20 +756,35 @@ attn_decode_dispatch(float *xb_dev, const float *q_dev,
     float *partial_acc = partial_sum + (size_t)n_heads * n_splits;
 
     gpu_dispatch_print("attn_decode_split");
+    /* The split-K path had NO prof slot, so every time context grew past
+     * ATTN_DECODE_MIN_CHUNK the decode attention's cost simply left the
+     * accounting and inflated the "unexplained" gap. That is precisely the
+     * cost that scales with context, so it must be measured. */
+    int _ps_split = picolm_gpu_prof_slot("attn_decode_split");
+    picolm_gpu_prof_begin(device);
     dim3 grid_split((unsigned)n_kv_heads, (unsigned)n_splits, 1);
     picolm_gpu_attention_decode_split_kernel<<<grid_split, 256, (unsigned)shared_bytes, ctx->stream>>>(
         partial_max, partial_sum, partial_acc,
         q_dev, g_kv_k_dev[device], g_kv_v_dev[device],
         layer_ordinal, pos, n_heads, n_kv_heads, head_dim, max_seq_len,
         kv_pos_stride_bytes, kv_head_stride_bytes, kv_head_stride_v_bytes, n_splits, chunk_size, n_swa, kv_type);
+    picolm_gpu_prof_end(_ps_split);
     if (!gpu_ok(gpuGetLastError(), "attn decode split kernel")) return 0;
 
-    size_t merge_shared = (size_t)kv_mul * 2 * sizeof(float);
+    /* Merge kernel dynamic shared: global_max/global_sum (kv_mul each) plus
+     * the hoisted per-split weight table [kv_mul][ATTN_DECODE_MAX_SPLITS].
+     * 6 * 512 * 4 = 12 KB for the largest realistic kv_mul, well under the
+     * 48 KB no-opt-in limit. */
+    size_t merge_shared = (size_t)kv_mul * 2 * sizeof(float)
+                        + (size_t)kv_mul * ATTN_DECODE_MAX_SPLITS * sizeof(float);
     gpu_dispatch_print("attn_decode_merge");
+    int _ps_merge = picolm_gpu_prof_slot("attn_decode_merge");
+    picolm_gpu_prof_begin(device);
     dim3 grid_merge((unsigned)n_kv_heads, 1, 1);
     picolm_gpu_attention_decode_merge_kernel<<<grid_merge, 128, (unsigned)merge_shared, ctx->stream>>>(
         xb_dev, partial_max, partial_sum, partial_acc,
         n_heads, n_kv_heads, head_dim, n_splits);
+    picolm_gpu_prof_end(_ps_merge);
     if (!gpu_ok(gpuGetLastError(), "attn decode merge kernel")) return 0;
     return 1;
 }
@@ -2457,7 +2478,7 @@ int picolm_gpu_ssm_chunked_recurrence_dev(const float *conv_dev, const float *al
  * when not.
  */
 #define PROF_MAX_SLOTS 16
-#define PROF_MAX_EVENTS 65536
+#define PROF_MAX_EVENTS 262144
 
 typedef struct {
     const char *name;
@@ -2472,6 +2493,7 @@ static int   g_prof_on = -1;
 static gpuEvent_t g_prof_ev[PROF_MAX_EVENTS];
 static int   g_prof_ev_n = 0;
 static int   g_prof_slot_log[PROF_MAX_EVENTS];   /* slot for event pair i */
+static int   g_prof_pair_start[PROF_MAX_EVENTS]; /* START event index for that pair */
 static int   g_prof_depth = 0;
 static gpuStream_t g_prof_stream = (gpuStream_t)0;
 
@@ -2483,7 +2505,15 @@ static int prof_enabled(void) {
     if (g_prof_on < 0) {
         g_prof_on = getenv("PICOLM_GPU_PROF") ? 1 : 0;
         if (g_prof_on) {
-            for (int i = 0; i < PROF_MAX_EVENTS; i++) gpuEventCreate(&g_prof_ev[i]);
+            for (int i = 0; i < PROF_MAX_EVENTS; i++) {
+                gpuEventCreate(&g_prof_ev[i]);
+                /* Both pairing arrays are read by prof_flush_ring() before a
+                 * slot is ever written, so an uninitialised entry can win the
+                 * `st < e` sanity check and get paired with a random start
+                 * event. That produced a bogus "gemv_q8_0, 2165 ms/call". */
+                g_prof_slot_log[i]    = -1;
+                g_prof_pair_start[i]  = -1;
+            }
         }
     }
     return g_prof_on;
@@ -2503,9 +2533,44 @@ extern "C" int picolm_gpu_prof_slot(const char *name) {
 /* Record a start event. Nested regions are not supported; the GPU pipeline is
  * a flat sequence of launches, so a simple depth counter is enough to keep
  * begin/end paired. */
+/* Nesting: regions DO nest here -- the whole-pass pair wraps every per-class
+ * pair. The original flat i/i+1 pairing silently mis-attributed everything
+ * (it reported the outer region's total against the inner slots and zero for
+ * all of them). Each open region now records its start event index and the
+ * matching end closes exactly that pair, so an outer region's delta naturally
+ * includes its children. */
+#define PROF_MAX_DEPTH 8
+static int g_prof_open[PROF_MAX_DEPTH];
+static int g_prof_open_n = 0;
+
+/* Fold every completed pair in the ring into g_prof[] and reset the ring.
+ * Called when the ring fills and once at exit. */
+static void prof_flush_ring(void) {
+    for (int e = 0; e < g_prof_ev_n; e++) {
+        int slot = g_prof_slot_log[e];
+        if (slot < 0 || slot >= g_prof_n) continue;
+        int st = g_prof_pair_start[e];
+        if (st < 0 || st >= e) continue;
+        float ms = 0.0f;
+        if (gpuEventElapsedTime(&ms, g_prof_ev[st], g_prof_ev[e]) != gpuSuccess) continue;
+        g_prof[slot].total_ms += (double)ms;
+        g_prof[slot].calls++;
+    }
+    for (int e = 0; e < g_prof_ev_n; e++) { g_prof_slot_log[e] = -1; g_prof_pair_start[e] = -1; }
+    g_prof_ev_n = 0;
+    g_prof_open_n = 0;
+}
+
 extern "C" void picolm_gpu_prof_begin(int device) {
+    /* NOTE the API is begin(device)/end(slot): the slot is only known at END.
+     * Rather than guess, this pushes a placeholder and trusts the caller to
+     * pair. Callers that return early between begin and end leak an entry,
+     * so the report SKIPS any pair whose start is not strictly after the
+     * previous end (i.e. out-of-order / leaked) instead of mis-attributing. */
     if (!prof_enabled()) return;
+    if (g_prof_ev_n + 1 >= PROF_MAX_EVENTS) prof_flush_ring();
     if (g_prof_ev_n + 1 >= PROF_MAX_EVENTS) return;
+    if (g_prof_open_n >= PROF_MAX_DEPTH) return;
     /* MUST record on ctx->stream, not the null stream: every kernel in this
      * backend is enqueued on ctx->stream, and an event on the null stream is
      * not ordered against them -- it would time nothing. */
@@ -2514,14 +2579,18 @@ extern "C" void picolm_gpu_prof_begin(int device) {
     g_prof_stream = st;
     gpuEventRecord(g_prof_ev[g_prof_ev_n], st);
     g_prof_depth = g_prof_ev_n;
+    g_prof_open[g_prof_open_n++] = g_prof_ev_n;   /* index of this START */
     g_prof_ev_n++;
 }
 
 extern "C" void picolm_gpu_prof_end(int slot) {
     if (slot < 0 || !prof_enabled()) return;
     if (g_prof_ev_n >= PROF_MAX_EVENTS) return;
+    int start = (g_prof_open_n > 0) ? g_prof_open[--g_prof_open_n] : -1;
     gpu_event_rec_stop();
+    /* Store {start_index, end_index, slot} so the report pairs the right two. */
     g_prof_slot_log[g_prof_ev_n] = slot;
+    g_prof_pair_start[g_prof_ev_n] = start;
     g_prof_ev_n++;
     (void)g_prof_depth;
 }
@@ -2530,17 +2599,7 @@ extern "C" void picolm_gpu_prof_end(int slot) {
 extern "C" void picolm_gpu_prof_report(void) {
     if (!g_prof_on || g_prof_n == 0) return;
     gpuDeviceSynchronize();
-    int i = 0;
-    while (i + 1 < g_prof_ev_n) {
-        float ms = 0.0f;
-        gpuEventElapsedTime(&ms, g_prof_ev[i], g_prof_ev[i + 1]);
-        int slot = g_prof_slot_log[i + 1];
-        if (slot >= 0 && slot < g_prof_n) {
-            g_prof[slot].total_ms += (double)ms;
-            g_prof[slot].calls++;
-        }
-        i += 2;
-    }
+    prof_flush_ring();
     double grand = 0.0;
     for (int k = 0; k < g_prof_n; k++) grand += g_prof[k].total_ms;
     fprintf(stderr, "\n[GPROF] per-kernel-class totals (%.1f ms measured)\n", grand);

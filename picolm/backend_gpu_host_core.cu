@@ -5,6 +5,7 @@
 extern "C" int  picolm_gpu_prof_slot(const char *name);
 extern "C" void picolm_gpu_prof_begin(int device);
 extern "C" void picolm_gpu_prof_end(int slot);
+extern "C" void picolm_gpu_launch_tmr_report(void);
 
 
 /* Win32 API forward declarations for CUDA_DEVICE_MAX_CONNECTIONS env var
@@ -24,6 +25,12 @@ extern "C" {
  * The .cuh declaration isn't picked up by MSVC's C++ front-end. */
 __global__ void picolm_q8_q8_matmul_imma_smw16(float *, const int8_t *, const float *,
                                                 const void *, int, int, int, int, int);
+
+/* PICOLM_GEMV_DBG: the layer whose decode/prefill pass is currently running.
+ * Set by the layer loops in model_ssm.c purely so the GEMV debug line can be
+ * attributed to a layer. Zero when nothing has set it. */
+int picolm_gpu_dbg_layer = -1;
+extern "C" void picolm_gpu_set_dbg_layer(int l) { picolm_gpu_dbg_layer = l; }
 
 static void gpu_dispatch_print(const char *name) {
     /* Called on EVERY kernel launch (~350 per decode token). Once all 64 slots
@@ -288,6 +295,7 @@ extern "C"
 void picolm_gpu_shutdown(void) {
     /* Resolve and print PICOLM_GPU_PROF totals before tearing anything down. */
     { extern void picolm_gpu_prof_report(void); picolm_gpu_prof_report(); }
+    { picolm_gpu_launch_tmr_report(); }
     /* Free KV cache allocations */
     picolm_gpu_kv_free();
     /* Free pipeline buffers */
@@ -1370,6 +1378,7 @@ kquant_gemv_dev(gpu_device_ctx_t *ctx, picolm_gpu_tensor_t *t, float *y_dev,
     if (n_super < 1 || I % 256 != 0) return 0;
     if (x_stride > 0 && x_stride != I) return 0;   /* GEMV assumes packed x */
 
+    dim3 q_grid((unsigned)n_super, 1);
     size_t qs_bytes    = (size_t)n_super * 256;
     size_t d_bytes     = (size_t)n_super * sizeof(float);
     size_t bsums_bytes = (size_t)n_super * 16 * sizeof(int16_t);
@@ -1383,14 +1392,27 @@ kquant_gemv_dev(gpu_device_ctx_t *ctx, picolm_gpu_tensor_t *t, float *y_dev,
         ctx->q8_k_bsums_cap = bsums_bytes;
     }
 
-    /* Quantize the activation row to Q8_K exactly as the CPU does. */
-    dim3 q_grid((unsigned)n_super, 1);
-    picolm_quantize_q8_K<<<q_grid, 256, 0, ctx->stream>>>(
-        ctx->q8_xd, ctx->q8_xq, ctx->q8_k_bsums, x_dev, I, 1);
-    if (!gpu_ok(gpuGetLastError(), "q8_K quantize (dev)")) return 0;
     dim3 grid((unsigned)O);
+    /* PICOLM_GEMV_DBG=1: one line per K-quant GEMV launch, with the layer it
+     * belongs to, so per-token weight traffic can be attributed to individual
+     * shapes. Use this rather than dividing a whole-run call count by the
+     * token count: that mixes in prefill and overstates the per-token work. */
+    if (getenv("PICOLM_GEMV_DBG"))
+        fprintf(stderr, "[GEMV] L=%d which=%d I=%d O=%d row_bytes=%d\n",
+                picolm_gpu_dbg_layer, which, I, O, (int)t->row_bytes);
     int _ps = picolm_gpu_prof_slot(which == 141 ? "gemv_iq6_K" : which == 2 ? "gemv_q2_K" : which == 3 ? "gemv_q3_K" : which == 4 ? "gemv_q4_K" : which == 5 ? "gemv_q5_K" : "gemv_q6_K");
-    picolm_gpu_prof_begin(0);
+    /* The begin must cover the activation quantize too: it is a real kernel on
+     * this stream and, at one launch per matmul call, it is part of the cost
+     * being attributed. This used to pass device 0 unconditionally as well,
+     * which times the wrong context on a multi-device setup. */
+    { int _psq = picolm_gpu_prof_slot("quantize_q8");
+      picolm_gpu_prof_begin(ctx->device);
+      picolm_quantize_q8_K<<<q_grid, 256, 0, ctx->stream>>>(
+          ctx->q8_xd, ctx->q8_xq, ctx->q8_k_bsums, x_dev, I, 1);
+      picolm_gpu_prof_end(_psq);
+    }
+    if (!gpu_ok(gpuGetLastError(), "q8_K quantize (dev)")) return 0;
+    picolm_gpu_prof_begin(ctx->device);
     if (which == 141) {
         gpu_dispatch_print("matmul_iq6_gemv_dev");
         picolm_iq6_K_gemv<<<grid, 32 * GEMV_WARPS, 0, ctx->stream>>>(
@@ -1426,9 +1448,34 @@ kquant_gemv_dev(gpu_device_ctx_t *ctx, picolm_gpu_tensor_t *t, float *y_dev,
     return gpu_ok(gpuGetLastError(), "kquant gemv (dev)");
 }
 
-extern "C" int
-picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
-                       int S, int device, int y_stride, int x_stride) {
+/* PICOLM_LAUNCH_TMR=1: accumulate the CPU wall time spent inside
+ * picolm_gpu_matmul_dev itself (i.e. enqueue cost, NOT GPU execution), and
+ * report it at exit. This is the number that decides whether a decode token is
+ * launch-bound; PICOLM_GPU_PROF cannot see it because its events measure the
+ * stream, not the host. */
+static double g_launch_ms = 0.0;
+static long   g_launch_n  = 0;
+static int    g_launch_on = -1;
+static double lt_now(void)
+{
+#if defined(_WIN32)
+    LARGE_INTEGER f, t;
+    QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t);
+    return (double)t.QuadPart * 1000.0 / (double)f.QuadPart;
+#else
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e3 + ts.tv_nsec * 1e-6;
+#endif
+}
+extern "C" void picolm_gpu_launch_tmr_report(void) {
+    if (g_launch_on != 1 || g_launch_n == 0) return;
+    fprintf(stderr, "[LNTMR] %ld matmul_dev calls, %.1f ms total, %.1f us/call (HOST side only)\n",
+            g_launch_n, g_launch_ms, 1000.0 * g_launch_ms / (double)g_launch_n);
+}
+
+static int
+matmul_dev_impl(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
+                int S, int device, int y_stride, int x_stride) {
     if (!t || !y_dev || !x_dev || S < 1) return 0;
     if (t->I < 64) return 0;  /* O gate removed: blocked K/V projections with O<256 */
     gpu_device_ctx_t *ctx = find_ctx(device);
@@ -1483,6 +1530,9 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
              * cooperate on it (see the kernel comment for why cooperating on
              * one row beats assigning one row per warp). */
             dim3 grid((unsigned)O);
+            if (getenv("PICOLM_GEMV_DBG"))
+                fprintf(stderr, "[GEMV] L=%d which=8 I=%d O=%d row_bytes=%d\n",
+                        picolm_gpu_dbg_layer, I, O, (int)t->row_bytes);
             int _ps = picolm_gpu_prof_slot("gemv_q8_0");
             picolm_gpu_prof_begin(device);
             picolm_q8_0_gemv<<<grid, 32 * GEMV_WARPS, 0, ctx->stream>>>(
@@ -1869,6 +1919,19 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
     if (!gpu_ok(gpuGetLastError(), "matmul launch (dev)")) return 0;
     /* Debug removed: was reading y_dev on default stream while kernel ran on ctx->stream */
     return 1;
+}
+
+extern "C" int
+picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
+                       int S, int device, int y_stride, int x_stride) {
+    if (g_launch_on < 0) g_launch_on = getenv("PICOLM_LAUNCH_TMR") ? 1 : 0;
+    if (!g_launch_on)
+        return matmul_dev_impl(t, y_dev, x_dev, S, device, y_stride, x_stride);
+    double t0 = lt_now();
+    int rc = matmul_dev_impl(t, y_dev, x_dev, S, device, y_stride, x_stride);
+    g_launch_ms += lt_now() - t0;
+    g_launch_n++;
+    return rc;
 }
 
 /* picolm_gpu_matmul_logits: output projection (lm_head) on GPU.
