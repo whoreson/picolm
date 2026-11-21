@@ -322,7 +322,9 @@ picolm_quantize_q8_0(int8_t *qs_out, float *d_out,
             gpu_fp16_to_fp32((int)gpu_fp32_to_fp16(d));
 }
 
-/* picolm_quantize_q8_0_fast -- same result as picolm_quantize_q8_0, done by a
+/* UNUSED AT PRESENT (see the note at the end of this comment).
+ *
+ * picolm_quantize_q8_0_fast -- same result as picolm_quantize_q8_0, done by a
  * WARP per 32-value block instead of a 32-thread BLOCK per 32-value block.
  *
  * Why this exists, and it is the whole prefill story:
@@ -341,6 +343,14 @@ picolm_quantize_q8_0(int8_t *qs_out, float *d_out,
  * shuffle reduction (no shared memory, no barriers), and grid 8x smaller.
  * Same arithmetic and the same fp16 rounding of d, so the output is
  * bit-identical -- verified with --gpu-q8diff and PICOLM_DUMP_LOGITS.
+ *
+ * MEASURED, AND IT DID NOT HELP: once the matmul was properly isolated it
+ * turned out the quantise was never the bottleneck. Fast vs old on the 27B at
+ * 423 tokens: 228/238/231 vs 228/236/237 tok/s, i.e. nothing. The 688 ms that
+ * had been attributed to "the q5_K slot including the quantise" is the q5_K
+ * matmul itself. Kept rather than deleted because it is strictly better code
+ * (no barriers, 1/8 the blocks) and will matter once the real fix lands, but
+ * it is currently unreferenced -- do not assume wiring it up gains anything.
  */
 #define Q8Q_WARPS 8
 
