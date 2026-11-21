@@ -240,8 +240,21 @@ __global__ void picolm_gpu_attention_decode_kernel( float *xb_out, const float *
  * PICOLM_DBG_ATTN/PICOLM_DBG_PIPELINE tolerance (1e-2/1e-3), not for
  * exact equality -- a nonzero-but-below-threshold diff here is correct
  * behavior, not a regression. */
-#define ATTN_DECODE_MAX_SPLITS 32
+/* The split count is capped so the per-head partial buffers stay small:
+ * n_heads * n_splits * (head_dim + 2) floats = 3.2 MB at 128 splits for the
+ * 27B (24 heads, head_dim 256), i.e. nothing. The old cap of 32 was the real
+ * bottleneck at long context: at 9848 keys it left chunk=308 and only
+ * n_kv_heads*32 = 128 blocks, which on a 128-SM card is one block per SM with
+ * each block serially scanning 308 keys. Decode attention then took 4.44 ms
+ * per call and 68% of the whole decode token, vs 0.22 ms at short context.
+ * A larger cap lets the chunk (and therefore the serial dependency chain per
+ * block) stay bounded as context grows. */
+#define ATTN_DECODE_MAX_SPLITS 512
 #define ATTN_DECODE_MIN_CHUNK  16  /* Lower threshold to avoid online softmax underflow for small head_dim models */
+/* Target keys per split. n_splits is derived from this, then clamped to
+ * [1, ATTN_DECODE_MAX_SPLITS]. Larger context therefore means more blocks
+ * rather than longer serial scans. */
+#define ATTN_DECODE_TARGET_CHUNK 64
 
 /* Partial state layout (flat float buffer, sized by the host wrapper):
  *   partial_max: [n_heads][n_splits]
@@ -336,6 +349,14 @@ __global__ void picolm_gpu_attention_prefill_fa2_kernel(
 
 
 __global__ void picolm_ssm_vecdot_kernel(float *out, const float *x, const void *weights, gguf_type_t qtype, int dim, int n_v_heads, int row_bytes, const int *head_map);
+
+#define VEC_WARP_HEADS 4
+
+/* Warp-per-head variant of the above. Same result to within summation order;
+ * launch with VEC_WARP_HEADS warps (128 threads) per block and grid =
+ * ceil(n_v_heads / VEC_WARP_HEADS). The serial kernel above leaves 255 of
+ * every 256 threads idle and was measured at 4.6 GB/s. */
+__global__ void picolm_ssm_vecdot_warp_kernel(float *out, const float *x, const void *weights, gguf_type_t qtype, int dim, int n_v_heads, int row_bytes, const int *head_map);
 
 /* Batched-over-tokens version of the above: identical per-(token,head)
  * computation (including the same redundant per-block re-quantization

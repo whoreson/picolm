@@ -1061,6 +1061,24 @@ picolm_gpu_ssm_vecdot_dev(float *out_dev,
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!ctx || !select_ctx(ctx)) return 0;
 
+    /* Warp-per-head path: one warp per head, 4 heads per 128-thread block.
+     * The serial one-thread-per-head kernel below measured 4.6 GB/s on the
+     * 27B (960 KB in 0.21 ms, twice per SSM layer); this is the same result
+     * to within summation order. PICOLM_SSM_VECDOT_SERIAL=1 restores the old
+     * kernel for A/B and for bisecting any numerical difference. */
+    static int vecdot_serial = -1;
+    if (vecdot_serial < 0)
+        vecdot_serial = getenv("PICOLM_SSM_VECDOT_SERIAL") ? 1 : 0;
+#ifndef PICOLM_NO_WARP_VECDOT
+    if (!vecdot_serial) {
+        dim3 wgrid((unsigned)((n_v_heads + VEC_WARP_HEADS - 1) / VEC_WARP_HEADS), 1, 1);
+        picolm_ssm_vecdot_warp_kernel<<<wgrid, 32 * VEC_WARP_HEADS, 0, ctx->stream>>>(
+            out_dev, x_dev, weights_dev, qtype, dim, n_v_heads, row_bytes, head_map_dev);
+        if (gpu_ok(gpuGetLastError(), "ssm vecdot warp (dev)")) return 1;
+    }
+#endif
+    (void)vecdot_serial;
+
     dim3 grid((unsigned)n_v_heads, 1, 1);
     picolm_ssm_vecdot_kernel<<<grid, 256, 0, ctx->stream>>>(
         out_dev, x_dev, weights_dev, qtype, dim, n_v_heads, row_bytes, head_map_dev);
