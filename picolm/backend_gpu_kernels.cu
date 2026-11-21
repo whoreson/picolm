@@ -4346,6 +4346,9 @@ picolm_q5_k_q8_matmul_imma_sb(float *y, const int8_t *xq, const float *xd,
                     : "+r"(d0[g]), "+r"(d1[g]), "+r"(d2[g]), "+r"(d3[g])
                     : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(bb0[g]), "r"(bb1[g]));
 #endif
+#ifdef PICOLM_ABL_NO_SHUF
+                { q0[g] = 0; q1[g] = 0; }
+#else
                 {
                     int s0v = 0, s1v = 0;
                     int8_t *av;
@@ -4364,6 +4367,7 @@ picolm_q5_k_q8_matmul_imma_sb(float *y, const int8_t *xq, const float *xd,
 #endif
                     q0[g] = s0v; q1[g] = s1v;
                 }
+#endif
             }
 
             /* ---- epilogue: same arithmetic and order as the non-unrolled
@@ -6973,6 +6977,117 @@ picolm_ssm_vecdot_batch_kernel(float *out,
     }
     int _os = out_stride > 0 ? out_stride : n_v_heads;
     out[(size_t)t * _os + h] = sum;
+}
+
+/* picolm_ssm_vecdot_batch_warp_kernel -- batched sibling of
+ * picolm_ssm_vecdot_warp_kernel.
+ *
+ * The scalar batch kernel does `if (tid != 0) return;` and computes each
+ * (head, token) dot product on ONE thread, launched as
+ * <<<dim3(n_v_heads, n_tokens), 256>>> with 255 of every 256 threads idle.
+ * For the 27B that is 48 x 423 = 20304 blocks each running a serial
+ * dim-length FMA chain, and it measured 2.05 ms per call / 196 ms of a
+ * prefill, 20% of all profiled GPU time.
+ *
+ * This version runs one WARP per (head, token): the 32 lanes split dim between
+ * them and a butterfly reduce finishes it, so the serial chain is dim/32
+ * instead of dim and every launched thread does work.
+ *
+ * Numerics: same summation-structure caveat as the single-token warp kernel --
+ * the serial version is not bit-identical to the CPU either, and the oracle is
+ * PICOLM_DUMP_LOGITS, not eyeballed text.
+ */
+#define VECB_WARPS 8
+
+__global__ void
+picolm_ssm_vecdot_batch_warp_kernel(float *out, const float *x, const void *weights,
+                                     gguf_type_t qtype, int dim, int n_v_heads, int n_tokens,
+                                     int row_bytes, const int *head_map,
+                                     int in_stride, int out_stride) {
+    int wid  = (int)(gpuThreadIdx_x >> 5);
+    int lane = (int)(gpuThreadIdx_x & 31);
+
+    long long gid = (long long)gpuBlockIdx_x * VECB_WARPS + wid;
+    long long total = (long long)n_v_heads * n_tokens;
+    if (gid >= total) return;
+
+    int h = (int)(gid % n_v_heads);
+    int t = (int)(gid / n_v_heads);
+
+    int gh = head_map ? head_map[h] : h;
+    const char *wrow = (const char *)weights + (size_t)gh * row_bytes;
+    int ts = in_stride > 0 ? in_stride : dim;
+    const float *xt = x + (size_t)t * ts;
+
+    float sum = 0.0f;
+    switch (qtype) {
+    case 0: {   /* F32 */
+        const float *wf = (const float *)wrow;
+        float a0 = 0.0f, a1 = 0.0f;
+        int i = lane;
+        for (; i + 32 < dim; i += 64) {
+            a0 = fmaf(wf[i],      xt[i],      a0);
+            a1 = fmaf(wf[i + 32], xt[i + 32], a1);
+        }
+        for (; i < dim; i += 32) a0 = fmaf(wf[i], xt[i], a0);
+        sum = a0 + a1;
+        break;
+    }
+    case 2: {   /* Q4_0 x f32 */
+        const int nb = dim / 32;
+        float acc = 0.0f;
+        for (int bi = lane; bi < nb; bi += 32) {
+            const uint8_t *blk = (const uint8_t *)wrow + (size_t)bi * 18;
+            float wd = gpu_fp16_to_fp32((uint16_t)(blk[0] | ((uint16_t)blk[1] << 8)));
+            const uint8_t *qs = blk + 2;
+            const float *xb = xt + bi * 32;
+            float s2 = 0.0f;
+            for (int j = 0; j < 16; j++) {
+                s2 = fmaf((float)((qs[j] & 0x0F) - 8), xb[j],      s2);
+                s2 = fmaf((float)((qs[j] >> 4) - 8), xb[j + 16], s2);
+            }
+            acc = fmaf(s2, wd, acc);
+        }
+        sum = acc;
+        break;
+    }
+    case 8: {   /* Q8_0 x f32 */
+        const int nb = dim / 32;
+        float acc = 0.0f;
+        for (int bi = lane; bi < nb; bi += 32) {
+            const uint8_t *blk = (const uint8_t *)wrow + (size_t)bi * 34;
+            float wd = gpu_fp16_to_fp32((uint16_t)(blk[0] | ((uint16_t)blk[1] << 8)));
+            const int8_t *qs = (const int8_t *)(blk + 2);
+            const float *xb = xt + bi * 32;
+            float s2 = 0.0f;
+            for (int j = 0; j < 32; j++) s2 = fmaf((float)qs[j], xb[j], s2);
+            acc = fmaf(s2, wd, acc);
+        }
+        sum = acc;
+        break;
+    }
+    case 30: {  /* BF16 */
+        float a0 = 0.0f, a1 = 0.0f;
+        int i = lane;
+        for (; i + 32 < dim; i += 64) {
+            a0 = fmaf(dequant_bf16(wrow, i),      xt[i],      a0);
+            a1 = fmaf(dequant_bf16(wrow, i + 32), xt[i + 32], a1);
+        }
+        for (; i < dim; i += 32) a0 = fmaf(dequant_bf16(wrow, i), xt[i], a0);
+        sum = a0 + a1;
+        break;
+    }
+    default:
+        return;
+    }
+
+    for (int off = 16; off > 0; off >>= 1)
+        sum += gpuShflDownSync(0xffffffffu, sum, off);
+
+    if (lane == 0) {
+        int os = out_stride > 0 ? out_stride : n_v_heads;
+        out[(size_t)t * os + h] = sum;
+    }
 }
 
 /* ================================================================

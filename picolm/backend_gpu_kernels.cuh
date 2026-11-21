@@ -414,6 +414,11 @@ __global__ void picolm_ssm_vecdot_warp_kernel(float *out, const float *x, const 
 
 __global__ void picolm_ssm_vecdot_batch_kernel(float *out, const float *x, const void *weights, gguf_type_t qtype, int dim, int n_v_heads, int n_tokens, int row_bytes, const int *head_map, int in_stride, int out_stride);
 
+/* Batched warp-per-(head,token) variant: 32 lanes split dim, butterfly reduce.
+ * The scalar version isolates each dot on one thread with 255 idle. */
+#define VECB_WARPS 8
+__global__ void picolm_ssm_vecdot_batch_warp_kernel(float *out, const float *x, const void *weights, gguf_type_t qtype, int dim, int n_v_heads, int n_tokens, int row_bytes, const int *head_map, int in_stride, int out_stride);
+
 /* ---- SSM causal conv1d + state shift (fused) ----
  * Direct port of the CPU reference (ssm_forward, conv1d section): for
  * each channel co, sum d_conv taps (d_conv-1 from history in

@@ -1382,6 +1382,16 @@ ssm_chunk_masked_gemm_kernel(float *out_cs_cs, const float *A, const float *B,
 __global__ void
 ssm_chunk_matvec_kernel(float *out, const float *state, const float *chunk_x,
                          int n_v_heads, int repeat, int cs, int d) {
+    /* blockIdx.x = head, blockIdx.y = a slice of the cs rows.
+     *
+     * This used to be grid = n_v_heads alone: 48 blocks for a 128-SM card, so
+     * 80 SMs sat idle, and each block ran cs*d/256 = 32 dependent length-d dot
+     * products per thread. Measured 0.4239 ms/call at 237 GFLOP/s = 0.29% of
+     * the card's fp32 peak, and it is the single largest kernel in the SSM
+     * chunked recurrence (142 ms of a 492 ms pass over the model).
+     *
+     * Each output row i is independent -- it reads its own x_h[i] and the whole
+     * of `state` -- so the rows split across blocks with no communication. */
     int h = blockIdx.x;
     if (h >= n_v_heads) return;
     int kh = h / repeat;
@@ -1389,13 +1399,17 @@ ssm_chunk_matvec_kernel(float *out, const float *state, const float *chunk_x,
     const float *st = state + (size_t)h * d * d;
     float *o = out + (size_t)h * cs * d;
 
-    int n_elem = cs * d;
-    for (int idx = threadIdx.x; idx < n_elem; idx += blockDim.x) {
-        int i = idx / d, r = idx % d;
+    int rows_per_blk = (cs + (int)gridDim.y - 1) / (int)gridDim.y;
+    int i0 = (int)blockIdx.y * rows_per_blk;
+    int i1 = i0 + rows_per_blk;
+    if (i1 > cs) i1 = cs;
+
+    for (int i = i0; i < i1; i++) {
         const float *xi = x_h + (size_t)i * d;
-        const float *st_row = st + (size_t)r * d;
-        float sum = ssm_dot_matvec(st_row, xi, d);
-        o[idx] = sum;
+        float *oi = o + (size_t)i * d;
+        for (int r = threadIdx.x; r < d; r += blockDim.x) {
+            oi[r] = ssm_dot_matvec(st + (size_t)r * d, xi, d);
+        }
     }
 }
 
@@ -1506,9 +1520,30 @@ ssm_chunk_state_update_kernel(float *state, const float *v_hat, const float *chu
     if (ex_total < -50.0f) ex_total = -50.0f;
     float total_decay = expf(ex_total);
 
-    int n_elem = d * d;
-    for (int idx = threadIdx.x; idx < n_elem; idx += blockDim.x) {
-        int r = idx / d, c = idx % d;
+    /* decay_to_end[j] depends only on j, but it used to be recomputed inside
+     * the innermost loop: d*d*cs = 1048576 expf() calls per head per chunk,
+     * i.e. 50M transcendentals per call, and this kernel was 96 ms of the SSM
+     * chunked recurrence. Hoisted into shared memory, computed once per chunk.
+     * Same value, same order of use. */
+    extern __shared__ float decay_sh[];
+    for (int j = threadIdx.x; j < cs; j += blockDim.x) {
+        float diff = cum_last - cg_h[j];
+        if (diff > 50.0f) diff = 50.0f;
+        if (diff < -50.0f) diff = -50.0f;
+        decay_sh[j] = expf(diff);
+    }
+    __syncthreads();
+
+    /* One block per head meant 48 blocks on a 128-SM card and d*d/256 = 64
+     * outputs per thread; the r rows are independent so they split over
+     * blockIdx.y like the matvec kernel. */
+    int rows_per_blk = (d + (int)gridDim.y - 1) / (int)gridDim.y;
+    int r0 = (int)blockIdx.y * rows_per_blk;
+    int r1 = r0 + rows_per_blk;
+    if (r1 > d) r1 = d;
+    for (int r = r0; r < r1; r++) {
+        for (int c = threadIdx.x; c < d; c += blockDim.x) {
+        int idx = r * d + c;
         /* Match CPU AVX-512 order: scale state by total_decay first,
          * then accumulate k[j][c] * (v_hat[j][r] * decay_to_end[j])
          * via FMA, exactly as _mm512_fmadd_ps(kv, set1(v*dj), state).
@@ -1517,15 +1552,13 @@ ssm_chunk_state_update_kernel(float *state, const float *v_hat, const float *chu
          * __fmaf_rn matches the FMA rounding. */
         float s = st_h[idx] * total_decay;
         for (int j = 0; j < cs; j++) {
-            float diff = cum_last - cg_h[j];
-            if (diff > 50.0f) diff = 50.0f;
-            if (diff < -50.0f) diff = -50.0f;
-            float decay_to_end = expf(diff);
+            float decay_to_end = decay_sh[j];
             if (decay_to_end == 0.0f) continue;
             float vd = vh_h[(size_t)j * d + r] * decay_to_end;
             s = __fmaf_rn(k_h[(size_t)j * d + c], vd, s);
         }
         st_h[idx] = s;
+        }
     }
 }
 

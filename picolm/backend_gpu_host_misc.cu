@@ -2207,7 +2207,7 @@ picolm_gpu_memcpy_async(void *dst, const void *src, size_t bytes, int dir, int d
     return gpu_ok(gpuMemcpyAsync(dst, src, bytes, kind, ctx->stream), "pipeline memcpy async");
 }
 extern "C"
-int picolm_gpu_ssm_conv1d_batch_dev(float *od, float *sd, const float *id, const float *wd,
+static int picolm_gpu_ssm_conv1d_batch_dev_impl(float *od, float *sd, const float *id, const float *wd,
     int cd, int dc, int nt, int dev, int stride) {
     if(cd<1||dc<1||nt<1) return 0;
     if(dc>PICOLM_SSM_CONV_MAX_D_CONV) return 0;
@@ -2217,14 +2217,29 @@ int picolm_gpu_ssm_conv1d_batch_dev(float *od, float *sd, const float *id, const
     picolm_gpu_ssm_conv1d_batch_kernel<<<nb,256,0,ctx->stream>>>(od,sd,id,wd,cd,dc,nt,stride);
     return gpu_ok(gpuGetLastError(),"conv1d batch dev");
 }
+extern "C" int picolm_gpu_ssm_conv1d_batch_dev(float *od, float *sd, const float *id, const float *wd,
+    int cd, int dc, int nt, int dev, int stride) {
+    int _ps = picolm_gpu_prof_slot("ssm_conv1d");
+    picolm_gpu_prof_begin(dev);
+    int _rc = picolm_gpu_ssm_conv1d_batch_dev_impl(od, sd, id, wd, cd, dc, nt, dev, stride);
+    picolm_gpu_prof_end(_ps);
+    return _rc;
+}
 
 extern "C"
-int picolm_gpu_ssm_l2norm_batch_dev(float *xd, int hd, int nh, int nt, int ts, float eps, float es, int dev) {
+static int picolm_gpu_ssm_l2norm_batch_dev_impl(float *xd, int hd, int nh, int nt, int ts, float eps, float es, int dev) {
     if(hd<1||nh<1||hd>256||nt<1) return 0;
     gpu_device_ctx_t *ctx = find_ctx(dev);
     if(!ctx||!select_ctx(ctx)) return 0;
     picolm_gpu_ssm_l2norm_batch_kernel<<<dim3((unsigned)nh,(unsigned)nt),min(hd,256),0,ctx->stream>>>(xd,hd,nh,nt,ts,eps,es);
     return gpu_ok(gpuGetLastError(),"l2norm batch dev");
+}
+extern "C" int picolm_gpu_ssm_l2norm_batch_dev(float *xd, int hd, int nh, int nt, int ts, float eps, float es, int dev) {
+    int _ps = picolm_gpu_prof_slot("ssm_l2norm");
+    picolm_gpu_prof_begin(dev);
+    int _rc = picolm_gpu_ssm_l2norm_batch_dev_impl(xd, hd, nh, nt, ts, eps, es, dev);
+    picolm_gpu_prof_end(_ps);
+    return _rc;
 }
 
 extern "C"
@@ -2240,7 +2255,7 @@ __global__ void picolm_gpu_ssm_head_permute_batch_kernel(float *dst, const float
  *   then dispatch IMMA/tiled/scalar kernel.
  * For Q4_0: fall back to the serial vecdot kernel.
  * When head_map != NULL, post-permute output from GGUF head order to natural head order. */
-int picolm_gpu_ssm_vecdot_batch_dev(float *od, const float *xd, const void *wd, gguf_type_t qt,
+static int picolm_gpu_ssm_vecdot_batch_dev_impl(float *od, const float *xd, const void *wd, gguf_type_t qt,
     int dim, int nvh, int nt, int rb, const int *hm, int dev, int in_stride, int out_stride) {
     if(nvh<=0||dim<=0||nt<=0) return 0;
     if(dim>PICOLM_SSM_VECDOT_MAX_DIM) return 0;
@@ -2341,19 +2356,46 @@ int picolm_gpu_ssm_vecdot_batch_dev(float *od, const float *xd, const void *wd, 
 vecdot_serial:
     /* Serial vecdot fallback for Q4_0 weights, misaligned dims, or OOM */
     gpu_dispatch_print("vecdot_serial_dev");
+    /* Warp-per-(head,token). PICOLM_NO_VECDOT_BATCH_WARP=1 for A/B. */
+    static int no_vbw = -1;
+    if (no_vbw < 0) no_vbw = getenv("PICOLM_NO_VECDOT_BATCH_WARP") ? 1 : 0;
+    if (!no_vbw && (qt == 0 || qt == 2 || qt == 8 || qt == 30)) {
+        long long vtot = (long long)nvh * nt;
+        unsigned vblk = (unsigned)((vtot + VECB_WARPS - 1) / VECB_WARPS);
+        picolm_ssm_vecdot_batch_warp_kernel<<<vblk, 32 * VECB_WARPS, 0, ctx->stream>>>(
+            od, xd, (const void *)wd, qt, dim, nvh, nt, rb, hm, in_stride, out_stride);
+        if (gpu_ok(gpuGetLastError(), "ssm vecdot batch warp")) return 1;
+        gpuGetLastError();
+    }
     picolm_ssm_vecdot_batch_kernel<<<dim3((unsigned)nvh,(unsigned)nt),256,0,ctx->stream>>>(
         od,xd,wd,qt,dim,nvh,nt,rb,hm,in_stride,out_stride);
     return gpu_ok(gpuGetLastError(),"vecdot batch dev");
 }
+extern "C" int picolm_gpu_ssm_vecdot_batch_dev(float *od, const float *xd, const void *wd, gguf_type_t qt,
+    int dim, int nvh, int nt, int rb, const int *hm, int dev, int in_stride, int out_stride) {
+    int _ps = picolm_gpu_prof_slot("ssm_vecdot_b");
+    picolm_gpu_prof_begin(dev);
+    int _rc = picolm_gpu_ssm_vecdot_batch_dev_impl(od, xd, wd, qt, dim, nvh, nt, rb, hm, dev, in_stride, out_stride);
+    picolm_gpu_prof_end(_ps);
+    return _rc;
+}
 
 extern "C"
-int picolm_gpu_ssm_prefill_gated_norm_dev(float *od, const float *zd, const float *nd,
+static int picolm_gpu_ssm_prefill_gated_norm_dev_impl(float *od, const float *zd, const float *nd,
     int hd, int nh, int nt, float eps, int so_stride, int z_stride, int dev) {
     if(hd<1||nh<1||nt<1) return 0;
     gpu_device_ctx_t *ctx = find_ctx(dev);
     if(!ctx||!select_ctx(ctx)) return 0;
     picolm_gpu_ssm_prefill_gated_norm_kernel<<<dim3((unsigned)nh,(unsigned)nt),min(hd,256),0,ctx->stream>>>(od,zd,nd,hd,nh,nt,eps,so_stride,z_stride);
     return gpu_ok(gpuGetLastError(),"gated norm dev");
+}
+extern "C" int picolm_gpu_ssm_prefill_gated_norm_dev(float *od, const float *zd, const float *nd,
+    int hd, int nh, int nt, float eps, int so_stride, int z_stride, int dev) {
+    int _ps = picolm_gpu_prof_slot("ssm_gnorm");
+    picolm_gpu_prof_begin(dev);
+    int _rc = picolm_gpu_ssm_prefill_gated_norm_dev_impl(od, zd, nd, hd, nh, nt, eps, so_stride, z_stride, dev);
+    picolm_gpu_prof_end(_ps);
+    return _rc;
 }
 
 __global__ void
@@ -2369,12 +2411,20 @@ picolm_gpu_ssm_head_permute_batch_kernel(float *dst, const float *src,
 }
 
 extern "C"
-int picolm_gpu_ssm_head_permute_batch_dev(float *dd, const float *sd, const int *hm,
+static int picolm_gpu_ssm_head_permute_batch_dev_impl(float *dd, const float *sd, const int *hm,
     int hd, int nh, int nt, int ss, int ds, int dev) {
     gpu_device_ctx_t *ctx = find_ctx(dev);
     if (!ctx || !select_ctx(ctx)) return 0;
     picolm_gpu_ssm_head_permute_batch_kernel<<<dim3((unsigned)nh,(unsigned)nt),128,0,ctx->stream>>>(dd,sd,hm,hd,nh,nt,ss,ds);
     return gpu_ok(gpuGetLastError(),"head permute batch dev");
+}
+extern "C" int picolm_gpu_ssm_head_permute_batch_dev(float *dd, const float *sd, const int *hm,
+    int hd, int nh, int nt, int ss, int ds, int dev) {
+    int _ps = picolm_gpu_prof_slot("ssm_permute_b");
+    picolm_gpu_prof_begin(dev);
+    int _rc = picolm_gpu_ssm_head_permute_batch_dev_impl(dd, sd, hm, hd, nh, nt, ss, ds, dev);
+    picolm_gpu_prof_end(_ps);
+    return _rc;
 }
 
 __global__ void
@@ -2396,12 +2446,20 @@ picolm_ssm_gate_beta_batch_kernel(float *ge, float *be,
 }
 
 extern "C"
-int picolm_gpu_ssm_gate_beta_batch_dev(float *ge, float *be, const float *ai, const float *bi,
+static int picolm_gpu_ssm_gate_beta_batch_dev_impl(float *ge, float *be, const float *ai, const float *bi,
     const float *dw, const float *aw, int nvh, int nt, int dev, int stride) {
     gpu_device_ctx_t *ctx = find_ctx(dev);
     if (!ctx || !select_ctx(ctx)) return 0;
     picolm_ssm_gate_beta_batch_kernel<<<dim3((unsigned)nvh,(unsigned)nt),1,0,ctx->stream>>>(ge,be,ai,bi,dw,aw,nvh,nt,stride);
     return gpu_ok(gpuGetLastError(),"gate beta batch dev");
+}
+extern "C" int picolm_gpu_ssm_gate_beta_batch_dev(float *ge, float *be, const float *ai, const float *bi,
+    const float *dw, const float *aw, int nvh, int nt, int dev, int stride) {
+    int _ps = picolm_gpu_prof_slot("ssm_gate_beta");
+    picolm_gpu_prof_begin(dev);
+    int _rc = picolm_gpu_ssm_gate_beta_batch_dev_impl(ge, be, ai, bi, dw, aw, nvh, nt, dev, stride);
+    picolm_gpu_prof_end(_ps);
+    return _rc;
 }
 
 extern "C"
@@ -2506,6 +2564,12 @@ int picolm_gpu_expert_mlp_dev(picolm_gpu_tensor_t *g, picolm_gpu_tensor_t *u, pi
 }
 
 extern "C"
+/* Row-split factor for ssm_chunk_matvec_kernel. Grid becomes
+ * (n_v_heads, MV_SPLIT) so a 48-head model fills more than 48 SMs, and each
+ * block does cs/MV_SPLIT rows instead of all cs. Cheap to raise: every row is
+ * independent. */
+#define MV_SPLIT 8
+
 int picolm_gpu_ssm_chunked_recurrence_dev(const float *conv_dev, const float *alpha_dev,
     const float *beta_dev, float *state_dev, float *xb2_dev,
     int n_tokens, int value_dim, int xb2_stride,
@@ -2569,11 +2633,17 @@ int picolm_gpu_ssm_chunked_recurrence_dev(const float *conv_dev, const float *al
     for(int ci=0;ci<nc&&ok;ci++){
       int ca=(ci==nc-1)?(n_tokens-ci*cs):cs; if(ca<=0)break;
       int co2=ci*cs;
-      ssm_chunk_gather_qk_kernel<<<n_k_heads,n_threads,0,ctx->stream>>>((float*)d_cq,(float*)d_ck,conv_dev,co2,ca,xb2_stride,qk_dim,d_state,n_k_heads);
+      { int _pk = picolm_gpu_prof_slot("gather_qk"); picolm_gpu_prof_begin(device);
+              ssm_chunk_gather_qk_kernel<<<n_k_heads,n_threads,0,ctx->stream>>>((float*)d_cq,(float*)d_ck,conv_dev,co2,ca,xb2_stride,qk_dim,d_state,n_k_heads);
+        picolm_gpu_prof_end(_pk); }
       if(!gpu_ok(gpuGetLastError(),"gather_qk"))return 0;
-      ssm_chunk_gather_v_kernel<<<n_v_heads,n_threads,0,ctx->stream>>>((float*)d_cv,(float*)d_cb,(float*)d_gl,conv_dev,alpha_dev,beta_dev,co2,ca,xb2_stride,qk_dim,head_v_dim,n_v_heads,xb2_stride);
+      { int _pk = picolm_gpu_prof_slot("gather_v"); picolm_gpu_prof_begin(device);
+              ssm_chunk_gather_v_kernel<<<n_v_heads,n_threads,0,ctx->stream>>>((float*)d_cv,(float*)d_cb,(float*)d_gl,conv_dev,alpha_dev,beta_dev,co2,ca,xb2_stride,qk_dim,head_v_dim,n_v_heads,xb2_stride);
+        picolm_gpu_prof_end(_pk); }
       if(!gpu_ok(gpuGetLastError(),"gather_v"))return 0;
-      ssm_chunk_decay_kernel<<<n_v_heads,n_threads,0,ctx->stream>>>((float*)d_cg,(float*)d_qd,(float*)d_dm,(float*)d_gl,n_v_heads,ca,ca);
+      { int _pk = picolm_gpu_prof_slot("decay"); picolm_gpu_prof_begin(device);
+              ssm_chunk_decay_kernel<<<n_v_heads,n_threads,0,ctx->stream>>>((float*)d_cg,(float*)d_qd,(float*)d_dm,(float*)d_gl,n_v_heads,ca,ca);
+        picolm_gpu_prof_end(_pk); }
       if(!gpu_ok(gpuGetLastError(),"decay"))return 0;
 #ifdef PICOLM_GPU
       if (getenv("PICOLM_SSM_STEP_VERIFY") && ci == 0) {
@@ -2591,19 +2661,29 @@ int picolm_gpu_ssm_chunked_recurrence_dev(const float *conv_dev, const float *al
               _dm_full[35*ca+0], _dm_full[35*ca+35], _cg[0], _cg[35]);
       }
 #endif
-      ssm_chunk_masked_gemm_kernel<<<n_v_heads,n_threads,0,ctx->stream>>>((float*)d_M,(const float*)d_ck,(const float*)d_ck,(const float*)d_dm,n_v_heads,repeat,ca,d);
+      { int _pk = picolm_gpu_prof_slot("masked_gemm"); picolm_gpu_prof_begin(device);
+              ssm_chunk_masked_gemm_kernel<<<n_v_heads,n_threads,0,ctx->stream>>>((float*)d_M,(const float*)d_ck,(const float*)d_ck,(const float*)d_dm,n_v_heads,repeat,ca,d);
+        picolm_gpu_prof_end(_pk); }
       if(!gpu_ok(gpuGetLastError(),"M_gemm"))return 0;
-      ssm_chunk_matvec_kernel<<<n_v_heads,n_threads,0,ctx->stream>>>((float*)d_sk,state_dev,(const float*)d_ck,n_v_heads,repeat,ca,d);
+      { int _pk = picolm_gpu_prof_slot("matvec"); picolm_gpu_prof_begin(device);
+              ssm_chunk_matvec_kernel<<<dim3(n_v_heads,MV_SPLIT),n_threads,0,ctx->stream>>>((float*)d_sk,state_dev,(const float*)d_ck,n_v_heads,repeat,ca,d);
+        picolm_gpu_prof_end(_pk); }
       if(!gpu_ok(gpuGetLastError(),"sk_matvec"))return 0;
-      ssm_chunk_veff_kernel<<<n_v_heads,n_threads,0,ctx->stream>>>((float*)d_ve,(const float*)d_cv,(const float*)d_sk,(const float*)d_qd,(const float*)d_cb,n_v_heads,ca,d);
+      { int _pk = picolm_gpu_prof_slot("veff"); picolm_gpu_prof_begin(device);
+              ssm_chunk_veff_kernel<<<n_v_heads,n_threads,0,ctx->stream>>>((float*)d_ve,(const float*)d_cv,(const float*)d_sk,(const float*)d_qd,(const float*)d_cb,n_v_heads,ca,d);
+        picolm_gpu_prof_end(_pk); }
       if(!gpu_ok(gpuGetLastError(),"veff"))return 0;
-      {int tr=d<1024?d:1024; ssm_chunk_trisolve_kernel<<<n_v_heads,tr,0,ctx->stream>>>((float*)d_vh,(const float*)d_ve,(const float*)d_M,(const float*)d_cb,n_v_heads,ca,d);}
+      { int _pk = picolm_gpu_prof_slot("trisolve"); picolm_gpu_prof_begin(device);
+              {int tr=d<1024?d:1024; ssm_chunk_trisolve_kernel<<<n_v_heads,tr,0,ctx->stream>>>((float*)d_vh,(const float*)d_ve,(const float*)d_M,(const float*)d_cb,n_v_heads,ca,d);}
       if(!gpu_ok(gpuGetLastError(),"trisolve"))return 0;
-      ssm_chunk_matvec_kernel<<<n_v_heads,n_threads,0,ctx->stream>>>((float*)d_sq,state_dev,(const float*)d_cq,n_v_heads,repeat,ca,d);
+        picolm_gpu_prof_end(_pk); }
+      ssm_chunk_matvec_kernel<<<dim3(n_v_heads,MV_SPLIT),n_threads,0,ctx->stream>>>((float*)d_sq,state_dev,(const float*)d_cq,n_v_heads,repeat,ca,d);
       if(!gpu_ok(gpuGetLastError(),"sq_matvec"))return 0;
       ssm_chunk_masked_gemm_kernel<<<n_v_heads,n_threads,0,ctx->stream>>>((float*)d_kq,(const float*)d_cq,(const float*)d_ck,(const float*)d_dm,n_v_heads,repeat,ca,d);
       if(!gpu_ok(gpuGetLastError(),"kq_gemm"))return 0;
-      ssm_chunk_output_kernel<<<n_v_heads,n_threads,0,ctx->stream>>>((float*)d_co,(const float*)d_sq,(const float*)d_qd,(const float*)d_kq,(const float*)d_vh,n_v_heads,ca,d);
+      { int _pk = picolm_gpu_prof_slot("chunk_out"); picolm_gpu_prof_begin(device);
+              ssm_chunk_output_kernel<<<n_v_heads,n_threads,0,ctx->stream>>>((float*)d_co,(const float*)d_sq,(const float*)d_qd,(const float*)d_kq,(const float*)d_vh,n_v_heads,ca,d);
+        picolm_gpu_prof_end(_pk); }
       if(!gpu_ok(gpuGetLastError(),"output"))return 0;
 #ifdef PICOLM_GPU
       if (getenv("PICOLM_SSM_STEP_VERIFY") && ci == 0) {
@@ -2617,9 +2697,13 @@ int picolm_gpu_ssm_chunked_recurrence_dev(const float *conv_dev, const float *al
               _ve[0],_ve[1],_ve[2],_ve[3], _vh[0],_vh[1],_vh[2],_vh[3], _co[0],_co[1],_co[2],_co[3]);
       }
 #endif
-      ssm_chunk_scatter_kernel<<<n_v_heads,n_threads,0,ctx->stream>>>(xb2_dev,(const float*)d_co,co2,ca,xb2_stride,head_v_dim,n_v_heads);
+      { int _pk = picolm_gpu_prof_slot("scatter"); picolm_gpu_prof_begin(device);
+              ssm_chunk_scatter_kernel<<<n_v_heads,n_threads,0,ctx->stream>>>(xb2_dev,(const float*)d_co,co2,ca,xb2_stride,head_v_dim,n_v_heads);
+        picolm_gpu_prof_end(_pk); }
       if(!gpu_ok(gpuGetLastError(),"scatter"))return 0;
-      ssm_chunk_state_update_kernel<<<n_v_heads,n_threads,0,ctx->stream>>>(state_dev,(const float*)d_vh,(const float*)d_ck,(const float*)d_cg,n_v_heads,repeat,ca,d);
+      { int _pk = picolm_gpu_prof_slot("state_up"); picolm_gpu_prof_begin(device);
+              ssm_chunk_state_update_kernel<<<dim3(n_v_heads,MV_SPLIT),n_threads,(unsigned)((ca<1024?ca:1024)*sizeof(float)),ctx->stream>>>(state_dev,(const float*)d_vh,(const float*)d_ck,(const float*)d_cg,n_v_heads,repeat,ca,d);
+        picolm_gpu_prof_end(_pk); }
       if(!gpu_ok(gpuGetLastError(),"state_up"))return 0;
     }
     picolm_gpu_prof_end(_ssmps);
