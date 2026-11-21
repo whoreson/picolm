@@ -90,13 +90,21 @@ static int picolm_gpu_q8_hmma(void) {
     if (cached < 0) cached = !picolm_gpu_env_flag("PICOLM_NO_Q8_HMMA");
     return cached;
 }
-static int picolm_gpu_q8_dp4a(void) {
+/* Q8_0 prefill via the DP4A GEMM. CUDA only (32-lane warps).
+ *
+ * NOTE this predicate does NOT look at the architecture, only the env flag.
+ * Its callers all sit AFTER the has_imma branch, so on Turing/Ampere/Ada the
+ * IMMA kernel returns first and this never fires -- correct, but only
+ * positionally. Making it depend on the device keeps that true by
+ * construction rather than by branch order. */
+static int picolm_gpu_q8_dp4a(gpu_device_ctx_t *ctx) {
 #ifdef __HIP__
+    (void)ctx;
     return 0;
 #else
     static int cached = -1;
     if (cached < 0) cached = !picolm_gpu_env_flag("PICOLM_NO_Q8_DP4A");
-    return cached;
+    return cached && ctx && !ctx->has_imma;
 #endif
 }
 static int picolm_gpu_force_f32(void) {
@@ -967,7 +975,7 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
             dim3 grid((unsigned)((O + 63) / 64), (unsigned)((S + 127) / 128));
             picolm_q8_q8_matmul_hmma<<<grid, 128, 0, ctx->stream>>>(
                 ctx->y, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, O);
-        } else if (S > 1 && picolm_gpu_q8_dp4a()) {
+        } else if (S > 1 && picolm_gpu_q8_dp4a(ctx)) {
             gpu_dispatch_print("matmul_dp4a_host");
             dim3 grid((unsigned)((O + 7) / 8), (unsigned)((S + 7) / 8));
             picolm_q8_q8_matmul_dp4a<<<grid, 256, 0, ctx->stream>>>(
@@ -1602,7 +1610,7 @@ matmul_dev_impl(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
             dim3 grid((unsigned)((O + 63) / 64), (unsigned)((S + 127) / 128));
             picolm_q8_q8_matmul_hmma<<<grid, 128, 0, ctx->stream>>>(
                 y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, ys);
-        } else if (S > 1 && picolm_gpu_q8_dp4a()) {
+        } else if (S > 1 && picolm_gpu_q8_dp4a(ctx)) {
             gpu_dispatch_print("matmul_dp4a_dev");
             dim3 grid((unsigned)((O + 7) / 8), (unsigned)((S + 7) / 8));
             picolm_q8_q8_matmul_dp4a<<<grid, 256, 0, ctx->stream>>>(
@@ -2337,7 +2345,7 @@ static int imma_dev_q8(picolm_gpu_tensor_t *t, float *y_dev,
         dim3 grid((unsigned)((O + 63) / 64), (unsigned)((S + 127) / 128));
         picolm_q8_q8_matmul_hmma<<<grid, 128, 0, ctx->stream>>>(
             y_dev, xq, xd, t->weights, S, I, O, (int)t->row_bytes, ys);
-    } else if (S > 1 && picolm_gpu_q8_dp4a()) {
+    } else if (S > 1 && picolm_gpu_q8_dp4a(ctx)) {
         gpu_dispatch_print("matmul_dp4a_dev");
         dim3 grid((unsigned)((O + 7) / 8), (unsigned)((S + 7) / 8));
         picolm_q8_q8_matmul_dp4a<<<grid, 256, 0, ctx->stream>>>(

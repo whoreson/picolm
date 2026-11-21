@@ -708,7 +708,25 @@ static void kv_strides_for(int device, int is_k, int n_kv_heads, int head_dim,
  * there are to walk. xb_dev/q_dev must already be device pointers. */
 /* Decode attention on picolm_gpu_attention_decode_warp_kernel: F16 KV cache,
  * head_dim 64/128/256, kv_mul <= 8, CUDA (32-lane warps).
- * PICOLM_NO_ATTN_DECODE_WARP=1 keeps the single-pass/split kernels. */
+ * PICOLM_NO_ATTN_DECODE_WARP=1 keeps the single-pass/split kernels.
+ *
+ * The kv_type test is a HARD REQUIREMENT, not a conservative gate:
+ * picolm_gpu_attention_decode_warp_kernel takes the cache as
+ * `const uint16_t *` and casts straight to `__half` with no dequantisation
+ * step at all (it never even receives kv_type). Pointing it at a q4_0 or q8_0
+ * cache would read 2 bytes where 18/34 are packed and produce garbage, not a
+ * slower answer.
+ *
+ * TODO(kv-quant): the same is true of picolm_gpu_attention_prefill_hmma_kernel
+ * (Volta prefill attention), which likewise takes `const uint16_t *kv_k/v` and
+ * assumes F16. So on Volta, QUANTISED KV CACHES (-ctk q4_0/q8_0) get neither
+ * the tensor-core prefill attention nor the warp decode attention, and fall
+ * back to the scalar/split kernels -- which is the configuration that matters
+ * for long context, since q4_0 KV is what makes 120k fit in 24 GB. Reaching
+ * parity there needs both kernels taught the kv_row_dequant()/kv_row_load_f16()
+ * path the other six attention kernels already use (see
+ * backend_gpu_dequant.cuh), plus a kv_type argument plumbed through.
+ * Not testable here: no Volta hardware. */
 static int attn_decode_warp_ok(int head_dim, int kv_mul, int kv_type) {
 #ifdef __HIP__
     (void)head_dim; (void)kv_mul; (void)kv_type;
@@ -716,6 +734,7 @@ static int attn_decode_warp_ok(int head_dim, int kv_mul, int kv_type) {
 #else
     static int off = -1;
     if (off < 0) off = getenv("PICOLM_NO_ATTN_DECODE_WARP") ? 1 : 0;
+    /* kv_type 0 == F16; the warp kernel has no quantised-KV read path. */
     return !off && kv_type == 0 && (head_dim == 64 || head_dim == 128 || head_dim == 256) && kv_mul <= 8;
 #endif
 }
@@ -759,7 +778,13 @@ attn_decode_dispatch(float *xb_dev, const float *q_dev,
     if (n_splits < 1) n_splits = 1;
     int warp_kernel = attn_decode_warp_ok(head_dim, kv_mul, kv_type);
     if (warp_kernel) {
-        /* ~240 blocks fill the GPU; keep at least 16 keys per split. */
+        /* ~240 blocks fill the GPU; keep at least 16 keys per split.
+         *
+         * That 240 is a V100 (80 SM) figure measured by the author of this
+         * kernel, and it has not been re-derived on anything else. It only
+         * matters once this kernel is reachable on a wider device (it is F16-KV
+         * only), so whoever enables it elsewhere should re-measure rather than
+         * inherit the constant -- a 4090 has 128 SMs and would want ~384. */
         n_splits = (240 + n_kv_heads - 1) / n_kv_heads;
         if (n_splits > (total_kv + 15) / 16) n_splits = (total_kv + 15) / 16;
         if (n_splits < 1) n_splits = 1;
@@ -977,10 +1002,25 @@ ensure_attn_fa2_shared_mem(size_t bytes) {
  * smaller for the same head_dim/tile_q -- more headroom before the
  * dynamic-shared-memory opt-in kicks in. */
 /* Volta tensor-core attention prefill: has_hmma, head_dim 128, F16 KV cache.
- * PICOLM_NO_ATTN_HMMA=1 (or PICOLM_FORCE_SCALAR_ATTN) keeps the scalar kernels. */
+ * PICOLM_NO_ATTN_HMMA=1 (or PICOLM_FORCE_SCALAR_ATTN) keeps the scalar kernels.
+ *
+ * The kv_type test is a HARD REQUIREMENT: picolm_gpu_attention_prefill_hmma_kernel
+ * takes `const uint16_t *kv_k/v` and casts to __half, with no dequantisation and
+ * no kv_type parameter at all.
+ *
+ * TODO(kv-quant): QUANTISED KV IS UNSUPPORTED HERE. With -ctk q4_0/q8_0 on
+ * Volta this declines silently and the model runs the scalar prefill attention
+ * instead -- which is precisely the configuration long context needs, since a
+ * quantised cache is what makes 120k tokens fit in 24 GB of VRAM. Both Volta
+ * kernels (this one and picolm_gpu_attention_decode_warp_kernel) need the same
+ * kv_row_dequant()/kv_row_load_f16() treatment the other six attention kernels
+ * already have (backend_gpu_dequant.cuh), plus a kv_type argument. Until then
+ * Volta + quantised KV is correct but leaves both fast paths on the table.
+ * Cannot be exercised or verified here: no Volta hardware available. */
 static int picolm_gpu_attn_hmma(const gpu_device_ctx_t *ctx, int n_tokens, int head_dim, int kv_type) {
     static int off = -1;
     if (off < 0) off = getenv("PICOLM_NO_ATTN_HMMA") || getenv("PICOLM_FORCE_SCALAR_ATTN");
+    /* kv_type 0 == F16; the HMMA prefill kernel has no quantised-KV read path. */
     return !off && ctx->has_hmma && n_tokens >= 64 && head_dim == 128 && kv_type == 0;
 }
 

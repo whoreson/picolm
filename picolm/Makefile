@@ -518,6 +518,15 @@ CUDAFLAGS   ?= -O3 --fmad=false -std=c++11 -Xcompiler="-fPIC"
 # CUDA: compile each GPU host .cu independently
 CUDA_OBJS := $(GPU_SRCS:%.cu=%-cuda.o)
 
+# TODO(ci): none of the three GPU checks below runs in CI. GitHub's hosted
+# runners have no GPU and this workflow has no CUDA job (see
+# .github/workflows/ci.yml), so they are manual targets on a CUDA box only.
+# They check exactly the properties their commits claim -- DP4A bit-exactness
+# against the tiled kernel, Volta HMMA attention against the scalar kernel, and
+# the warp decode attention against the split kernel -- so they are worth
+# running before touching those paths, and worth wiring into a GPU-enabled
+# runner if one is ever available.
+#
 # GPU check: the DP4A Q8_0 GEMM must match the tiled kernel bit for bit.
 test-q8-gemm-gpu: tests/test_q8_gemm_gpu.cu backend_gpu_kernels-cuda.o
 	$(NVCC) $(CUDAFLAGS) $(CUDA_GENCODE) -DPICOLM_GPU=1 -o test_q8_gemm_gpu $^ -I.
