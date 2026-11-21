@@ -1873,7 +1873,7 @@ matmul_dev_impl(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
             gpu_dispatch_print("matmul_q5_imma_w8_dev");
             unsigned gy = (unsigned)((S + 16 * Q5K_TILES_S - 1) / (16 * Q5K_TILES_S));
             unsigned gx = (unsigned)((O + 8 * Q5KW_WARPS - 1) / (8 * Q5KW_WARPS));
-            int smt = Q5KW_WARPS * 32 * Q5K_TILES_S * 4 * (int)sizeof(float);
+            int smt = 0;   /* register accumulators now; no dynamic shared memory */
             picolm_q5_k_q8_matmul_imma_w8<<<dim3(gx, gy), 32 * Q5KW_WARPS, smt, ctx->stream>>>(
                 y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, ys);
             if (gpu_ok(gpuGetLastError(), "q5 matmul w8 (dev)")) return 1;

@@ -3609,6 +3609,10 @@ picolm_q5_k_q8_matmul_imma_cs(float *y, const int8_t *xq, const float *xd,
     }
 }
 
+#ifndef PICOLM_ABL_MMA_TILES
+#define PICOLM_ABL_MMA_TILES 1
+#endif
+
 /* Q5_K x Q8_0 IMMA kernel, MULTI-WARP x MULTI-TILE.
  *
  * WHY: measured on the 27B at S=423, the multi-tile kernel above runs at
@@ -3670,14 +3674,18 @@ picolm_q5_k_q8_matmul_imma_w8(float *y, const int8_t *xq, const float *xd,
      * register array for the reason recorded on the multi-tile kernel: as
      * registers the array spills from 8 tiles up and the spill changes the
      * RESULT, not just the speed. */
-    extern __shared__ float sum_sh[];
-    {
-        int total = Q5KW_WARPS * 32 * Q5K_TILES_S * 4;
-        for (int i = (int)gpuThreadIdx_x; i < total; i += (int)gpuBlockDim_x)
-            sum_sh[i] = 0.0f;
-    }
-    gpuSyncthreads();
-    float *mysum = sum_sh + ((size_t)warp * 32 + lane) * 4;
+    /* Accumulators in REGISTERS, one 4-float group per tile.
+     *
+     * They used to live in shared memory, updated on every k-block:
+     * 16 tiles x 160 k-blocks x 4 floats = 10240 read-modify-writes per warp
+     * per tensor, on the same addresses, with ~30-cycle dependent latency.
+     * Measured, that was ~600 ms of the 695 ms q5_K kernel.
+     *
+     * Q5K_TILES_S is 4 here so float acc[4][4] = 16 registers, which fits --
+     * the spill that forced shared memory only happens from 8 tiles up. */
+    float acc[Q5K_TILES_S][4];
+    for (int t = 0; t < Q5K_TILES_S; t++)
+        acc[t][0] = acc[t][1] = acc[t][2] = acc[t][3] = 0.0f;
 
     for (int kb = 0; kb < n_blocks; kb++) {
         int q5_block = kb / 8;
@@ -3711,6 +3719,52 @@ picolm_q5_k_q8_matmul_imma_w8(float *y, const int8_t *xq, const float *xd,
             b0 = (int)b0_val;
             b1 = (int)b1_val;
         }
+
+#if defined(PICOLM_ABL_STREAM_ONLY) || defined(PICOLM_ABL_W_PLUS_MMA)
+        /* ABLATION: weights read and decoded exactly as the real kernel does. */
+        acc[0][0] += (float)(b0 + b1);
+#ifndef PICOLM_ABL_W_PLUS_MMA
+        continue;
+#endif
+#ifdef PICOLM_ABL_W_PLUS_MMA
+        /* add back ONLY the mma, with fixed A fragments and unit scales.
+         * PICOLM_ABL_MMA_TILES=<n> sets how many of the n_tiles are done, so
+         * the per-tile cost can be measured instead of guessed: one tile is
+         * 1/16th of the real inner loop. */
+        for (int tt = 0; tt < PICOLM_ABL_MMA_TILES; tt++) {
+            int a0x, a1x, a2x, a3x;
+#ifdef PICOLM_ABL_PLUS_AGATHER
+            /* ALSO do the real A gather (the 4 scattered int32 loads) */
+            {
+                int tile_s = tile_s0 + tt * 16;
+                int c0 = tid * 4;
+                int c2 = c0 + 16;
+                int row0 = tile_s + gid;
+                int row1 = tile_s + gid + 8;
+                if (row0 >= S) row0 = S - 1;
+                if (row1 >= S) row1 = S - 1;
+                int32_t *p;
+                p = (int32_t *)(const int8_t *)(&xq[row0 * I + kb * 32 + c0]); a0x = p[0];
+                p = (int32_t *)(const int8_t *)(&xq[row1 * I + kb * 32 + c0]); a1x = p[0];
+                p = (int32_t *)(const int8_t *)(&xq[row0 * I + kb * 32 + c2]); a2x = p[0];
+                p = (int32_t *)(const int8_t *)(&xq[row1 * I + kb * 32 + c2]); a3x = p[0];
+            }
+#else
+            a0x = 0x04030201; a1x = 0x04030201; a2x = 0x04030201; a3x = 0x04030201;
+#endif
+            int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIP__)
+            asm volatile(
+                "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                : "+r"(d0), "+r"(d1), "+r"(d2), "+r"(d3)
+                : "r"(a0x), "r"(a1x), "r"(a2x), "r"(a3x), "r"(b0), "r"(b1));
+#endif
+            acc[tt][0] += (float)(d0 + d1 + d2 + d3);
+        }
+        continue;
+#endif
+#endif
 
         float wds0, wdmn0, wds1, wdmn1;
         {
@@ -3795,11 +3849,10 @@ picolm_q5_k_q8_matmul_imma_w8(float *y, const int8_t *xq, const float *xd,
             float dx0 = (row_a < S) ? xd[(size_t)row_a * n_blocks + kb] : 0.0f;
             float dx1 = (row_b < S) ? xd[(size_t)row_b * n_blocks + kb] : 0.0f;
 
-            { float *S4 = mysum + (size_t)t * Q5KW_WARPS * 32 * 4;
-              S4[0] += wds0 * dx0 * (float)d0 - wdmn0 * dx0 * (float)sq0;
-              S4[2] += wds0 * dx1 * (float)d2 - wdmn0 * dx1 * (float)sq1;
-              S4[1] += wds1 * dx0 * (float)d1 - wdmn1 * dx0 * (float)sq0;
-              S4[3] += wds1 * dx1 * (float)d3 - wdmn1 * dx1 * (float)sq1; }
+            acc[t][0] += wds0 * dx0 * (float)d0 - wdmn0 * dx0 * (float)sq0;
+            acc[t][2] += wds0 * dx1 * (float)d2 - wdmn0 * dx1 * (float)sq1;
+            acc[t][1] += wds1 * dx0 * (float)d1 - wdmn1 * dx0 * (float)sq0;
+            acc[t][3] += wds1 * dx1 * (float)d3 - wdmn1 * dx1 * (float)sq1;
         }
     }
 
@@ -3809,7 +3862,7 @@ picolm_q5_k_q8_matmul_imma_w8(float *y, const int8_t *xq, const float *xd,
             int row = tile_s + ((f < 2) ? gid : gid + 8);
             int col = tile_o + tid * 2 + (f % 2);
             if (row < S && col < O)
-                y[(size_t)row * ys + (size_t)col] = mysum[(size_t)t * Q5KW_WARPS * 32 * 4 + f];
+                y[(size_t)row * ys + (size_t)col] = acc[t][f];
         }
     }
 }
@@ -3978,7 +4031,10 @@ picolm_q5_k_q8_matmul_imma_mt(float *y, const int8_t *xq, const float *xd,
                 av = (int8_t *)&a1; sq1 += av[0] + av[1] + av[2] + av[3];
                 av = (int8_t *)&a3; sq1 += av[0] + av[1] + av[2] + av[3];
             }
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 300
+#ifdef PICOLM_ABL_NO_MINCORR2
+            /* ABLATION: drop 16 byte adds + 6 warp shuffles per tile per k-block. */
+            (void)sq0; (void)sq1;
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 300
             {
                 const unsigned mask = 0xFFFFFFFFu;
                 sq0 += gpuShflDownSync(mask, sq0, 2, 4);

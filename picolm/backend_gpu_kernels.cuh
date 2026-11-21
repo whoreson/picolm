@@ -16,7 +16,7 @@ __global__ void picolm_q5_k_q8_matmul_imma(float *y, const int8_t *xq, const flo
  * decodes the weight fragment once and reuses it for Q5K_TILES_S row-tiles,
  * cutting the per-chunk weight traffic by that factor. Grid is
  * ((O+7)/8, ceil(S / (16*Q5K_TILES_S))). */
-#define Q5K_TILES_S 16
+#define Q5K_TILES_S 8
 __global__ void picolm_q5_k_q8_matmul_imma_mt(float *y, const int8_t *xq, const float *xd, const void *weights, int S, int I, int O, int row_bytes, int y_stride);
 
 /* Multi-warp x multi-tile Q5_K IMMA. Block = Q5KW_WARPS warps; each warp owns
