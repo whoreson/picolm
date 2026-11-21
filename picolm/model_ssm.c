@@ -3471,7 +3471,11 @@ int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
             free(a2);
         }
     }
+#ifdef PICOLM_ABL_NO_SSMSYNC
+    /* ABLATION: drop the unconditional per-layer device sync. */
+#else
     if(ok) ok&=picolm_gpu_sync(dev);
+#endif
     SSM_DBG_SYNC;
       _DBG_TOK("gn_out",battn_out);
     if(l <= 4 && _SSM_DBG) {
@@ -5942,9 +5946,13 @@ static int _prefill_gpu_ubatch(model_t *m, run_state_t *s, gpu_weights_t *gw,
         { char _ts_label[64]; snprintf(_ts_label, 64, "LAYER_%d_START", l); picolm_gpu_ts_write(_ts_label); }
         picolm_gpu_set_dbg_layer(l);
 
+        double _ph0 = 0;
         layer_weights_t *lw = &w->layers[l];
         gl = &gw->layers[l];
 
+        { static int pw3 = -1;
+          if (pw3 < 0) { const char *e = getenv("PICOLM_PREFILL_WALL"); pw3 = (e && atoi(e) >= 2) ? 1 : 0; }
+          if (pw3) _ph0 = ssm_now_ms(); }
         if (c->has_ssm && !lw->is_attn_layer) {
             if (ssm_prefill_layer_gpu(m, s, bx, bxb, bq, battn_out, bffn_norm, bgate, bup, lw, l, n_ubatch, start_pos, gpu_dev)) {
                 /* GPU-native SSM succeeded */
@@ -6016,11 +6024,18 @@ static int _prefill_gpu_ubatch(model_t *m, run_state_t *s, gpu_weights_t *gw,
                 }
             }
 #endif
+            { static int pw3 = -1;
+              if (pw3 < 0) { const char *e = getenv("PICOLM_PREFILL_WALL"); pw3 = (e && atoi(e) >= 2) ? 1 : 0; }
+              if (pw3) { static double acc = 0; static long n = 0;
+                         acc += ssm_now_ms() - _ph0; n++;
+                         if (n == 48) { fprintf(stderr, "[PWALL2] SSM layers: %.1f ms total (%.2f ms/layer)\n", acc, acc/n); } } }
             continue;
         }
 
         int attn_out_stride = n_heads * head_dim;
         int attn_ffn_stride = n_ffn;
+        /* PICOLM_PREFILL_WALL=2: accumulate HOST wall time in three slices of
+         * the layer body. GPU_PROF only sees the stream; this sees the host. */
 
         /* Diagnostic: dump input to first attention layer */
 
@@ -6733,7 +6748,17 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
                     host_embd + (size_t)bi * dim,
                     dim * sizeof(float), 1, gpu_dev);
             }
+            /* PICOLM_PREFILL_WALL=1: host-side wall clock per prefill phase.
+             *
+             * PICOLM_GPU_PROF records CUDA events on the stream, so it sees
+             * kernel time and NOTHING the host does between launches. Measured
+             * on the 27B at 423 tokens: the sum of all prof slots was 718 ms
+             * against a 2370 ms prefill wall, i.e. 70% of prefill was in no
+             * kernel at all and every kernel optimisation was chasing the
+             * remaining 30%. This timer exists so that split is measurable. */
+            double _pw0 = ssm_now_ms();
             /* Process this ubatch through all layers */
+            double _pwemb = ssm_now_ms();
             int ubatch_rc = _prefill_gpu_ubatch(m, s, gw, tokens + offset, gpu_dev,
                 dim, n_ffn, n_heads, n_kv_heads, head_dim,
                 seq_len, rope_dim, rope_half,
@@ -6745,6 +6770,16 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
                 return NULL;
             }
 
+            {
+                static int pw = -1;
+                if (pw < 0) pw = getenv("PICOLM_PREFILL_WALL") ? 1 : 0;
+                if (pw) {
+                    double t1 = ssm_now_ms();
+                    fprintf(stderr, "[PWALL] ubatch@%d n=%d  embed+layers %.1f ms  (of which H2D embed %.1f)  (%.1f ms/token)\n",
+                            ubatch_start_pos, this_ubatch, t1 - _pw0, _pwemb - _pw0,
+                            this_ubatch > 0 ? (t1 - _pw0) / this_ubatch : 0.0);
+                }
+            }
             last_ubatch_size = this_ubatch;
             offset += this_ubatch;
         }
