@@ -2712,7 +2712,7 @@ int picolm_gpu_ssm_chunked_recurrence_dev(const float *conv_dev, const float *al
         picolm_gpu_prof_end(_pk); }
       if(!gpu_ok(gpuGetLastError(),"scatter"))SSMCR_RET(0);
       { int _pk = picolm_gpu_prof_slot("state_up"); picolm_gpu_prof_begin(device);
-              ssm_chunk_state_update_kernel<<<dim3(n_v_heads,MV_SPLIT),n_threads,(unsigned)((ca<1024?ca:1024)*sizeof(float)),ctx->stream>>>(state_dev,(const float*)d_vh,(const float*)d_ck,(const float*)d_cg,n_v_heads,repeat,ca,d);
+              ssm_chunk_state_update_kernel<<<dim3(n_v_heads,MV_SPLIT),n_threads,(unsigned)(((ca<1024?ca:1024)+4)*sizeof(float)),ctx->stream>>>(state_dev,(const float*)d_vh,(const float*)d_ck,(const float*)d_cg,n_v_heads,repeat,ca,d);
         picolm_gpu_prof_end(_pk); }
       if(!gpu_ok(gpuGetLastError(),"state_up"))SSMCR_RET(0);
     }

@@ -1755,7 +1755,9 @@ picolm_gpu_ssm_chunked_recurrence(const float *conv_batch_host,
              * have all read the PRE-update state for this chunk --
              * stream ordering guarantees that since everything above
              * is submitted first on the same stream. */
-            ssm_chunk_state_update_kernel<<<n_v_heads, n_threads, 0, ctx->stream>>>(
+            /* decay_sh[] is dynamic shared memory since 91df73b; +4 for the
+             * compiler's 3-float tail read past cs. */
+            ssm_chunk_state_update_kernel<<<n_v_heads, n_threads, (unsigned)((cs_actual + 4) * sizeof(float)), ctx->stream>>>(
                 (float *)d_state_buf, (const float *)d_v_hat, (const float *)d_chunk_k,
                 (const float *)d_cum_g, n_v_heads, repeat, cs_actual, d);
 
