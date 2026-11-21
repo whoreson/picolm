@@ -1805,6 +1805,22 @@ matmul_dev_impl(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
                 ctx->q8_xq, ctx->q8_xd, x_dev, I, S);
         }
         if (!gpu_ok(gpuGetLastError(), "q8 quantize (dev)")) return 0;
+        /* Multi-tile: see picolm_q6_k_q8_matmul_imma_mt. Weights were being
+         * re-read once per 16-token block, exactly as Q5_K was.
+         * PICOLM_NO_MT_Q6K=1 restores the single-tile kernel for A/B. */
+        static int no_mt_q6k = -1;
+        if (no_mt_q6k < 0) no_mt_q6k = getenv("PICOLM_NO_MT_Q6K") ? 1 : 0;
+        if (!no_mt_q6k && S > 16) {
+            gpu_dispatch_print("matmul_q6_imma_mt_dev");
+            /* Same stride rule as the Q5_K launch above: blockIdx.y maps to
+             * 16*Q6K_TILES_S rows, so the grid must divide by that. */
+            dim3 grid((unsigned)((O + 7) / 8),
+                      (unsigned)((S + 16 * Q6K_TILES_S - 1) / (16 * Q6K_TILES_S)));
+            int smt = Q6K_TILES_S * 32 * 4 * (int)sizeof(float);
+            picolm_q6_k_q8_matmul_imma_mt<<<grid, 32, smt, ctx->stream>>>(
+                y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, ys);
+            if (gpu_ok(gpuGetLastError(), "q6 matmul mt (dev)")) return 1;
+        }
         gpu_dispatch_print("matmul_q6_imma_dev");
         dim3 grid((unsigned)((O + 7) / 8), (unsigned)((S + 15) / 16));
         picolm_q6_q8_matmul_imma<<<grid, 32, 0, ctx->stream>>>(
@@ -1838,6 +1854,38 @@ matmul_dev_impl(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
                 ctx->q8_xq, ctx->q8_xd, x_dev, I, S);
         }
         if (!gpu_ok(gpuGetLastError(), "q8 quantize (dev)")) return 0;
+        /* Multi-tile kernel: decode the weight fragment once per k-block and
+         * reuse it across Q5K_TILES_S 16-row tiles. The single-tile kernel
+         * re-streams every weight byte once per 16-token block, which at a
+         * 512-token ubatch is a 32x read amplification -- measured as kernel
+         * time scaling exactly linearly with token count (1.03/2.10/4.27 ms
+         * per call at 128/256/512 tokens).
+         * PICOLM_NO_MT_Q5K=1 restores the single-tile kernel for A/B. */
+        static int no_mt_q5k = -1;
+        if (no_mt_q5k < 0) no_mt_q5k = getenv("PICOLM_NO_MT_Q5K") ? 1 : 0;
+        if (!no_mt_q5k && S > 16) {
+            gpu_dispatch_print("matmul_q5_imma_mt_dev");
+            /* Cap the tile count so short chunks stay wide: with a fixed 32
+             * tiles a 64-token ubatch would launch O/8 blocks of which each
+             * uses 4 tiles, wasting 87% of the accumulator work. Using
+             * ceil(S/16) when that is smaller keeps the grid shape matched
+             * to the work actually present. */
+            /* The kernel derives tile_s0 = blockIdx.y * 16 * Q5K_TILES_S from
+             * the COMPILE-TIME constant, so the grid must use that same
+             * stride. Capping the stride here (while the kernel kept using
+             * Q5K_TILES_S) made the blocks overlap and skip rows, which is
+             * what produced a different argmax at 423 tokens. Cap the ROW
+             * COUNT per block of the grid instead: with tiles_s < Q5K_TILES_S
+             * every block still owns Q5K_TILES_S tiles-worth of stride and
+             * simply processes fewer of them, which the kernel already
+             * handles through n_tiles. */
+            dim3 grid((unsigned)((O + 7) / 8),
+                      (unsigned)((S + 16 * Q5K_TILES_S - 1) / (16 * Q5K_TILES_S)));
+            int smt = Q5K_TILES_S * 32 * 4 * (int)sizeof(float);
+            picolm_q5_k_q8_matmul_imma_mt<<<grid, 32, smt, ctx->stream>>>(
+                y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, ys);
+            if (gpu_ok(gpuGetLastError(), "q5 matmul mt (dev)")) return 1;
+        }
         gpu_dispatch_print("matmul_q5_imma_dev");
         dim3 grid((unsigned)((O + 7) / 8), (unsigned)((S + 15) / 16));
         picolm_q5_k_q8_matmul_imma<<<grid, 32, 0, ctx->stream>>>(
@@ -1921,16 +1969,55 @@ matmul_dev_impl(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
     return 1;
 }
 
+/* Slot name for one matmul_dev call, split by S.
+ *
+ * Every quant type has its own 30-line copy-pasted activation-quantize block
+ * inside matmul_dev_impl (the survey counted ten), so instrumenting each call
+ * site would mean touching ten places and would still miss the next one added.
+ * Doing it at the wrapper means every path is covered by construction.
+ *
+ * The S split matters: S==1 takes the GEMV kernels (which have their own,
+ * more detailed slots inside kquant_gemv_dev / the Q8_0 GEMV branch), while
+ * S>=2 is prefill and a completely different set of tile kernels
+ * (matmul_q5_imma_dev, matmul_q6_imma_dev, matmul_imma_smw16_dev...) that had
+ * no slot at all. Prefill is the slower of the two paths and was therefore
+ * the one with no visibility.
+ */
+static int matmul_dev_prof_slot(const picolm_gpu_tensor_t *t, int S) {
+    if (S <= 1) return -1;   /* decode: already instrumented at the kernels */
+    switch (t->qtype) {
+    case GGUF_TYPE_Q8_0: return picolm_gpu_prof_slot("pf_matmul_q8_0");
+    case GGUF_TYPE_Q6_K: return picolm_gpu_prof_slot("pf_matmul_q6_K");
+    case GGUF_TYPE_Q5_K: return picolm_gpu_prof_slot("pf_matmul_q5_K");
+    case GGUF_TYPE_Q4_K: return picolm_gpu_prof_slot("pf_matmul_q4_K");
+    case GGUF_TYPE_Q4_0: return picolm_gpu_prof_slot("pf_matmul_q4_0");
+    case GGUF_TYPE_Q8_K: return picolm_gpu_prof_slot("pf_matmul_q8_K");
+    case GGUF_TYPE_F16:  return picolm_gpu_prof_slot("pf_matmul_f16");
+    case GGUF_TYPE_BF16: return picolm_gpu_prof_slot("pf_matmul_bf16");
+    case GGUF_TYPE_F32:  return picolm_gpu_prof_slot("pf_matmul_f32");
+    default:             return picolm_gpu_prof_slot("pf_matmul_other");
+    }
+}
+
 extern "C" int
 picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
                        int S, int device, int y_stride, int x_stride) {
     if (g_launch_on < 0) g_launch_on = getenv("PICOLM_LAUNCH_TMR") ? 1 : 0;
-    if (!g_launch_on)
-        return matmul_dev_impl(t, y_dev, x_dev, S, device, y_stride, x_stride);
-    double t0 = lt_now();
-    int rc = matmul_dev_impl(t, y_dev, x_dev, S, device, y_stride, x_stride);
-    g_launch_ms += lt_now() - t0;
-    g_launch_n++;
+
+    int ps = t ? matmul_dev_prof_slot(t, S) : -1;
+    if (ps >= 0) picolm_gpu_prof_begin(device);
+
+    int rc;
+    if (!g_launch_on) {
+        rc = matmul_dev_impl(t, y_dev, x_dev, S, device, y_stride, x_stride);
+    } else {
+        double t0 = lt_now();
+        rc = matmul_dev_impl(t, y_dev, x_dev, S, device, y_stride, x_stride);
+        g_launch_ms += lt_now() - t0;
+        g_launch_n++;
+    }
+
+    if (ps >= 0) picolm_gpu_prof_end(ps);
     return rc;
 }
 
