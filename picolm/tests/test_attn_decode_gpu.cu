@@ -40,7 +40,7 @@ static int run(int pos, int n_heads, int n_kv, int D, int n_swa, int splits_new)
             if (which == 0)
                 picolm_gpu_attention_decode_split_kernel<<<dim3(n_kv, ns), 256, sh>>>(pm, psum, pacc, dq, dk, dv, 0, pos, n_heads, n_kv, D, max_seq, pos_stride, head_stride, head_stride, ns, chunk, n_swa, 0);
             else
-                picolm_gpu_attention_decode_warp_kernel<<<dim3(n_kv, ns), 128>>>(pm, psum, pacc, dq, dk, dv, 0, pos, n_heads, n_kv, D, max_seq, pos_stride, head_stride, head_stride, ns, chunk, n_swa);
+                picolm_gpu_attention_decode_warp_launch(dim3(n_kv, ns), 0, pm, psum, pacc, dq, dk, dv, 0, pos, n_heads, n_kv, D, max_seq, pos_stride, head_stride, head_stride, ns, chunk, n_swa);
             picolm_gpu_attention_decode_merge_kernel<<<n_kv, 128, msh>>>(dy, pm, psum, pacc, n_heads, n_kv, D, ns);
             cudaEventRecord(b); cudaEventSynchronize(b);
         }
@@ -65,6 +65,8 @@ int main(void) {
     f |= run(5999, 32, 8, 128, 512, 40);
     f |= run(3000, 16, 2, 256, 0, 64);
     f |= run(700, 12, 4, 64, 0, 20);
+    f |= run(900, 24, 4, 128, 0, 30);
+    f |= run(400, 8, 8, 128, 0, 24);
     printf(f ? "FAILED\n" : "all ok\n");
     return f;
 }

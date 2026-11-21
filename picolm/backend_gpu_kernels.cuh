@@ -288,8 +288,10 @@ __global__ void picolm_gpu_attention_decode_kernel( float *xb_out, const float *
  * rather than longer serial scans. */
 #define ATTN_DECODE_TARGET_CHUNK 64
 /* Decode attention, warp per key: split-K partials for the merge kernel.
- * grid (n_kv_heads, n_splits), 128 threads. F16 KV, head_dim % 32 == 0, <= 256, kv_mul <= 8. */
-__global__ void picolm_gpu_attention_decode_warp_kernel(
+ * Launches picolm_gpu_attention_decode_warp_kernel<G, DPL> on grid
+ * (n_kv_heads, n_splits), 128 threads; 0 if kv_mul > 8 or head_dim is not
+ * 64/128/256. F16 KV cache only. */
+int picolm_gpu_attention_decode_warp_launch(dim3 grid, gpuStream_t stream,
     float *partial_max, float *partial_sum, float *partial_acc, const float *q_dev,
     const uint16_t *kv_k, const uint16_t *kv_v, int layer_ordinal, int pos,
     int n_heads, int n_kv_heads, int head_dim, int max_seq_len,

@@ -707,7 +707,7 @@ static void kv_strides_for(int device, int is_k, int n_kv_heads, int head_dim,
  * n_kv_heads*n_splits + a merge pass) based on how many KV positions
  * there are to walk. xb_dev/q_dev must already be device pointers. */
 /* Decode attention on picolm_gpu_attention_decode_warp_kernel: F16 KV cache,
- * head_dim a multiple of 32 up to 256, kv_mul <= 8, CUDA (32-lane warps).
+ * head_dim 64/128/256, kv_mul <= 8, CUDA (32-lane warps).
  * PICOLM_NO_ATTN_DECODE_WARP=1 keeps the single-pass/split kernels. */
 static int attn_decode_warp_ok(int head_dim, int kv_mul, int kv_type) {
 #ifdef __HIP__
@@ -716,7 +716,7 @@ static int attn_decode_warp_ok(int head_dim, int kv_mul, int kv_type) {
 #else
     static int off = -1;
     if (off < 0) off = getenv("PICOLM_NO_ATTN_DECODE_WARP") ? 1 : 0;
-    return !off && kv_type == 0 && head_dim % 32 == 0 && head_dim <= 256 && kv_mul <= 8;
+    return !off && kv_type == 0 && (head_dim == 64 || head_dim == 128 || head_dim == 256) && kv_mul <= 8;
 #endif
 }
 
@@ -806,7 +806,7 @@ attn_decode_dispatch(float *xb_dev, const float *q_dev,
     dim3 grid_split((unsigned)n_kv_heads, (unsigned)n_splits, 1);
     if (warp_kernel) {
         gpu_dispatch_print("attn_decode_warp");
-        picolm_gpu_attention_decode_warp_kernel<<<grid_split, 128, 0, ctx->stream>>>(
+        picolm_gpu_attention_decode_warp_launch(grid_split, ctx->stream,
             partial_max, partial_sum, partial_acc,
             q_dev, g_kv_k_dev[device], g_kv_v_dev[device],
             layer_ordinal, pos, n_heads, n_kv_heads, head_dim, max_seq_len,
