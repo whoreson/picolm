@@ -364,7 +364,11 @@ if /i "%MSVC_SIMD%"=="sse2"   set "NVCC_SIMD_DEF=-DPICOLM_SSE3=1 -DPICOLM_SSE2=1
 
 rem /arch is also forwarded to nvcc's inner cl.exe via -Xcompiler so the device
 rem side matches the C side.
-set "NVCC_FLAGS=-O3 --fmad=false -std=c++14 %NVCC_SIMD_DEF% -DPICOLM_GPU=1 -DPICOLM_CUDA=1 -DPICOLM_SSM_WARP_KERNEL_VALIDATED -DPICOLM_SSM_CHUNKED_GPU_VALIDATED -ccbin "!CL_EXE!" -Xcompiler "/EHsc /O2 /W3 /std:c++14 !MSVC_ARCH! /wd4244 /wd4267 /wd4101 /wd4102" -gencode arch=compute_89,code=sm_89 -I. -c -o"
+rem PICOLM_NVCC_EXTRA: extra nvcc flags, e.g. -DPICOLM_ABL_NO_BDECODE for the
+rem prefill ablation experiments. Kept as an env var rather than a Makefile
+rem option because it is for throwaway measurements, not for shipping builds.
+set "NVCC_EXTRA=%PICOLM_NVCC_EXTRA%"
+set "NVCC_FLAGS=-O3 --fmad=false -std=c++14 %NVCC_EXTRA% %NVCC_SIMD_DEF% -DPICOLM_GPU=1 -DPICOLM_CUDA=1 -DPICOLM_SSM_WARP_KERNEL_VALIDATED -DPICOLM_SSM_CHUNKED_GPU_VALIDATED -ccbin "!CL_EXE!" -Xcompiler "/EHsc /O2 /W3 /std:c++14 !MSVC_ARCH! /wd4244 /wd4267 /wd4101 /wd4102" -gencode arch=compute_89,code=sm_89 -I. -c -o"
 
 rem --selftest only inspects the environment; it must not compile the .cu files
 rem (that is the slow part of this target). Skip straight to the checks.
