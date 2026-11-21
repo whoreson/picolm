@@ -20,12 +20,29 @@
 *.sh            text eol=lf
 configure       text eol=lf
 
-# Sources: let each platform's normal convention apply, so a checkout on
-# Windows gets CRLF in the editor without changing what the compiler sees.
-*.c             text
-*.h             text
-*.md            text
-*.txt           text
+# Sources: LF on disk EVERYWHERE, explicitly.
+#
+# This used to be a bare "text", i.e. normalise on commit and let the platform
+# default apply on checkout. On Windows that means CRLF in the working tree
+# while the blob is LF, so git reports every line of every .c/.h file as
+# modified the moment it is checked out. Here it showed up as
+# picolm/steer.c permanently "M" with a 179/179 diff, which blocked
+# `git stash pop` and, worse, stopped an in-progress `git rebase` dead on a
+# file nobody had edited. Committing the file once did not help -- the next
+# checkout re-expanded it.
+#
+# Same failure as the .bat rule above, inverted: there the working tree needs
+# CRLF, here it must not. eol=lf makes the checkout deterministic.
+*.c             text eol=lf
+*.h             text eol=lf
+*.hpp           text eol=lf
+*.cuh           text eol=lf
+*.cu            text eol=lf
+*.mm            text eol=lf
+*.m             text eol=lf
+*.md            text eol=lf
+*.txt           text eol=lf
+*.py            text eol=lf
 
 # Binary-ish assets: never touch these.
 *.png           binary
