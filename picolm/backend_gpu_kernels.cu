@@ -4158,6 +4158,35 @@ picolm_q5_k_q8_matmul_imma_w8(float *y, const int8_t *xq, const float *xd,
     }
 }
 
+/* NEGATIVE RESULT, recorded so it is not retried: shared-memory staging for
+ * Q5_K LOSES, and clearly.
+ *
+ * A staged kernel was written to the same shape as the one that works for
+ * q8_0 (picolm_q8_q8_matmul_imma_smw16: 16 columns x 16 rows per block,
+ * coalesced per-column staging, 64 threads). q8_0 moves 32 MB/ms and unstaged
+ * q5_K only 24, which looked like a 1.33x to be had.
+ *
+ * It is not. Measured on the 27B at 423 tokens:
+ *     unstaged (imma_sb)                     360-394 tok/s
+ *     staged, 1 k-step per barrier           216 tok/s
+ *     staged, 2 k-steps per barrier          191 tok/s
+ *     staged, 4 k-steps per barrier          181 tok/s
+ *     staged, 8 k-steps per barrier          150 tok/s
+ * Correct at every setting (max|logit diff| 2.72, argmax same), just slow.
+ *
+ * WHY: a block_q5_K is 176 bytes against block_q8_0's 34. The same staging
+ * geometry therefore needs 5x the shared memory, and it is paid twice --
+ *   * occupancy: 16 cols x 8 x 176 = 22.5 KB per block caps an SM at 2 blocks,
+ *     i.e. 128 of 2048 thread slots = 6%;
+ *   * barriers: staging one k-step at a time means 160 __syncthreads() per
+ *     block, and batching k-steps to amortise them only makes the shared
+ *     memory worse.
+ * The unstaged imma_sb kernel uses no shared memory, runs 256 threads, and has
+ * no barrier inside the k loop at all.
+ *
+ * So q8_0's advantage is NOT "it stages". It is that a 34-byte block is cheap
+ * to stage. The conclusion for q5_K is the opposite of the hypothesis: keep it
+ * unstructured, and look elsewhere. */
 /* Q5_K x Q8_0 IMMA kernel, SUPERBLOCK-UNROLLED inner loop.
  *
  * WHY: after moving the accumulators to registers the q5_K kernel ran at
@@ -7296,18 +7325,37 @@ picolm_gpu_ssm_conv1d_batch_kernel(float *conv_output,     /* out [n_tokens][str
                                     const float *new_input, /* in [n_tokens][stride] */
                                     const float *conv1d_w,  /* in [conv_dim][d_conv] */
                                     int conv_dim, int d_conv, int n_tokens, int stride) {
+    /* WARNING: the token loop below MUST stay serial, in order.
+     *
+     * The caller aliases input and output (conv1d_batch_dev(bxb, ..., bxb)).
+     * Each token's input is read into a register before its own output is
+     * written, so a single thread walking t = 0..n_tokens-1 is safe, and the
+     * hist[] window holds the ORIGINAL inputs because they were captured
+     * before being overwritten. Any reordering across tokens -- splitting the
+     * token range over blockIdx.y, or computing x[t-d_conv+1..t] directly from
+     * the array -- makes one block overwrite x[t] before another reads it.
+     *
+     * Both were tried. Splitting tokens over blockIdx.y measured max|logit
+     * diff| 15.4 against the previous build with a different argmax, i.e.
+     * garbage, and prefill barely moved (0.443 -> 0.367 ms/call) because the
+     * cost is the dependent chain, not the shift.
+     *
+     * If this ever needs to be faster: the honest route is to copy the input
+     * out first (one D2D of n_tokens*stride*4 bytes, ~17 MB for the 27B) and
+     * then let the tokens run independently against the copy. The measured
+     * shape says so -- 423 dependent iterations at ~1.1 us each is memory
+     * latency on the chain, not ALU, and expf is only ~1% of the 0.466 ms. */
+    int n_state_rows = d_conv - 1;
     int co = (int)gpuBlockIdx_x * gpuBlockDim_x + gpuThreadIdx_x;
     if (co >= conv_dim) return;
-
-    int n_state_rows = d_conv - 1;
-
-    float hist[PICOLM_SSM_CONV_MAX_D_CONV];
-    for (int r = 0; r < n_state_rows; r++)
-        hist[r] = conv_state[r * conv_dim + co];
 
     float w[PICOLM_SSM_CONV_MAX_D_CONV];
     for (int d = 0; d < d_conv; d++)
         w[d] = conv1d_w[d + co * d_conv];
+
+    float hist[PICOLM_SSM_CONV_MAX_D_CONV];
+    for (int r = 0; r < n_state_rows; r++)
+        hist[r] = conv_state[(size_t)r * conv_dim + co];
 
     for (int t = 0; t < n_tokens; t++) {
         float new_sample = new_input[(size_t)t * stride + co];
@@ -7315,7 +7363,7 @@ picolm_gpu_ssm_conv1d_batch_kernel(float *conv_output,     /* out [n_tokens][str
         for (int d = 0; d < n_state_rows; d++)
             sum += w[d] * hist[d];
         sum += w[n_state_rows] * new_sample;
-        conv_output[(size_t)t * stride + co] = sum / (1.0f + expf(-sum)); /* silu */
+        conv_output[(size_t)t * stride + co] = sum / (1.0f + expf(-sum));
 
         for (int r = 0; r < n_state_rows - 1; r++)
             hist[r] = hist[r + 1];
@@ -7324,7 +7372,7 @@ picolm_gpu_ssm_conv1d_batch_kernel(float *conv_output,     /* out [n_tokens][str
     }
 
     for (int r = 0; r < n_state_rows; r++)
-        conv_state[r * conv_dim + co] = hist[r];
+        conv_state[(size_t)r * conv_dim + co] = hist[r];
 }
 __global__ void
 picolm_ssm_recurrence_kernel(float *state,

@@ -2214,6 +2214,9 @@ static int picolm_gpu_ssm_conv1d_batch_dev_impl(float *od, float *sd, const floa
     gpu_device_ctx_t *ctx = find_ctx(dev);
     if(!ctx||!select_ctx(ctx)) return 0;
     int nb=(cd+255)/256;
+    /* Tokens CANNOT be split across blocks here: the caller aliases input and
+     * output (conv1d_batch_dev(bxb, ..., bxb)) and the token walk must stay in
+     * order. Only channels parallelise. */
     picolm_gpu_ssm_conv1d_batch_kernel<<<nb,256,0,ctx->stream>>>(od,sd,id,wd,cd,dc,nt,stride);
     return gpu_ok(gpuGetLastError(),"conv1d batch dev");
 }
