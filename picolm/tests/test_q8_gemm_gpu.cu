@@ -1,5 +1,5 @@
 /* test_q8_gemm_gpu: picolm_q8_q8_matmul_dp4a must match
- * picolm_q8_q8_matmul_tiled bit for bit (and both must be close to a
+ * picolm_q8_q8_matmul_tiled and picolm_q8_q8_matmul bit for bit (and be close to a
  * double-precision CPU reference). On Volta, picolm_q8_q8_matmul_hmma must
  * be within 1e-6 of that reference (relative to the sum of |terms|). Random Q8_0 weights and activations over
  * shapes that hit every tail: K not a multiple of 1024, K > 8192 (slots with
@@ -36,6 +36,7 @@ static int run(int S, int I, int O) {
     float *y0 = (float *)malloc((size_t)S * O * sizeof(float));
     float *y1 = (float *)malloc((size_t)S * O * sizeof(float));
     float *y2 = (float *)calloc((size_t)S * O, sizeof(float));
+    float *y3 = (float *)malloc((size_t)S * O * sizeof(float));
 
     for (int o = 0; o < O; o++)
         for (int b = 0; b < nb; b++) {
@@ -62,6 +63,9 @@ static int run(int S, int I, int O) {
     picolm_q8_q8_matmul_dp4a<<<dim3((O + 7) / 8, (S + 7) / 8), 256>>>(
         dy, dxq, dxd, dw, S, I, O, row_bytes, O);
     cudaMemcpy(y1, dy, (size_t)S * O * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemset(dy, 0xFF, (size_t)S * O * sizeof(float));
+    picolm_q8_q8_matmul<<<dim3(O, S), 256>>>(dy, dxq, dxd, dw, S, I, O, row_bytes, O);
+    cudaMemcpy(y3, dy, (size_t)S * O * sizeof(float), cudaMemcpyDeviceToHost);
     if (g_hmma) {
         cudaMemset(dy, 0xFF, (size_t)S * O * sizeof(float));
         picolm_q8_q8_matmul_hmma<<<dim3((O + 63) / 64, (S + 127) / 128), 128>>>(
@@ -74,7 +78,7 @@ static int run(int S, int I, int O) {
     for (int s = 0; s < S; s++)
         for (int o = 0; o < O; o++) {
             size_t k = (size_t)s * O + o;
-            if (memcmp(&y0[k], &y1[k], 4)) diff++;
+            if (memcmp(&y0[k], &y1[k], 4) || memcmp(&y3[k], &y1[k], 4)) diff++;
             double ref = 0.0, mag = 0.0;
             for (int b = 0; b < nb; b++) {
                 const uint8_t *p = w + (size_t)o * row_bytes + (size_t)b * GPU_BLOCK_Q8_0_SIZE;
@@ -93,7 +97,7 @@ static int run(int S, int I, int O) {
            S, I, O, diff, S * O, max_rel, max_rel2,
            err != cudaSuccess ? cudaGetErrorString(err) : fail ? "FAIL" : "ok");
     cudaFree(dw); cudaFree(dxq); cudaFree(dxd); cudaFree(dy);
-    free(w); free(xq); free(xd); free(y0); free(y1); free(y2);
+    free(w); free(xq); free(xd); free(y0); free(y1); free(y2); free(y3);
     return fail;
 }
 
