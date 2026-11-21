@@ -6,6 +6,22 @@ extern "C" int  picolm_gpu_prof_slot(const char *name);
 extern "C" void picolm_gpu_prof_begin(int device);
 extern "C" void picolm_gpu_prof_end(int slot);
 
+/* Profile one prefill-side helper call. GPU_PROF had slots for the matmuls and
+ * the decode attention only, so prefill attention, the KV store, rmsnorm,
+ * silu_mul and residual_add between them accounted for none of the ~730 ms of
+ * layer-loop wall time that the kernel sum could not explain. */
+#define PF_PROF(name, dev, call)                                          \
+    do {                                                                  \
+        int _pfps = picolm_gpu_prof_slot(name);                           \
+        picolm_gpu_prof_begin(dev);                                       \
+        int _pfrc = (call);                                               \
+        picolm_gpu_prof_end(_pfps);                                       \
+        return _pfrc;                                                     \
+    } while (0)
+
+extern "C" void picolm_gpu_prof_begin(int device);
+extern "C" void picolm_gpu_prof_end(int slot);
+
 extern "C" {
 __global__ void picolm_gpu_kv_pack_store_kernel(uint16_t *dst_row, const float *src, int n);
 }
@@ -1239,7 +1255,7 @@ picolm_gpu_attention_prefill(float *xb_out, const float *q_host,
 /* Device-native prefill attention: xb_out_dev and q_dev are already
  * device-resident. No H2D, no D2H, no gpuDeviceSynchronize(). */
 extern "C" int
-picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
+attn_prefill_dev_impl(float *xb_out_dev, const float *q_dev,
                                   int layer_ordinal, int start_pos, int n_tokens,
                                   int n_heads, int n_kv_heads, int head_dim,
                                   int max_seq_len, int device, int n_swa) {
@@ -1359,6 +1375,23 @@ picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
         kv_pos_stride_bytes, kv_head_stride_bytes, kv_head_stride_v_bytes, tile_q, n_swa, kv_type);
     if (!gpu_ok(gpuGetLastError(), "attn prefill (dev)")) return 0;
     return 1;
+}
+
+/* Profiled wrapper. Prefill attention had NO slot, so it contributed nothing
+ * to the kernel sum while the layer loop ran ~730 ms faster than that sum
+ * explained. */
+extern "C" int
+picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
+                                  int layer_ordinal, int start_pos, int n_tokens,
+                                  int n_heads, int n_kv_heads, int head_dim,
+                                  int max_seq_len, int device, int n_swa) {
+    int ps = picolm_gpu_prof_slot("attn_prefill");
+    picolm_gpu_prof_begin(device);
+    int rc = attn_prefill_dev_impl(xb_out_dev, q_dev, layer_ordinal, start_pos,
+                                   n_tokens, n_heads, n_kv_heads, head_dim,
+                                   max_seq_len, device, n_swa);
+    picolm_gpu_prof_end(ps);
+    return rc;
 }
 
 /* Device-native prefill attention with FP32 K/V (no KV cache read).
@@ -2479,10 +2512,17 @@ int picolm_gpu_ssm_chunked_recurrence_dev(const float *conv_dev, const float *al
     int d_state, int n_k_heads, int n_v_heads,
     int head_v_dim, int repeat, int conv_dim, int cs, int device) {
     (void)conv_dim; /* conv_dim is used for offset calculations, xb2_stride for striding */
+    /* Profile the SSM chunked recurrence: this file had NO prof slots at all,
+     * so the whole SSM GPU prefill path was invisible while it accounted for
+     * almost all of prefill's wall time on the 27B (48 SSM layers x ~29 ms,
+     * against 16 attention layers costing ~50 ms in total). */
+    int _ssmps = picolm_gpu_prof_slot("ssm_chunk_rec");
+    picolm_gpu_prof_begin(device);
 #ifndef PICOLM_SSM_CHUNKED_GPU_VALIDATED
     (void)conv_dev;(void)alpha_dev;(void)beta_dev;(void)state_dev;(void)xb2_dev;
     (void)n_tokens;(void)value_dim;(void)xb2_stride;(void)d_state;(void)n_k_heads;
     (void)n_v_heads;(void)head_v_dim;(void)repeat;(void)cs;(void)device;
+    picolm_gpu_prof_end(_ssmps);
     return 0;
 #else
     if(d_state!=head_v_dim) return 0;
@@ -2582,6 +2622,7 @@ int picolm_gpu_ssm_chunked_recurrence_dev(const float *conv_dev, const float *al
       ssm_chunk_state_update_kernel<<<n_v_heads,n_threads,0,ctx->stream>>>(state_dev,(const float*)d_vh,(const float*)d_ck,(const float*)d_cg,n_v_heads,repeat,ca,d);
       if(!gpu_ok(gpuGetLastError(),"state_up"))return 0;
     }
+    picolm_gpu_prof_end(_ssmps);
     return ok;
 #endif
 }
