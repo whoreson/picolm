@@ -2261,6 +2261,7 @@ picolm_q8_q8_matmul_imma_smw16(float *y, const int8_t *xq, const float *xd,
 
             int d0a = 0, d1a = 0, d2a = 0, d3a = 0;
             int d0b = 0, d1b = 0, d2b = 0, d3b = 0;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIP__)
             asm volatile(
                 "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
@@ -2271,6 +2272,7 @@ picolm_q8_q8_matmul_imma_smw16(float *y, const int8_t *xq, const float *xd,
                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                 : "+r"(d0b), "+r"(d1b), "+r"(d2b), "+r"(d3b)
                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0b), "r"(b1b));
+#endif
 
             /* Weight scales from shared memory. */
             {
@@ -6792,12 +6794,14 @@ picolm_gpu_attention_prefill_fa2_kernel(
                 int b1 = ki < tk_size ? ((int *)k_tile_sh)[ki * row_stride32 + dim32_2] : 0;
 
                 float d0 = 0.0f, d1 = 0.0f, d2_ = 0.0f, d3 = 0.0f;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIP__)
                 asm volatile(
                     "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
                     "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
                     : "+f"(d0), "+f"(d1), "+f"(d2_), "+f"(d3)
                     : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1)
                 );
+#endif
 
                 {
                     int k = ki8 + tid_in_grp * 2;
