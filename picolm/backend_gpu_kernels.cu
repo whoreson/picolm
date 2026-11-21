@@ -3099,6 +3099,371 @@ picolm_q5_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
     }
 }
 
+/* Q6_K x Q8_0 IMMA kernel, MULTI-TILE.
+ *
+ * Same reasoning as picolm_q5_k_q8_matmul_imma_mt: the single-tile Q6_K kernel
+ * streams the whole K extent of 8 output rows to produce one 16x8 tile, so
+ * every weight byte is re-read once per 16-token block. After the Q5_K
+ * multi-tile change made Q5_K 7x cheaper, Q6_K became the largest prefill
+ * matmul (53% of the matmul time), so it gets the same treatment: decode the
+ * weight fragment and the per-column scales ONCE per k-block, then reuse them
+ * across Q6K_TILES_S independent 16-row accumulators.
+ *
+ * Arithmetic per output element is unchanged, so results are bit-identical to
+ * the single-tile kernel (verified with PICOLM_DUMP_LOGITS, max|diff| 0.0).
+ */
+__global__ void
+picolm_q6_k_q8_matmul_imma_mt(float *y, const int8_t *xq, const float *xd,
+                               const void *weights, int S, int I, int O,
+                               int row_bytes, int y_stride) {
+    int gid = gpuThreadIdx_x / 4;
+    int tid = gpuThreadIdx_x % 4;
+    int tile_o = gpuBlockIdx_x * 8;
+    int tile_s0 = gpuBlockIdx_y * (16 * Q6K_TILES_S);
+    int ys = y_stride > 0 ? y_stride : O;
+    int n_blocks = I / 32;
+    const uint8_t *w = (const uint8_t *)weights;
+
+    int n_tiles = (S - tile_s0 + 15) >> 4;
+    if (n_tiles > Q6K_TILES_S) n_tiles = Q6K_TILES_S;
+    if (n_tiles <= 0) return;
+
+    /* Shared-memory accumulators -- see the long comment in
+     * picolm_q5_k_q8_matmul_imma_mt for why these cannot be a register array. */
+    extern __shared__ float sum_sh[];
+    for (int i = gpuThreadIdx_x; i < Q6K_TILES_S * 32 * 4; i += gpuBlockDim_x)
+        sum_sh[i] = 0.0f;
+    gpuSyncthreads();
+    float *mysum = sum_sh + (size_t)gpuThreadIdx_x * 4;
+
+    for (int kb = 0; kb < n_blocks; kb++) {
+        int q6_block = kb / 8;
+        int g = kb % 8;
+
+        int wc = tile_o + gid;
+        size_t wrow_base = (size_t)wc * row_bytes + q6_block * GPU_BLOCK_Q6_K_SIZE;
+
+        int chunk = g / 4;
+        int half = (g % 4) % 2;
+        int nibble = (g % 4) / 2;
+        int qh_pair = g % 4;
+
+        int ql_base = chunk * 64 + half * 32;
+        int qh_base = 128 + chunk * 32;
+        int qh_shift = qh_pair * 2;
+
+        /* ---- WEIGHT fragment: decoded once, reused by every tile ---- */
+        uint32_t ql0_raw, ql1_raw;
+        {
+            const uint8_t *qlp = w + wrow_base + ql_base;
+            memcpy(&ql0_raw, qlp + tid * 4, 4);
+            memcpy(&ql1_raw, qlp + 16 + tid * 4, 4);
+        }
+        uint32_t ql0, ql1;
+        if (nibble) {
+            ql0 = (ql0_raw >> 4) & 0x0F0F0F0F;
+            ql1 = (ql1_raw >> 4) & 0x0F0F0F0F;
+        } else {
+            ql0 = ql0_raw & 0x0F0F0F0F;
+            ql1 = ql1_raw & 0x0F0F0F0F;
+        }
+        uint32_t qh0, qh1;
+        {
+            const uint8_t *qhp = w + wrow_base + qh_base;
+            uint32_t qh0_raw, qh1_raw;
+            memcpy(&qh0_raw, qhp + tid * 4, 4);
+            memcpy(&qh1_raw, qhp + 16 + tid * 4, 4);
+            if (qh_shift == 0) {
+                qh0 = (qh0_raw & 0x03030303) << 4;
+                qh1 = (qh1_raw & 0x03030303) << 4;
+            } else if (qh_shift == 2) {
+                qh0 = ((qh0_raw >> 2) & 0x03030303) << 4;
+                qh1 = ((qh1_raw >> 2) & 0x03030303) << 4;
+            } else if (qh_shift == 4) {
+                qh0 = qh0_raw & 0x30303030;
+                qh1 = qh1_raw & 0x30303030;
+            } else {
+                qh0 = ((qh0_raw >> 6) & 0x03030303) << 4;
+                qh1 = ((qh1_raw >> 6) & 0x03030303) << 4;
+            }
+        }
+        uint32_t b0, b1;
+        { uint32_t v = ql0 | qh0; b0 = (((v & 0xFF) - 32) & 0xFF) | ((((v >> 8) & 0xFF) - 32) & 0xFF) << 8 | ((((v >> 16) & 0xFF) - 32) & 0xFF) << 16 | (((v >> 24) - 32) & 0xFF) << 24; }
+        { uint32_t v = ql1 | qh1; b1 = (((v & 0xFF) - 32) & 0xFF) | ((((v >> 8) & 0xFF) - 32) & 0xFF) << 8 | ((((v >> 16) & 0xFF) - 32) & 0xFF) << 16 | (((v >> 24) - 32) & 0xFF) << 24; }
+
+        /* ---- per-output-column scales, independent of the tile ---- */
+        float sc00, sc01, sc10, sc11;
+        { size_t wb0_off = (size_t)(tile_o + tid * 2) * row_bytes + q6_block * GPU_BLOCK_Q6_K_SIZE;
+          const uint8_t *wb0 = w + wb0_off;
+          float wd0 = gpu_fp16_to_fp32((uint16_t)(wb0[208] | (wb0[209] << 8)));
+          sc00 = wd0 * (float)(int8_t)wb0[192 + g * 2];
+          sc01 = wd0 * (float)(int8_t)wb0[192 + g * 2 + 1]; }
+        { size_t wb1_off = (size_t)(tile_o + tid * 2 + 1) * row_bytes + q6_block * GPU_BLOCK_Q6_K_SIZE;
+          const uint8_t *wb1 = w + wb1_off;
+          float wd1 = gpu_fp16_to_fp32((uint16_t)(wb1[208] | (wb1[209] << 8)));
+          sc10 = wd1 * (float)(int8_t)wb1[192 + g * 2];
+          sc11 = wd1 * (float)(int8_t)wb1[192 + g * 2 + 1]; }
+
+        for (int t = 0; t < n_tiles; t++) {
+            int tile_s = tile_s0 + t * 16;
+
+            int a0, a1, a2, a3;
+            {
+                int c0 = tid * 4;
+                int c2 = c0 + 16;
+                int row0 = tile_s + gid;
+                int row1 = tile_s + gid + 8;
+                if (row0 >= S) row0 = S - 1;
+                if (row1 >= S) row1 = S - 1;
+                int src0 = row0 * I + kb * 32 + c0;
+                int src1 = row1 * I + kb * 32 + c0;
+                int src2 = row0 * I + kb * 32 + c2;
+                int src3 = row1 * I + kb * 32 + c2;
+                int32_t *p;
+                p = (int32_t *)(const int8_t *)(&xq[src0]); a0 = p[0];
+                p = (int32_t *)(const int8_t *)(&xq[src1]); a1 = p[0];
+                p = (int32_t *)(const int8_t *)(&xq[src2]); a2 = p[0];
+                p = (int32_t *)(const int8_t *)(&xq[src3]); a3 = p[0];
+            }
+
+            int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+            int d0b = 0, d1b = 0, d2b = 0, d3b = 0;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIP__)
+            asm volatile(
+                "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                : "+r"(d0), "+r"(d1), "+r"(d2), "+r"(d3)
+                : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(0));
+            asm volatile(
+                "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                : "+r"(d0b), "+r"(d1b), "+r"(d2b), "+r"(d3b)
+                : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(0), "r"(b1));
+#endif
+            const int row_a = tile_s + gid;
+            const int row_b = tile_s + gid + 8;
+            float dx0 = (row_a < S) ? xd[(size_t)row_a * n_blocks + kb] : 0.0f;
+            float dx1 = (row_b < S) ? xd[(size_t)row_b * n_blocks + kb] : 0.0f;
+
+            { float *S4 = mysum + (size_t)t * 32 * 4;
+              S4[0] += (float)d0  * dx0 * sc00 + (float)d0b  * dx0 * sc01;
+              S4[2] += (float)d2  * dx1 * sc00 + (float)d2b  * dx1 * sc01;
+              S4[1] += (float)d1  * dx0 * sc10 + (float)d1b  * dx0 * sc11;
+              S4[3] += (float)d3  * dx1 * sc10 + (float)d3b  * dx1 * sc11; }
+        }
+    }
+
+    for (int t = 0; t < n_tiles; t++) {
+        int tile_s = tile_s0 + t * 16;
+        for (int f = 0; f < 4; f++) {
+            int row = tile_s + ((f < 2) ? gid : gid + 8);
+            int col = tile_o + tid * 2 + (f % 2);
+            if (row < S && col < O)
+                y[(size_t)row * ys + (size_t)col] = mysum[(size_t)t * 32 * 4 + f];
+        }
+    }
+}
+
+/* Q5_K x Q8_0 IMMA kernel, MULTI-TILE (TILES_S row-tiles of 16 per block).
+ *
+ * Why this exists: the single-tile kernel above (picolm_q5_k_q8_matmul_imma)
+ * computes ONE 16x8 output tile per warp and streams the entire K extent of
+ * those 8 output rows to do it. The weight bytes are therefore re-read once
+ * per 16-token row-block: for a 512-token prefill chunk that is a 32x read
+ * amplification, and it is measurable as "kernel time scales exactly linearly
+ * with token count while the per-call time doubles as the ubatch doubles"
+ * (measured: tokens 128/256/512 -> 1.03/2.10/4.27 ms per call, total time flat
+ * at ~1040 ms). Prefill was moving 317 GB per chunk instead of 11.7 GB, at a
+ * healthy 315 GB/s -- i.e. bandwidth-bound on 27x too much traffic, 2.3% of
+ * int8 tensor-core peak.
+ *
+ * This kernel keeps the SAME per-tile arithmetic (same m16n8k32 mma, same
+ * nibble/high-bit decode as the reference, same min-correction), but decodes
+ * the weight fragment ONCE per k-block and reuses it for TILES_S independent
+ * 16-row accumulators. That cuts the weight traffic by TILES_S with no change
+ * to what any individual output element computes.
+ *
+ * Registers: sum[] is TILES_S*4 floats. TILES_S=4 -> 16 accumulators plus the
+ * 4 activation fragments and 2 weight fragments per tile set, which stays well
+ * inside the 255-register budget at 32 threads/block.
+ */
+__global__ void
+picolm_q5_k_q8_matmul_imma_mt(float *y, const int8_t *xq, const float *xd,
+                               const void *weights, int S, int I, int O,
+                               int row_bytes, int y_stride) {
+    int gid = gpuThreadIdx_x / 4;
+    int tid = gpuThreadIdx_x % 4;
+    int tile_o = gpuBlockIdx_x * 8;
+    int tile_s0 = gpuBlockIdx_y * (16 * Q5K_TILES_S);
+    int ys = y_stride > 0 ? y_stride : O;
+    int n_blocks = I / 32;
+    const uint8_t *w = (const uint8_t *)weights;
+
+    /* How many of the Q5K_TILES_S tiles this block actually owns. The last
+     * block in y may own fewer, and for a short ubatch (a 2-token chunk tail,
+     * say) that is most of them; skipping them here avoids both the wasted
+     * accumulator work and the clamped-row loads below. */
+    int n_tiles = (S - tile_s0 + 15) >> 4;
+    if (n_tiles > Q5K_TILES_S) n_tiles = Q5K_TILES_S;
+    if (n_tiles <= 0) return;
+
+    /* Accumulators live in SHARED memory, not registers.
+     *
+     * As a register array this kernel is correct up to Q5K_TILES_S=4 and
+     * silently WRONG at 8: sum[8][4] is 32 live floats per thread before the
+     * 4 activation fragments, 2 weight fragments and address arithmetic, so
+     * ptxas spills and the result changes (measured: 2 and 4 tiles match the
+     * CPU bit-for-bit, 8 tiles diverges with a different argmax). Staging them
+     * in shared memory removes the ceiling: 32 threads x 4 floats per tile is
+     * only 512 bytes for 8 tiles.
+     *
+     * Layout: sum_sh[(t * 32 + tid) * 4 + f] -- per-thread, so the hot path
+     * still reads/writes its own slice and needs no synchronisation. */
+    extern __shared__ float sum_sh[];
+    for (int i = gpuThreadIdx_x; i < Q5K_TILES_S * 32 * 4; i += gpuBlockDim_x)
+        sum_sh[i] = 0.0f;
+    gpuSyncthreads();
+    float *mysum = sum_sh + (size_t)gpuThreadIdx_x * 4;   /* stride 32*4 per tile */
+
+    for (int kb = 0; kb < n_blocks; kb++) {
+        int q5_block = kb / 8;
+        int g = kb % 8;
+
+        /* ---- WEIGHT fragment: decoded once, reused by every tile ---- */
+        int wc = tile_o + gid;
+        size_t wrow_base = (size_t)wc * row_bytes + q5_block * GPU_BLOCK_Q5_K_SIZE;
+        const uint8_t *wb = w + wrow_base;
+
+        int b0, b1;
+        {
+            int group = g >> 1;
+            int sub = g & 1;
+            const uint8_t *qs_base = wb + 48 + group * 32;
+            const uint8_t *qh_base = wb + 16;
+            int bit_shift = 2 * group + sub;
+
+            uint32_t b0_val = 0, b1_val = 0;
+            for (int e = 0; e < 4; e++) {
+                int l = tid * 4 + e;
+                uint8_t qs_byte = qs_base[l];
+                uint8_t nibble = sub ? (qs_byte >> 4) : (qs_byte & 0xF);
+                uint8_t high = ((qh_base[l] >> bit_shift) & 1) ? 16 : 0;
+                b0_val |= (uint32_t)(nibble + high) << (e * 8);
+
+                int l1 = 16 + tid * 4 + e;
+                uint8_t qs1 = qs_base[l1];
+                uint8_t nib1 = sub ? (qs1 >> 4) : (qs1 & 0xF);
+                uint8_t hi1 = ((qh_base[l1] >> bit_shift) & 1) ? 16 : 0;
+                b1_val |= (uint32_t)(nib1 + hi1) << (e * 8);
+            }
+            b0 = (int)b0_val;
+            b1 = (int)b1_val;
+        }
+
+        /* ---- per-output-column scales, also independent of the tile ---- */
+        float wds0, wdmn0, wds1, wdmn1;
+        {
+            size_t wb0_off = (size_t)(tile_o + tid * 2) * row_bytes + q5_block * GPU_BLOCK_Q5_K_SIZE;
+            const uint8_t *wb0 = w + wb0_off;
+            float wd0 = gpu_fp16_to_fp32((uint16_t)(wb0[0] | (wb0[1] << 8)));
+            float wdm0 = gpu_fp16_to_fp32((uint16_t)(wb0[2] | (wb0[3] << 8)));
+            uint8_t sc0, mn0;
+            { const uint8_t *s0 = wb0 + 4;
+              if (g < 4) { sc0 = s0[g] & 63; mn0 = s0[g + 4] & 63; }
+              else { sc0 = (uint8_t)((s0[g + 4] & 0xF) | ((s0[g - 4] >> 6) << 4));
+                      mn0 = (uint8_t)((s0[g + 4] >> 4) | ((s0[g] >> 6) << 4)); } }
+            wds0 = wd0 * (float)sc0;
+            wdmn0 = wdm0 * (float)mn0;
+
+            size_t wb1_off = (size_t)(tile_o + tid * 2 + 1) * row_bytes + q5_block * GPU_BLOCK_Q5_K_SIZE;
+            const uint8_t *wb1 = w + wb1_off;
+            float wd1 = gpu_fp16_to_fp32((uint16_t)(wb1[0] | (wb1[1] << 8)));
+            float wdm1 = gpu_fp16_to_fp32((uint16_t)(wb1[2] | (wb1[3] << 8)));
+            uint8_t sc1, mn1;
+            { const uint8_t *s1 = wb1 + 4;
+              if (g < 4) { sc1 = s1[g] & 63; mn1 = s1[g + 4] & 63; }
+              else { sc1 = (uint8_t)((s1[g + 4] & 0xF) | ((s1[g - 4] >> 6) << 4));
+                      mn1 = (uint8_t)((s1[g + 4] >> 4) | ((s1[g] >> 6) << 4)); } }
+            wds1 = wd1 * (float)sc1;
+            wdmn1 = wdm1 * (float)mn1;
+        }
+
+        /* ---- one pass per 16-row tile, sharing b0/b1/scales above ---- */
+        for (int t = 0; t < n_tiles; t++) {
+            int tile_s = tile_s0 + t * 16;
+
+            int a0, a1, a2, a3;
+            {
+                int c0 = tid * 4;
+                int c2 = c0 + 16;
+                int row0 = tile_s + gid;
+                int row1 = tile_s + gid + 8;
+                if (row0 >= S) row0 = S - 1;   /* clamp: reads stay in the S rows */
+                if (row1 >= S) row1 = S - 1;
+                int src0 = row0 * I + kb * 32 + c0;
+                int src1 = row1 * I + kb * 32 + c0;
+                int src2 = row0 * I + kb * 32 + c2;
+                int src3 = row1 * I + kb * 32 + c2;
+                int32_t *p;
+                p = (int32_t *)(const int8_t *)(&xq[src0]); a0 = p[0];
+                p = (int32_t *)(const int8_t *)(&xq[src1]); a1 = p[0];
+                p = (int32_t *)(const int8_t *)(&xq[src2]); a2 = p[0];
+                p = (int32_t *)(const int8_t *)(&xq[src3]); a3 = p[0];
+            }
+
+            int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIP__)
+            asm volatile(
+                "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                : "+r"(d0), "+r"(d1), "+r"(d2), "+r"(d3)
+                : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
+
+            int sq0 = 0, sq1 = 0;
+            {
+                int8_t *av;
+                av = (int8_t *)&a0; sq0 += av[0] + av[1] + av[2] + av[3];
+                av = (int8_t *)&a2; sq0 += av[0] + av[1] + av[2] + av[3];
+                av = (int8_t *)&a1; sq1 += av[0] + av[1] + av[2] + av[3];
+                av = (int8_t *)&a3; sq1 += av[0] + av[1] + av[2] + av[3];
+            }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 300
+            {
+                const unsigned mask = 0xFFFFFFFFu;
+                sq0 += gpuShflDownSync(mask, sq0, 2, 4);
+                sq1 += gpuShflDownSync(mask, sq1, 2, 4);
+                sq0 += gpuShflDownSync(mask, sq0, 1, 4);
+                sq1 += gpuShflDownSync(mask, sq1, 1, 4);
+                sq0 = gpuShflSync(mask, sq0, 0, 4);
+                sq1 = gpuShflSync(mask, sq1, 0, 4);
+            }
+#endif
+
+            const int row_a = tile_s + gid;
+            const int row_b = tile_s + gid + 8;
+            float dx0 = (row_a < S) ? xd[(size_t)row_a * n_blocks + kb] : 0.0f;
+            float dx1 = (row_b < S) ? xd[(size_t)row_b * n_blocks + kb] : 0.0f;
+
+            { float *S4 = mysum + (size_t)t * 32 * 4;
+              S4[0] += wds0 * dx0 * (float)d0 - wdmn0 * dx0 * (float)sq0;
+              S4[2] += wds0 * dx1 * (float)d2 - wdmn0 * dx1 * (float)sq1;
+              S4[1] += wds1 * dx0 * (float)d1 - wdmn1 * dx0 * (float)sq0;
+              S4[3] += wds1 * dx1 * (float)d3 - wdmn1 * dx1 * (float)sq1; }
+        }
+    }
+
+    for (int t = 0; t < n_tiles; t++) {
+        int tile_s = tile_s0 + t * 16;
+        for (int f = 0; f < 4; f++) {
+            int row = tile_s + ((f < 2) ? gid : gid + 8);
+            int col = tile_o + tid * 2 + (f % 2);
+            if (row < S && col < O)
+                y[(size_t)row * ys + (size_t)col] = mysum[(size_t)t * 32 * 4 + f];
+        }
+    }
+}
+
 /* Q4_K x Q8_0 IMMA kernel.
  * Q4_K: 256 values in 144 bytes. block_q4_K layout:
  *   d(2), dmin(2), scales[12], qs[128].
