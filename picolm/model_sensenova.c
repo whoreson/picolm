@@ -196,7 +196,7 @@ static void sensenova_attn_sublayer(model_t *m, run_state_t *s,
 }
 
 /* FFN sublayer on an ALREADY-NORMED input. Output to out. */
-static void sensenova_ffn_sublayer(model_t *m, run_state_t *s,
+static void sensenova_ffn_sublayer(run_state_t *s,
                                    layer_weights_t *lw, int dim, int n_ffn,
                                    const float *xb_normed, float *out) {
     matmul(s->hb, xb_normed, lw->ffn_gate, dim, n_ffn, lw->type_ffn_gate);
@@ -204,6 +204,108 @@ static void sensenova_ffn_sublayer(model_t *m, run_state_t *s,
     silu(s->hb, n_ffn);
     elemwise_mul(s->hb, s->hb, s->hb2, n_ffn);
     matmul(out, s->hb, lw->ffn_down, n_ffn, dim, lw->type_ffn_down);
+}
+
+/* Run one layer (index l) of the SenseNova-Loop stack for one token.
+ *
+ * x_in/out: residual stream, dim floats. For mHC blocks the second stream
+ * lives in s->mhc_str_b and *streams_active carries the enter/exit state
+ * across layers (the caller owns it; kind 1 seeds both streams from x,
+ * kind 2 merges them into x and clears the flag).
+ *
+ * This is the shared body of the decode loop (model_forward_sensenova)
+ * and the per-token prefill fallback, so the two paths cannot drift. */
+void sensenova_layer(model_t *m, run_state_t *s, int l, int pos,
+                     int *streams_active) {
+    model_config_t *c = &m->config;
+    layer_weights_t *lw = &m->weights.layers[l];
+
+    const int dim = c->n_embd;
+    const int n_ffn = c->n_ffn;
+    const int n_heads = c->n_heads;
+    const int n_kv_heads = c->n_kv_heads;
+    const int head_dim = c->head_dim;
+    const int q_dim = n_heads * head_dim;
+    const int q_full_dim = q_dim * 2;      /* fused Q|gate, per-head interleaved */
+    const int kv_dim = n_kv_heads * head_dim;
+    const int seq_len = c->max_seq_len;
+    const int rope_half = (c->rope_dim > 0 ? c->rope_dim : head_dim) / 2;
+
+    float *str_b = s->mhc_str_b;      /* second stream */
+    float *branch = s->xb;            /* router output -> normed sublayer input */
+    float *sub_out = s->xb2;          /* sublayer output (pre-merge) */
+    float gates[6];
+    const uint8_t kind = c->mhc_layer_kinds[l];
+
+        if (kind == 0) {
+        /* ---- Plain block: standard post-norm residual flow ---- */
+        if (c->has_ssm && !lw->is_attn_layer) {
+            float *ssm_residual = s->xb2;
+            s->mhc_sublayer_only = 0;
+            ssm_forward(m, s, s->x, ssm_residual, lw, l, pos, NULL);
+        } else {
+            /* Attention sublayer: y lands in s->xb (see o_proj note in
+             * sensenova_attn_sublayer), residual add into s->x. */
+            rmsnorm(s->xb, s->x, s->attn_norm_w[l], dim, c->rms_norm_eps);
+            sensenova_attn_sublayer(m, s, lw, l, pos, dim, n_heads,
+                                    n_kv_heads, head_dim, q_dim, q_full_dim,
+                                    kv_dim, seq_len, rope_half, s->xb, s->xb2);
+            vec_add(s->x, s->xb, dim);
+            /* FFN sublayer: norm into s->xb (free again -- the o_proj wrote
+             * y there and vec_add consumed it), y into s->xb2, residual add. */
+            rmsnorm(s->xb, s->x, s->post_attn_norm_w[l], dim, c->rms_norm_eps);
+            sensenova_ffn_sublayer(s, lw, dim, n_ffn, s->xb, s->xb2);
+            vec_add(s->x, s->xb2, dim);
+        }
+#ifdef PICOLM_VIZ
+        viz_push_row(l, pos, s->x, dim);
+#endif
+        return;
+    }
+
+    /* ---- mHC block (1 = enter, 4 = interior, 2 = exit) ---- */
+    if (kind == 1 || !*streams_active) {
+        memcpy(str_b, s->x, dim * sizeof(float));
+        *streams_active = 1;
+    }
+
+    /* -- sublayer 1: attention (GDN or full), routed -- */
+    float *y;
+    mhc_route(branch, gates, s->x, str_b,
+              (const float *)lw->mhc_attn_w, (const float *)lw->mhc_attn_b, dim);
+    if (c->has_ssm && !lw->is_attn_layer) {
+        /* GDN: ssm_forward norms x internally (attn_norm_w is the norm
+         * weight the reference uses for the attn sublayer too), writes
+         * y to the residual arg and stops (mhc_sublayer_only). */
+        s->mhc_sublayer_only = 1;
+        ssm_forward(m, s, branch, sub_out, lw, l, pos, NULL);
+        s->mhc_sublayer_only = 0;
+        y = sub_out;
+    } else {
+        rmsnorm(branch, branch, s->attn_norm_w[l], dim, c->rms_norm_eps);
+        sensenova_attn_sublayer(m, s, lw, l, pos, dim, n_heads,
+                                n_kv_heads, head_dim, q_dim, q_full_dim,
+                                kv_dim, seq_len, rope_half, branch, sub_out);
+        /* the attention sublayer returns y in s->xb (o_proj target) */
+        y = s->xb;
+    }
+    /* merge: a'=x (in place), b'=str_b (in place), y from the sublayer */
+    mhc_merge(s->x, str_b, s->x, str_b, y, gates, dim);
+
+    /* -- sublayer 2: FFN, routed -- */
+    mhc_route(branch, gates, s->x, str_b,
+              (const float *)lw->mhc_ffn_w, (const float *)lw->mhc_ffn_b, dim);
+    rmsnorm(branch, branch, s->post_attn_norm_w[l], dim, c->rms_norm_eps);
+    sensenova_ffn_sublayer(s, lw, dim, n_ffn, branch, sub_out);
+    mhc_merge(s->x, str_b, s->x, str_b, sub_out, gates, dim);
+
+    if (kind == 2) {
+        for (int i = 0; i < dim; i++) s->x[i] = 0.5f * (s->x[i] + str_b[i]);
+        *streams_active = 0;
+    }
+#ifdef PICOLM_VIZ
+    viz_push_row(l, pos, s->x, dim);
+#endif
 }
 
 float *model_forward_sensenova(model_t *m, int token, int pos) {
@@ -218,15 +320,6 @@ float *model_forward_sensenova(model_t *m, int token, int pos) {
     }
 
     const int dim = c->n_embd;
-    const int n_ffn = c->n_ffn;
-    const int n_heads = c->n_heads;
-    const int n_kv_heads = c->n_kv_heads;
-    const int head_dim = c->head_dim;
-    const int q_dim = n_heads * head_dim;
-    const int q_full_dim = q_dim * 2;      /* fused Q|gate, per-head interleaved */
-    const int kv_dim = n_kv_heads * head_dim;
-    const int seq_len = c->max_seq_len;
-    const int rope_half = (c->rope_dim > 0 ? c->rope_dim : head_dim) / 2;
 
     /* 1. Embedding */
     {
@@ -235,92 +328,11 @@ float *model_forward_sensenova(model_t *m, int token, int pos) {
         dequantize_row(embd_row, s->x, dim, w->type_token_embd);
     }
 
-    float *str_b = s->mhc_str_b;      /* second stream */
-    float *branch = s->xb;            /* router output -> normed sublayer input */
-    float *sub_out = s->xb2;          /* sublayer output (pre-merge) */
-    float gates[6];
+    /* 2. Layer loop (stream state carried across layers) */
     int streams_active = 0;
-
-    /* 2. Layer loop */
     for (int l = 0; l < c->n_layers; l++) {
-        layer_weights_t *lw = &w->layers[l];
         BENCH_LAYER_START();
-        const uint8_t kind = c->mhc_layer_kinds[l];
-
-        if (kind == 0) {
-            /* ---- Plain block: standard post-norm residual flow ---- */
-            if (c->has_ssm && !lw->is_attn_layer) {
-                float *ssm_residual = s->xb2;
-                s->mhc_sublayer_only = 0;
-                ssm_forward(m, s, s->x, ssm_residual, lw, l, pos, NULL);
-            } else {
-                /* Attention sublayer: y lands in s->xb (see o_proj note in
-                 * sensenova_attn_sublayer), residual add into s->x. */
-                rmsnorm(s->xb, s->x, s->attn_norm_w[l], dim, c->rms_norm_eps);
-                sensenova_attn_sublayer(m, s, lw, l, pos, dim, n_heads,
-                                        n_kv_heads, head_dim, q_dim, q_full_dim,
-                                        kv_dim, seq_len, rope_half, s->xb, s->xb2);
-                vec_add(s->x, s->xb, dim);
-                /* FFN sublayer: norm into s->xb2 (free again), y into s->xb2,
-                 * residual add. sensenova_ffn_sublayer uses s->hb/s->hb2 as
-                 * gate/up scratch and writes its result to its out arg, so
-                 * out may not be s->hb2 -- hence xb2 holds the normed input
-                 * and the FFN result overwrites... it can't. Use the mHC
-                 * scratch instead: branch (= s->xb) is free at this point. */
-                rmsnorm(s->xb, s->x, s->post_attn_norm_w[l], dim, c->rms_norm_eps);
-                sensenova_ffn_sublayer(m, s, lw, dim, n_ffn, s->xb, s->xb2);
-                vec_add(s->x, s->xb2, dim);
-            }
-#ifdef PICOLM_VIZ
-            viz_push_row(l, pos, s->x, dim);
-#endif
-            BENCH_LAYER_END(l, 0);
-            continue;
-        }
-
-        /* ---- mHC block (1 = enter, 4 = interior, 2 = exit) ---- */
-        if (kind == 1 || !streams_active) {
-            memcpy(str_b, s->x, dim * sizeof(float));
-            streams_active = 1;
-        }
-
-        /* -- sublayer 1: attention (GDN or full), routed -- */
-        float *y;
-        mhc_route(branch, gates, s->x, str_b,
-                  (const float *)lw->mhc_attn_w, (const float *)lw->mhc_attn_b, dim);
-        if (c->has_ssm && !lw->is_attn_layer) {
-            /* GDN: ssm_forward norms x internally (attn_norm_w is the norm
-             * weight the reference uses for the attn sublayer too), writes
-             * y to the residual arg and stops (mhc_sublayer_only). */
-            s->mhc_sublayer_only = 1;
-            ssm_forward(m, s, branch, sub_out, lw, l, pos, NULL);
-            s->mhc_sublayer_only = 0;
-            y = sub_out;
-        } else {
-            rmsnorm(branch, branch, s->attn_norm_w[l], dim, c->rms_norm_eps);
-            sensenova_attn_sublayer(m, s, lw, l, pos, dim, n_heads,
-                                    n_kv_heads, head_dim, q_dim, q_full_dim,
-                                    kv_dim, seq_len, rope_half, branch, sub_out);
-            /* the attention sublayer returns y in s->xb (o_proj target) */
-            y = s->xb;
-        }
-        /* merge: a'=x (in place), b'=str_b (in place), y from the sublayer */
-        mhc_merge(s->x, str_b, s->x, str_b, y, gates, dim);
-
-        /* -- sublayer 2: FFN, routed -- */
-        mhc_route(branch, gates, s->x, str_b,
-                  (const float *)lw->mhc_ffn_w, (const float *)lw->mhc_ffn_b, dim);
-        rmsnorm(branch, branch, s->post_attn_norm_w[l], dim, c->rms_norm_eps);
-        sensenova_ffn_sublayer(m, s, lw, dim, n_ffn, branch, sub_out);
-        mhc_merge(s->x, str_b, s->x, str_b, sub_out, gates, dim);
-
-        if (kind == 2) {
-            for (int i = 0; i < dim; i++) s->x[i] = 0.5f * (s->x[i] + str_b[i]);
-            streams_active = 0;
-        }
-#ifdef PICOLM_VIZ
-        viz_push_row(l, pos, s->x, dim);
-#endif
+        sensenova_layer(m, s, l, pos, &streams_active);
         BENCH_LAYER_END(l, 0);
     }
 
