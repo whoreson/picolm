@@ -64,7 +64,26 @@
 #define gpuMalloc hipMalloc
 #define gpuFree hipFree
 #define gpuMemcpy hipMemcpy
-#define gpuMemcpy2D hipMemcpy2D
+/* gpuMemcpy2D: CUDA and HIP do NOT agree on this one.
+ *
+ *   cudaMemcpy2D(dst, dpitch, src, spitch, width, height, kind)
+ *   hipMemcpy2D (dst, dpitch, src, spitch, width, height, kind)
+ *
+ * The argument ORDER is the same, but hipMemcpy2D's `kind` is hipMemcpyKind
+ * and its width/height are size_t on every ROCm the tree builds against --
+ * while the CUDA one takes size_t for the pitches and width/height. Passing
+ * our size_t pitches straight through therefore compiles on both today, but
+ * the two APIs have diverged before (hipMemcpy2DAsync swapped its kind and
+ * stream arguments between ROCm 4 and 5), so route it through a wrapper that
+ * names every parameter explicitly. If a ROCm version changes order again the
+ * fix is one line here instead of a silent transpose at every call site. */
+static inline hipError_t picolm_hipMemcpy2D(void *dst, size_t dpitch,
+                                            const void *src, size_t spitch,
+                                            size_t width, size_t height,
+                                            hipMemcpyKind kind) {
+    return hipMemcpy2D(dst, dpitch, src, spitch, width, height, kind);
+}
+#define gpuMemcpy2D picolm_hipMemcpy2D
 #define gpuMemcpyKind hipMemcpyKind
 #define gpuMemcpyHostToDevice hipMemcpyHostToDevice
 #define gpuMemcpyDeviceToHost hipMemcpyDeviceToHost
@@ -157,7 +176,13 @@ typedef hipEvent_t gpuEvent_t;
 #define gpuMalloc cudaMalloc
 #define gpuFree cudaFree
 #define gpuMemcpy cudaMemcpy
-#define gpuMemcpy2D cudaMemcpy2D
+static inline cudaError_t picolm_cudaMemcpy2D(void *dst, size_t dpitch,
+                                              const void *src, size_t spitch,
+                                              size_t width, size_t height,
+                                              cudaMemcpyKind kind) {
+    return cudaMemcpy2D(dst, dpitch, src, spitch, width, height, kind);
+}
+#define gpuMemcpy2D picolm_cudaMemcpy2D
 #define gpuMemcpyKind cudaMemcpyKind
 #define gpuMemcpyHostToDevice cudaMemcpyHostToDevice
 #define gpuMemcpyDeviceToHost cudaMemcpyDeviceToHost
