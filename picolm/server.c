@@ -1995,15 +1995,29 @@ static void handle_slots_post(SOCKET sock, const char *body) {
             int gpu_dev = model->gpu.device;
             if (model->gpu.kv_active && gpu_dev >= 0) {
                 const model_config_t *c = &model->config;
-                /* Upload KV cache from CPU to GPU (F16 only for now) */
-                if (model->state.kv_type_k == KV_CACHE_F16 &&
-                    model->state.kv_type_v == KV_CACHE_F16) {
+                /* Upload the restored KV cache to the GPU.
+                 *
+                 * This was gated on `kv_type_k == F16 && kv_type_v == F16`, so
+                 * for a QUANTISED cache (-ctk q4_0 -ctv q4_0, i.e. the only
+                 * configuration in which a long context fits in 24 GB) the
+                 * upload was skipped entirely while the SSM state below was
+                 * still synced. The model then ran with correct recurrent state
+                 * against a GPU KV cache that had never been filled -- which is
+                 * exactly "the slot loads fine, then the output is garbage".
+                 *
+                 * picolm_gpu_kv_upload_layer() has derived the row size from
+                 * the cache's own layout since the --cache fix, and the host
+                 * cache kvcache_load() filled is already in that same format,
+                 * so no type gate is needed: q4_0/q8_0 upload byte-for-byte.
+                 * The CLI path (picolm.c) was fixed the same way and has been
+                 * correct since; this is the copy that was missed. */
+                {
                     for (int l = 0; l < c->n_layers; l++) {
                         if (!model->weights.layers[l].is_attn_layer) continue;
                         int ao = model->state.kv_layer_ordinal[l];
-                        const uint16_t *k_rows = (const uint16_t *)(model->state.key_cache +
+                        const void *k_rows = (const void *)(model->state.key_cache +
                             (size_t)ao * c->max_seq_len * model->state.kv_row_size_k);
-                        const uint16_t *v_rows = (const uint16_t *)(model->state.val_cache +
+                        const void *v_rows = (const void *)(model->state.val_cache +
                             (size_t)ao * c->max_seq_len * model->state.kv_row_size_v);
                         picolm_gpu_kv_upload_layer(1, ao, n_restored,
                             k_rows, c->n_kv_heads, c->head_dim, c->max_seq_len, gpu_dev);
