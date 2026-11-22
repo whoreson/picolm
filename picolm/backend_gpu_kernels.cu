@@ -7645,6 +7645,7 @@ picolm_gpu_attention_prefill_fa3_kernel(
          * That is 8 floats per row per lane at hd 256, and it keeps the V
          * multiply independent of the softmax scan. */
         if (warp_tile_live)
+        #pragma unroll
         for (int r = 0; r < FA3_ROWS; r++) {
             int gq = q0 + r;
             if (gq >= n_tokens) continue;
