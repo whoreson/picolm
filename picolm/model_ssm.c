@@ -5540,6 +5540,44 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
                                                   this_attn_ordinal - 1, pos,
                                                   n_heads, n_kv_heads, head_dim,
                                                   seq_len, gpu_dev, c->n_swa_layer[l])) {
+                /* Mid-pipeline escape to the CPU path.
+                 *
+                 * This used to be a bare `return model_forward(m, token, pos)`,
+                 * which re-entered the CPU forward with the device pipeline
+                 * HALF APPLIED: this layer's K/V had already been written to
+                 * the device KV cache, this_attn_ordinal had been advanced, and
+                 * m->gpu.kv_active was still 1 -- so the CPU pass still
+                 * dispatched GPU matmuls, now against a pipeline whose earlier
+                 * layers had run on the device. Result: illegal memory access
+                 * in the very next q8 quantize (a sticky error 700, after
+                 * which the whole context is poisoned and every later call
+                 * reports "reserve OOM: gpu_free=0.0 MB").
+                 *
+                 * The CPU path also cannot see the device KV cache: the host
+                 * mirrors s->key_cache/s->val_cache are deliberately NOT
+                 * updated per token (see the note above the KV store), so
+                 * attention from the host would read stale rows even if the
+                 * buffers were valid.
+                 *
+                 * The comment on that KV store already prescribes the fix:
+                 * a one-time bulk device->host flush, then hand over. Do
+                 * exactly that, and clear kv_active so the CPU pass cannot
+                 * half-dispatch to the GPU again. */
+                fprintf(stderr, "WARN: GPU decode attention declined at layer %d pos %d -- "
+                        "flushing the device KV cache and continuing on the CPU\n", l, pos);
+                picolm_gpu_sync(gpu_dev);
+                picolm_gpu_kv_flush_to_cpu(s->key_cache, s->val_cache,
+                                           this_attn_ordinal, seq_len, pos + 1,
+                                           s->kv_row_size_k, s->kv_row_size_v, gpu_dev);
+                gw->kv_active = 0;
+                m->gpu.kv_active = 0;
+                /* Also drop the global GPU-tensor handle. picolm_gpu_matmul_dev()
+                 * has no kv_active gate of its own -- it launches whenever a
+                 * tensor handle is installed -- so without this the CPU
+                 * model_forward() below still routes every matmul to the GPU,
+                 * against pipeline buffers that no longer belong to it. That is
+                 * the illegal access this whole branch has to avoid. */
+                tensor_set_gpu_tensor(NULL, 0);
                 return model_forward(m, token, pos);
             }
 
