@@ -535,6 +535,10 @@ test-q8-gemm-gpu: tests/test_q8_gemm_gpu.cu backend_gpu_kernels-cuda.o
 test-attn-hmma-gpu: tests/test_attn_hmma_gpu.cu backend_gpu_kernels-cuda.o
 	$(NVCC) $(CUDAFLAGS) $(CUDA_GENCODE) -DPICOLM_GPU=1 -o test_attn_hmma_gpu $^ -I.
 
+# GPU check: FA3 (register-resident O, head_dim 256) agrees with the scalar warpgrp kernel.
+test-attn-fa3-gpu: tests/test_attn_fa3_gpu.cu backend_gpu_kernels-cuda.o
+	$(NVCC) $(CUDAFLAGS) $(CUDA_GENCODE) -DPICOLM_GPU=1 -o test_attn_fa3_gpu $^ -I.
+
 # GPU check: warp-per-key decode attention agrees with the split kernel.
 test-attn-decode-gpu: tests/test_attn_decode_gpu.cu backend_gpu_kernels-cuda.o
 	$(NVCC) $(CUDAFLAGS) $(CUDA_GENCODE) -DPICOLM_GPU=1 -o test_attn_decode_gpu $^ -I.

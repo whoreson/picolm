@@ -48,6 +48,7 @@ if "%~1"=="" goto args_done
 set "ARG=%~1"
 if /i "%ARG:~0,7%"=="--simd:" goto arg_simd
 if /i "%ARG%"=="--gpu" goto arg_gpu
+if /i "%ARG%"=="--fa3test" goto arg_fa3test
 if /i "%ARG%"=="--selftest" goto arg_selftest
 if /i "%ARG%"=="--print-tier" goto arg_print_tier
 if /i "%ARG%"=="--viz" goto arg_viz
@@ -375,9 +376,32 @@ rem (that is the slow part of this target). Skip straight to the checks.
 if defined MSVC_SELFTEST goto cuda_done
 
 set "MSVC_CUOBJS="
-for %%f in (backend_gpu_kernels.cu backend_gpu_host_core.cu backend_gpu_host_ssm.cu backend_gpu_host_misc.cu) do call :cuda_one "%%f"
+for %%f in (backend_gpu_kernels.cu) do call :cuda_one "%%f"
+if errorlevel 1 goto fail
+if defined MSVC_FA3TEST (
+    echo [nvcc] tests\test_attn_fa3_gpu.cu
+    "!NVCC!" !NVCC_FLAGS! "tfa3_win.obj" "tests\test_attn_fa3_gpu.cu"
+    if errorlevel 1 goto fail
+    echo [link] test_fa3.exe
+    "!NVCC!" -gencode arch=compute_89,code=sm_89 -o test_fa3.exe !MSVC_CUOBJS! tfa3_win.obj "!CUDA_ROOT!\lib\x64\cudart.lib"
+    if errorlevel 1 goto fail
+    del /q !MSVC_CUOBJS! tfa3_win.obj 2>nul
+    echo === OK: test_fa3.exe built ===
+    exit /b 0
+)
+for %%f in (backend_gpu_host_core.cu backend_gpu_host_ssm.cu backend_gpu_host_misc.cu) do call :cuda_one "%%f"
 if errorlevel 1 goto fail
 goto cuda_done
+
+:arg_fa3test
+rem Build and run the FA3 attention test instead of the model. It needs the
+rem same nvcc invocation the CUDA objects use (:cuda_one below), which is the
+rem only one known to work with this MSVC + CUDA combination -- calling nvcc
+rem by hand from a fresh vcvars shell fails with rc=2 and no diagnostics.
+set "MSVC_GPU=1"
+set "MSVC_FA3TEST=1"
+shift
+goto parse_args
 
 :cuda_one
 echo [nvcc] %~1
