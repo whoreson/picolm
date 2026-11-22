@@ -75,6 +75,22 @@ static int picolm_gpu_no_gemv(void) {
     if (cached < 0) cached = picolm_gpu_env_flag("PICOLM_NO_GEMV");
     return cached;
 }
+
+/* K-quant (and IQ6_K) decode GEMV for this type, 0 if none. These kernels
+ * are plain CUDA (DP4A), no IMMA needed. */
+static int kquant_which(gguf_type_t qt) {
+    switch ((int)qt) {
+    case GGUF_TYPE_Q2_K: return 2;
+    case GGUF_TYPE_Q3_K: return 3;
+    case GGUF_TYPE_Q4_K: return 4;
+    case GGUF_TYPE_Q5_K: return 5;
+    case GGUF_TYPE_Q6_K: return 6;
+    case GGUF_TYPE_IQ6_K: return 141;
+    default: return 0;
+    }
+}
+static int kquant_gemv_dev(gpu_device_ctx_t *ctx, picolm_gpu_tensor_t *t, float *y_dev,
+                           const float *x_dev, int I, int O, int ys, int x_stride, int which);
 static int picolm_gpu_no_sm_imma(void) {
     static int cached = -1;
     if (cached < 0) cached = picolm_gpu_env_flag("PICOLM_NO_SM_IMMA");
@@ -1274,6 +1290,18 @@ static int matmul_host_impl(picolm_gpu_tensor_t *t, float *y, const float *x, in
         return 1;
     }
 
+    /* K-quant decode (S == 1) on the GEMVs. They used to be reachable only
+     * through the has_imma branches, so a GPU without IMMA ran K-quant decode
+     * on the per-element dequant matmul. IMMA GPUs keep their IMMA path here. */
+    if (!ctx->has_imma && S == 1 && O >= 8 && I % 256 == 0 && kquant_which(t->qtype) && !picolm_gpu_no_gemv()) {
+        if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "input upload")) return 0;
+        if (kquant_gemv_dev(ctx, t, ctx->y, ctx->x, I, O, O, 0, kquant_which(t->qtype))) {
+            if (!gpu_ok(gpuStreamSynchronize(ctx->stream), "kquant gemv sync") ||
+                !gpu_ok(gpuMemcpy(y, ctx->y, yb, gpuMemcpyDeviceToHost), "output download")) return 0;
+            return 1;
+        }
+    }
+
     /* Q6_K x Q8_0 IMMA path: quantize activations to Q8_0, native Q6_K weights. */
     if (t->qtype == GGUF_TYPE_Q6_K && ctx->has_imma && !picolm_gpu_no_imma() && S >= 1 && O >= 8 && I % 256 == 0) {
         int n_blocks = I / 32;
@@ -1864,6 +1892,12 @@ matmul_dev_impl(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
             return 1;
     }
 
+    /* K-quant decode on the GEMVs on any GPU; the has_imma branches below
+     * used to be the only way in (see the host path). */
+    if (S == 1 && O >= 8 && I % 256 == 0 && kquant_which(t->qtype) && !picolm_gpu_no_gemv() &&
+        kquant_gemv_dev(ctx, t, y_dev, x_dev, I, O, ys, x_stride, kquant_which(t->qtype)))
+        return 1;
+
     if (t->qtype == GGUF_TYPE_Q2_K && ctx->has_imma && !picolm_gpu_no_imma() && S >= 1 && O >= 8 && I % 256 == 0) {
         if (S == 1 && !picolm_gpu_no_gemv() && kquant_gemv_dev(ctx, t, y_dev, x_dev, I, O, ys, x_stride, 2))
             return 1;
@@ -2329,8 +2363,8 @@ int picolm_gpu_matmul_logits(picolm_gpu_tensor_t *t, float *logits_dev,
      * straight back to picolm_quant_matmul -- whose switch has no IQ6_K case
      * and therefore ZEROES the logits, poisoning every later token. Reusing
      * kquant_gemv_dev (Q8_K quantise + IQ6_K GEMV) avoids that entirely. */
-    if (t->qtype == GGUF_TYPE_IQ6_K && (I % 256) == 0 && O >= 8) {
-        if (kquant_gemv_dev(ctx, t, logits_dev, x_dev, I, O, O, 0, 141)) return 1;
+    if (kquant_which(t->qtype) && (I % 256) == 0 && O >= 8) {   /* and the other K-quants */
+        if (kquant_gemv_dev(ctx, t, logits_dev, x_dev, I, O, O, 0, kquant_which(t->qtype))) return 1;
         return 0;
     }
     return 0; /* unsupported type */

@@ -896,12 +896,16 @@ picolm_q5_K_gemv(float *y,
         int acc = 0;
         for (int l = 0; l < 32; l += 8) {
             /* 8 weight values: bytes l..l+7 of this group's window. */
-            const uint8_t p0 = qs[group * 32 + l + 0], p1 = qs[group * 32 + l + 1];
-            const uint8_t p2 = qs[group * 32 + l + 2], p3 = qs[group * 32 + l + 3];
-            const uint8_t p4 = qs[group * 32 + l + 4], p5 = qs[group * 32 + l + 5];
-            const uint8_t p6 = qs[group * 32 + l + 6], p7 = qs[group * 32 + l + 7];
-            const uint8_t h0 = qh[l+0], h1 = qh[l+1], h2 = qh[l+2], h3 = qh[l+3];
-            const uint8_t h4 = qh[l+4], h5 = qh[l+5], h6 = qh[l+6], h7 = qh[l+7];
+            /* Q5_K blocks are 176 bytes, so qs/qh are 4-byte aligned: two
+             * 32-bit loads each instead of 16 byte loads (same bytes). */
+            const uint32_t P0 = *(const uint32_t *)(qs + group * 32 + l);
+            const uint32_t P1 = *(const uint32_t *)(qs + group * 32 + l + 4);
+            const uint32_t H0 = *(const uint32_t *)(qh + l);
+            const uint32_t H1 = *(const uint32_t *)(qh + l + 4);
+            const uint8_t p0 = (uint8_t)P0, p1 = (uint8_t)(P0 >> 8), p2 = (uint8_t)(P0 >> 16), p3 = (uint8_t)(P0 >> 24);
+            const uint8_t p4 = (uint8_t)P1, p5 = (uint8_t)(P1 >> 8), p6 = (uint8_t)(P1 >> 16), p7 = (uint8_t)(P1 >> 24);
+            const uint8_t h0 = (uint8_t)H0, h1 = (uint8_t)(H0 >> 8), h2 = (uint8_t)(H0 >> 16), h3 = (uint8_t)(H0 >> 24);
+            const uint8_t h4 = (uint8_t)H1, h5 = (uint8_t)(H1 >> 8), h6 = (uint8_t)(H1 >> 16), h7 = (uint8_t)(H1 >> 24);
 
             /* Two 4-value groups, packed into ints for DP4A/SDOT. */
             int8_t wA[4], wB[4];
@@ -1029,15 +1033,22 @@ picolm_q6_K_gemv(float *y,
 
             /* l=0..15 -> acc0, l=16..31 -> acc1, both indexing qlp[l] and
              * qh_c[l] with the FULL l (see the note above). */
-            for (int l = 0; l < 16; l++) {
-                const int q = ((qlp[l] >> ql_sh) & 0xF)
-                            | (((qh_c[l] >> qh_sh) & 3) << 4);
-                acc0 += q * q8p[l];
-            }
-            for (int l = 16; l < 32; l++) {
-                const int q = ((qlp[l] >> ql_sh) & 0xF)
-                            | (((qh_c[l] >> qh_sh) & 3) << 4);
-                acc1 += q * q8p[l];
+            /* Four values per step: 4 ql + 4 qh bytes become four 6-bit q in
+             * one int, then one DP4A against 4 q8 bytes -- the same integer
+             * sums as the byte loop (bit-identical), a quarter of the loads.
+             * Q6_K blocks are 210 bytes, so ql/qh are only 2-byte aligned:
+             * read them as two uint16; q8 is 256-aligned. On a V100 the byte
+             * loop ran at ~220 GB/s. */
+            const uint16_t *ql16 = (const uint16_t *)qlp;
+            const uint16_t *qh16 = (const uint16_t *)qh_c;
+            const int *q8i = (const int *)q8p;
+#pragma unroll
+            for (int l = 0; l < 32; l += 4) {
+                uint32_t lo = (uint32_t)ql16[l / 2] | ((uint32_t)ql16[l / 2 + 1] << 16);
+                uint32_t hi = (uint32_t)qh16[l / 2] | ((uint32_t)qh16[l / 2 + 1] << 16);
+                int q4 = (int)(((lo >> ql_sh) & 0x0F0F0F0Fu) | (((hi >> qh_sh) & 0x03030303u) << 4));
+                if (l < 16) acc0 = gpu_dot4_i8_packed(q4, q8i[l / 4], acc0);
+                else        acc1 = gpu_dot4_i8_packed(q4, q8i[l / 4], acc1);
             }
         }
 
@@ -1107,21 +1118,15 @@ picolm_q4_K_gemv(float *y,
          * what cost Q5_K 30% before that fix. */
         int acc = 0;
         for (int l = 0; l < 32; l += 8) {
-            int8_t wA[4], wB[4];
-            wA[0] = (int8_t)(half ? (qsg[l+0] >> 4) : (qsg[l+0] & 0xF));
-            wA[1] = (int8_t)(half ? (qsg[l+1] >> 4) : (qsg[l+1] & 0xF));
-            wA[2] = (int8_t)(half ? (qsg[l+2] >> 4) : (qsg[l+2] & 0xF));
-            wA[3] = (int8_t)(half ? (qsg[l+3] >> 4) : (qsg[l+3] & 0xF));
-            wB[0] = (int8_t)(half ? (qsg[l+4] >> 4) : (qsg[l+4] & 0xF));
-            wB[1] = (int8_t)(half ? (qsg[l+5] >> 4) : (qsg[l+5] & 0xF));
-            wB[2] = (int8_t)(half ? (qsg[l+6] >> 4) : (qsg[l+6] & 0xF));
-            wB[3] = (int8_t)(half ? (qsg[l+7] >> 4) : (qsg[l+7] & 0xF));
+            /* Q4_K blocks are 144 bytes, so qs is 4-byte aligned: one 32-bit
+             * load + nibble mask per 4 values instead of 4 byte loads. */
+            const uint32_t QA = *(const uint32_t *)(qsg + l), QB = *(const uint32_t *)(qsg + l + 4);
 
             const int8_t *qa = q8 + (size_t)sub * 32 + l;
             const int aA = gemv_get_int_b2(qa, 0);
             const int aB = gemv_get_int_b2(qa, 1);
-            int wAi, wBi;
-            memcpy(&wAi, wA, 4); memcpy(&wBi, wB, 4);
+            const int wAi = (int)((half ? QA >> 4 : QA) & 0x0F0F0F0Fu);
+            const int wBi = (int)((half ? QB >> 4 : QB) & 0x0F0F0F0Fu);
             acc = gpu_dot4_i8_packed(wAi, aA, acc);
             acc = gpu_dot4_i8_packed(wBi, aB, acc);
         }
