@@ -1059,8 +1059,12 @@ ensure_attn_fa2_shared_mem(size_t bytes) {
 static int picolm_gpu_attn_hmma(const gpu_device_ctx_t *ctx, int n_tokens, int head_dim, int kv_type) {
     static int off = -1;
     if (off < 0) off = getenv("PICOLM_NO_ATTN_HMMA") || getenv("PICOLM_FORCE_SCALAR_ATTN");
-    /* kv_type 0 == F16; the HMMA prefill kernel has no quantised-KV read path. */
-    return !off && ctx->has_hmma && n_tokens >= 64 && head_dim == 128 && kv_type == 0;
+    /* kv_type 0 == F16; the HMMA prefill kernel has no quantised-KV read path.
+     * Any n_tokens > 1: it was >= 64, which sent every chat turn (a few dozen
+     * new tokens on a long cached history) to the scalar warpgrp kernel --
+     * 8.8 ms per layer for 27 tokens at position 2048 on Cydonia-24B, against
+     * 0.38 for this one (make test-attn-hmma-gpu has those shapes). */
+    return !off && ctx->has_hmma && n_tokens >= 2 && head_dim == 128 && kv_type == 0;
 }
 
 static size_t
