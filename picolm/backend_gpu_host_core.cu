@@ -1629,21 +1629,10 @@ kquant_gemv_dev(gpu_device_ctx_t *ctx, picolm_gpu_tensor_t *t, float *y_dev,
         picolm_q3_K_gemv<<<grid, 32 * GEMV_WARPS, 0, ctx->stream>>>(
             y_dev, ctx->q8_xq, ctx->q8_xd, ctx->q8_k_bsums, t->weights,
             I, O, (int)t->row_bytes, ys);
-    } else if (which == 4) {
-        gpu_dispatch_print("matmul_q4_gemv_dev");
-        picolm_q4_K_gemv<<<grid, 32 * GEMV_WARPS, 0, ctx->stream>>>(
-            y_dev, ctx->q8_xq, ctx->q8_xd, ctx->q8_k_bsums, t->weights,
-            I, O, (int)t->row_bytes, ys);
-    } else if (which == 5) {
-        gpu_dispatch_print("matmul_q5_gemv_dev");
-        picolm_q5_K_gemv<<<grid, 32 * GEMV_WARPS, 0, ctx->stream>>>(
-            y_dev, ctx->q8_xq, ctx->q8_xd, ctx->q8_k_bsums, t->weights,
-            I, O, (int)t->row_bytes, ys);
     } else {
-        gpu_dispatch_print("matmul_q6_gemv_dev");
-        picolm_q6_K_gemv<<<grid, 32 * GEMV_WARPS, 0, ctx->stream>>>(
-            y_dev, ctx->q8_xq, ctx->q8_xd, ctx->q8_k_bsums, t->weights,
-            I, O, (int)t->row_bytes, ys);
+        gpu_dispatch_print(which == 4 ? "matmul_q4_gemv_dev" : which == 5 ? "matmul_q5_gemv_dev" : "matmul_q6_gemv_dev");
+        picolm_kquant_gemv_w_launch(which, ctx->stream, y_dev, ctx->q8_xq, ctx->q8_xd,
+                                    t->weights, I, O, (int)t->row_bytes);
     }
     picolm_gpu_prof_end(_ps);
     return gpu_ok(gpuGetLastError(), "kquant gemv (dev)");
