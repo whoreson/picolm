@@ -794,354 +794,203 @@ picolm_q8_0_gemv(float *y,
  * vectorised restatements of the same arithmetic. Keeping the structure
  * identical means a future SIMD version can be diffed against these.
  *
- * Work split: one 256-value super-block is covered by
+ * Work split (Q2_K, Q3_K, IQ6_K): one 256-value super-block is covered by
  * GEMVK_THREADS_PER_SB (8) threads, each taking 32 values, so a warp covers
- * 4 super-blocks per step and consecutive lanes read consecutive bytes.
+ * 4 super-blocks per step. Q4_K/Q5_K/Q6_K use the warp-per-row kernels below.
  */
 #define GEMVK_THREADS_PER_SB  8
 #define GEMVK_BLOCKS_PER_ITER (GEMV_WARPS * 32 / GEMVK_THREADS_PER_SB)  /* 16 */
 
-/* Unpack the 6-bit scale/min pairs of a Q5_K super-block into 8 scales
- * followed by 8 mins, exactly like the utmp shuffling in quant.c's
- * vec_dot_q5_K_q8_K. */
-/* Materialise only the ONE (scale, min) pair this thread needs. The previous
- * version built all 16 bytes on every thread and then used two of them, so
- * with 8 threads per super-block the shuffle ran 8x redundantly. On Q3_K,
- * where 16 threads each used 1 of 16, removing that redundancy took the
- * kernel from 77 to ~220 tok/s -- it was the dominant cost, not the dot
- * product. out[0] = scale[sub], out[1] = min[sub]. */
-__device__ static inline void gemv_q5k_scale_min(const uint8_t *packed, int sub,
-                                                  uint8_t *out /* 2 */) {
-    uint32_t utmp[4];
-    const uint32_t kmask1 = 0x3f3f3f3f;
-    const uint32_t kmask2 = 0x0f0f0f0f;
-    const uint32_t kmask3 = 0x03030303;
-    memcpy(utmp, packed, 12);
-    utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
-    { const uint32_t uaux = utmp[1] & kmask1;
-      utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
-      utmp[2] = uaux; }
-    utmp[0] &= kmask1;
-    /* bytes 0..7 = 8 scales, bytes 8..15 = 8 mins */
-    const uint8_t *sc = (const uint8_t *)(const void *)&utmp[0];
-    out[0] = sc[sub];
-    out[1] = sc[8 + sub];
+/* ---- K-quant GEMV, one warp per output row (decode) ----
+ *
+ * The kernels above give a row to a whole 128-thread block, with each thread
+ * walking 32 values of a super-block: neighbouring lanes read 32-byte apart
+ * windows, a row of 5120 (20 super-blocks) leaves a quarter of the block idle
+ * on its second pass, and every row ends in a block-wide reduction. On a V100
+ * they topped out near 470 GB/s (Q6_K) and 255 GB/s (Q4_K).
+ *
+ * Here a warp owns a row and takes one super-block at a time, each lane four
+ * consecutive weight bytes, so a warp's loads are contiguous. A lane's dot
+ * products are exact integers (DP4A); the super-block's integer sum times
+ * d * xd is accumulated in f32 and reduced with shuffles. A 128-thread block
+ * holds GEMVW_ROWS warps; wpr of them share a row (split over super-blocks)
+ * when the matrix has few rows or long ones -- see picolm_kquant_gemv_w_launch.
+ * V100, 5120 x 32768: Q6_K 475 -> 800 GB/s, Q5_K 283 -> 780, Q4_K 255 -> 770. */
+#define GEMVW_ROWS 4
+
+__device__ static inline int gemvw_u16x2(const uint8_t *p) {   /* 2-byte aligned */
+    const uint16_t *h = (const uint16_t *)p;
+    return (int)((uint32_t)h[0] | ((uint32_t)h[1] << 16));
 }
 
-__global__ void
-picolm_q5_K_gemv(float *y,
-                 const int8_t *xq, const float *xd, const int16_t *xbsums,
-                 const void *weights,
-                 int I, int O, int row_bytes, int y_stride) {
-    const int lane = (int)(gpuThreadIdx_x & 31);
-    const int warp = (int)(gpuThreadIdx_x >> 5);
-    const int tid  = warp * 32 + lane;
-    const int o    = (int)gpuBlockIdx_x;
-    if (o >= O) return;
-    int ys = y_stride > 0 ? y_stride : O;
-
-    const int n_super = I / 256;
-    const uint8_t *wrow = (const uint8_t *)weights + (size_t)o * row_bytes;
-
-    const int sb0 = tid / GEMVK_THREADS_PER_SB;   /* first super-block */
-    const int sub = tid % GEMVK_THREADS_PER_SB;   /* which 32 of the 256 */
-
-    float sumf = 0.0f;
-
-    for (int sb = sb0; sb < n_super; sb += GEMVK_BLOCKS_PER_ITER) {
-        const uint8_t *wb = wrow + (size_t)sb * GPU_BLOCK_Q5_K_SIZE;
-        const float wd   = gpu_fp16_to_fp32((uint16_t)(wb[0] | ((uint16_t)wb[1] << 8)));
-        const float wdm  = gpu_fp16_to_fp32((uint16_t)(wb[2] | ((uint16_t)wb[3] << 8)));
-        const float d    = xd[sb] * wd;
-        const float dmin = xd[sb] * wdm;
-
-        uint8_t sc2[2];
-        gemv_q5k_scale_min(wb + 4, sub, sc2);
-
-        const uint8_t *qh = wb + 16;
-        const uint8_t *qs = wb + 48;
-        const int8_t  *q8 = xq + (size_t)sb * 256;
-
-        const int group = sub >> 1;     /* 0..3: selects a 32-byte qs window */
-        const int half  = sub & 1;      /* 0/1: low or high nibble           */
-        /* The reference walks `m` as 1,2,4,...,128 -- one bit per 32-value
-         * group, in order. So the 5th bit for sub-block `sub` is simply
-         * bit `sub`, NOT (half ? 2 : 1) << (2*group) (which collides across
-         * groups and left group 3 reading bit 8..15 of "qh[l]" -- qh is only
-         * 8 bytes logically but the array is 32, so it silently read garbage).
-         * This was the Q5_K bug. */
-        const uint8_t bitmask = (uint8_t)(1u << sub);
-
-        /* Unpack 32 five-bit values, then dot them 4 at a time through
-         * gpu_dot4_i8_packed. The naive version multiplied per element with a
-         * branch on `half` inside the loop and measured 398 GB/s -- less than
-         * half what the Q8_0 GEMV reaches with the same shape (878 GB/s),
-         * because the unpack dominated. The nibble selection is now hoisted
-         * out of the loop (it depends only on `sub`) and the multiply is a
-         * single DP4A/SDOT per 4 values.
-         *
-         * Values are 0..31, which does not fit signed int8 semantics for the
-         * high bit: the 5th bit sets 0x10, so 16..31 would read as negative if
-         * interpreted as int8. The reference treats them as UNSIGNED and
-         * multiplies by a signed q8, so subtract 16 from every weight value
-         * and add back 16*sum(q8) afterwards -- that keeps the arithmetic in
-         * int8 range and is exactly what the +16*bias term below cancels. */
-        /* Activation (q8) is read 8 bytes at a time via gemv_get_int_b2, the
-         * SAME load the Q8_0 GEMV uses. Reading it as four separate byte
-         * accesses measured 30% of this kernel's runtime: an ablation that
-         * dropped the q8 read entirely took 0.0907 -> 0.0636 ms/call, landing
-         * on Q8_0's 0.0564, while dropping the qh unpack saved only 7%. The
-         * traffic is identical between the two kernels (same I, S=1), so it is
-         * the 4-byte strided access pattern, not the volume. */
-        int acc = 0;
-        for (int l = 0; l < 32; l += 8) {
-            /* 8 weight values: bytes l..l+7 of this group's window. */
-            const uint8_t p0 = qs[group * 32 + l + 0], p1 = qs[group * 32 + l + 1];
-            const uint8_t p2 = qs[group * 32 + l + 2], p3 = qs[group * 32 + l + 3];
-            const uint8_t p4 = qs[group * 32 + l + 4], p5 = qs[group * 32 + l + 5];
-            const uint8_t p6 = qs[group * 32 + l + 6], p7 = qs[group * 32 + l + 7];
-            const uint8_t h0 = qh[l+0], h1 = qh[l+1], h2 = qh[l+2], h3 = qh[l+3];
-            const uint8_t h4 = qh[l+4], h5 = qh[l+5], h6 = qh[l+6], h7 = qh[l+7];
-
-            /* Two 4-value groups, packed into ints for DP4A/SDOT. */
-            int8_t wA[4], wB[4];
-            wA[0] = (int8_t)(((half ? (p0 >> 4) : (p0 & 0xF)) | ((h0 & bitmask) ? 0x10 : 0)) - 16);
-            wA[1] = (int8_t)(((half ? (p1 >> 4) : (p1 & 0xF)) | ((h1 & bitmask) ? 0x10 : 0)) - 16);
-            wA[2] = (int8_t)(((half ? (p2 >> 4) : (p2 & 0xF)) | ((h2 & bitmask) ? 0x10 : 0)) - 16);
-            wA[3] = (int8_t)(((half ? (p3 >> 4) : (p3 & 0xF)) | ((h3 & bitmask) ? 0x10 : 0)) - 16);
-            wB[0] = (int8_t)(((half ? (p4 >> 4) : (p4 & 0xF)) | ((h4 & bitmask) ? 0x10 : 0)) - 16);
-            wB[1] = (int8_t)(((half ? (p5 >> 4) : (p5 & 0xF)) | ((h5 & bitmask) ? 0x10 : 0)) - 16);
-            wB[2] = (int8_t)(((half ? (p6 >> 4) : (p6 & 0xF)) | ((h6 & bitmask) ? 0x10 : 0)) - 16);
-            wB[3] = (int8_t)(((half ? (p7 >> 4) : (p7 & 0xF)) | ((h7 & bitmask) ? 0x10 : 0)) - 16);
-
-            const int8_t *qa = q8 + (size_t)sub * 32 + l;
-            /* Two 32-bit activation loads (bytes l..l+3 and l+4..l+7). */
-            const int aA = gemv_get_int_b2(qa, 0);
-            const int aB = gemv_get_int_b2(qa, 1);
-
-            const int8_t *aAp = (const int8_t *)&aA;
-            const int8_t *aBp = (const int8_t *)&aB;
-            int sumA = (int)aAp[0]+(int)aAp[1]+(int)aAp[2]+(int)aAp[3];
-            int sumB = (int)aBp[0]+(int)aBp[1]+(int)aBp[2]+(int)aBp[3];
-
-            int wAi, wBi;
-            memcpy(&wAi, wA, 4); memcpy(&wBi, wB, 4);
-            acc = gpu_dot4_i8_packed(wAi, aA, acc);
-            acc = gpu_dot4_i8_packed(wBi, aB, acc);
-            acc += 16 * (sumA + sumB);          /* undo the -16 shift */
-        }
-
-        /* scales[is++] runs sequentially with j (0..7) == our `sub`.
-         * The reference bias loop is  sumi += bsums[j] * mins[j/2]  for
-         * j in 0..15, i.e. mins[m] pairs with bsums[2m] and bsums[2m+1].
-         * Sub-block `sub` owns exactly those two bsums, so its min index is
-         * `sub`, not sub/2. */
-        const int scale = (int)sc2[0];
-        const int minv  = (int)sc2[1];
-        sumf += scale * d * (float)acc;
-        /* Bias correction over this 32-value sub-block = two 16-value bsums. */
-        const int bsum = (int)xbsums[sb * 16 + sub * 2]
-                       + (int)xbsums[sb * 16 + sub * 2 + 1];
-        sumf -= dmin * (float)minv * (float)bsum;
-    }
-
-    __shared__ float red[GEMV_WARPS > 1 ? GEMV_WARPS - 1 : 1][32];
-    if (warp > 0) red[warp - 1][lane] = sumf;
-    gpuSyncthreads();
-    if (warp > 0) return;
-    for (int w = 0; w < GEMV_WARPS - 1; w++) sumf += red[w][lane];
-    for (int off = 16; off > 0; off >>= 1)
-        sumf += gpuShflXorSync(0xFFFFFFFFu, sumf, off);
-    if (lane == 0) y[o] = sumf;
+__device__ static inline float gemvw_warp_sum(float v) {
+    for (int m = 16; m > 0; m >>= 1) v += gpuShflXorSync(0xFFFFFFFFu, v, m);
+    return v;
 }
 
-/* Q6_K: same shape. Transcribed from the "Scalar fallback" in
- * vec_dot_q6_K_q8_K. Layout: ql[128], qh[64], scales[16] (int8), d (fp16). */
-__global__ void
-picolm_q6_K_gemv(float *y,
-                 const int8_t *xq, const float *xd, const int16_t *xbsums,
-                 const void *weights,
-                 int I, int O, int row_bytes, int y_stride) {
-    const int lane = (int)(gpuThreadIdx_x & 31);
-    const int warp = (int)(gpuThreadIdx_x >> 5);
-    const int tid  = warp * 32 + lane;
-    const int o    = (int)gpuBlockIdx_x;
-    if (o >= O) return;
-    int ys = y_stride > 0 ? y_stride : O;
-
+/* Q6_K: ql[128] qh[64] sc[16] d. The 210-byte blocks are only 2-byte aligned,
+ * so weights are read as uint16 pairs. Half-warp t>>4 takes every other
+ * super-block; in it, u = t&15: chunk n = u>>3 (128 values), half h = (u>>2)&1,
+ * bytes l = 8*(u&3)..+7: the ql bytes give values l+32h.. (low nibbles, qh
+ * bits 2h) and l+64+32h.. (high nibbles, qh bits 4+2h) of the chunk, eight
+ * values each, all in one 16-value scale group. */
+template <int wpr>
+__global__ void __launch_bounds__(32 * GEMVW_ROWS)
+picolm_q6_K_gemv_w(float *y, const int8_t *xq, const float *xd, const int16_t *xbsums,
+                    const void *weights, int I, int O, int row_bytes, int y_stride) {
+    (void)xbsums; (void)y_stride;
+    const int lane = (int)(gpuThreadIdx_x & 31), warp = (int)(gpuThreadIdx_x >> 5);
+    const int o = (int)gpuBlockIdx_x * (GEMVW_ROWS / wpr) + warp / wpr, ws = warp % wpr;
+    __shared__ float part[GEMVW_ROWS];
+    if (wpr == 1 && o >= O) return;
     const int n_super = I / 256;
-    const uint8_t *wrow = (const uint8_t *)weights + (size_t)o * row_bytes;
-
-    const int sb0 = tid / GEMVK_THREADS_PER_SB;
-    const int sub = tid % GEMVK_THREADS_PER_SB;
-
+    const uint8_t *wrow = (const uint8_t *)weights + (size_t)(o < O ? o : O - 1) * row_bytes;
+    const int half = lane >> 4, u = lane & 15, n = u >> 3, h = (u >> 2) & 1, l = 8 * (u & 3);
+    const int p0 = l + 32 * h, p1 = p0 + 64;
     float sumf = 0.0f;
-
-    for (int sb = sb0; sb < n_super; sb += GEMVK_BLOCKS_PER_ITER) {
-        const uint8_t *wb = wrow + (size_t)sb * GPU_BLOCK_Q6_K_SIZE;
-        const uint8_t *ql = wb;
-        const uint8_t *qh = wb + 128;
-        const int8_t  *sc = (const int8_t *)(wb + 192);
-        const uint16_t d_raw = (uint16_t)(wb[208] | ((uint16_t)wb[209] << 8));
-        const float d = xd[sb] * gpu_fp16_to_fp32(d_raw);
-
-        const int8_t *q8 = xq + (size_t)sb * 256;
-
-        /* A 128-value chunk holds 4 interleaved sub-blocks. Per the reference
-         * (quant.c vec_dot_q6_K_q8_K scalar path), sub-block `which` sums
-         * q8_c[q8off + 0..15] for l=0..15 and q8_c[q8off + 16..31] for
-         * l=16..31 -- i.e. the two halves of the 32 q8 values are taken from
-         * the SAME ql/qh byte range but different l, so l must run the full
-         * 0..31 here while the byte index wraps at 16. Getting this wrong
-         * silently mis-associates half of every sub-block. */
-        const int chunk = sub >> 2;          /* 0 or 1 */
-        const int which = sub & 3;           /* 0..3 -> q1..q4 */
-        const uint8_t *ql_c = ql + chunk * 64;
-        const uint8_t *qh_c = qh + chunk * 32;
-        const int8_t  *q8_c = q8 + chunk * 128;
-
-        /* IMPORTANT: a 32-value sub-block spans TWO reference entries.
-         * sums[is+2*which] accumulates l=0..15 and sums[is+2*which+1]
-         * accumulates l=16..31, each with its OWN scale sc[is+2*which] and
-         * sc[is+2*which+1] (and its own bsums entry). Treating the 32 values
-         * as one block with a single scale was the bug: it produced plausible
-         * magnitudes but a wrong answer for 8 of every 16 scale slots. */
-        const int j0 = chunk * 8 + 2 * which;      /* first of the pair */
-        const int j1 = j0 + 1;
-        int acc0 = 0, acc1 = 0;
-        /* Everything that depends only on `which` is hoisted out, so each of
-         * the four cases becomes a straight-line 16-iteration loop with no
-         * branch and no switch -- same shape as the reference, which has two
-         * separate 16-iteration loops rather than one 32-iteration loop with a
-         * predicate. The previous version switched on `which` and tested
-         * `l < 16` on EVERY iteration; measured 448 GB/s against Q8_0's 839.
-         *
-         * NOTE: the byte index is `l`, not `l & 15`, and the q8 index runs the
-         * full l=0..31 for both halves. Folding the halves with a mask
-         * re-reads the first 16 bytes of every sub-block. */
-        {
-            const int  ql_off  = (which & 1) ? 32 : 0;   /* q1/q3 vs q2/q4 */
-            const int  ql_sh   = (which & 2) ? 4 : 0;    /* high vs low nibble */
-            const int  qh_sh   = which * 2;              /* 0,2,4,6 */
-            const int  q8_off  = which * 32;             /* 0,32,64,96 */
-            const uint8_t *qlp = ql_c + ql_off;
-            const int8_t  *q8p = q8_c + q8_off;
-
-            /* l=0..15 -> acc0, l=16..31 -> acc1, both indexing qlp[l] and
-             * qh_c[l] with the FULL l (see the note above). */
-            for (int l = 0; l < 16; l++) {
-                const int q = ((qlp[l] >> ql_sh) & 0xF)
-                            | (((qh_c[l] >> qh_sh) & 3) << 4);
-                acc0 += q * q8p[l];
-            }
-            for (int l = 16; l < 32; l++) {
-                const int q = ((qlp[l] >> ql_sh) & 0xF)
-                            | (((qh_c[l] >> qh_sh) & 3) << 4);
-                acc1 += q * q8p[l];
-            }
-        }
-
-        /* Reference: block_sum += sc[j]*sums[j] - 32*bsums[j]*sc[j] */
-        const int s0 = (int)sc[j0], s1 = (int)sc[j1];
-        const int b0 = (int)xbsums[sb * 16 + j0];
-        const int b1 = (int)xbsums[sb * 16 + j1];
-        acc0 = acc0 * s0 - 32 * b0 * s0;
-        acc1 = acc1 * s1 - 32 * b1 * s1;
-        sumf += d * (float)(acc0 + acc1);
+#pragma unroll 2
+    for (int sb = 2 * ws + half; sb < n_super; sb += 2 * wpr) {
+        const uint8_t *b = wrow + (size_t)sb * GPU_BLOCK_Q6_K_SIZE;
+        const uint8_t *qlp = b + 64 * n + 32 * h + l, *qhp = b + 128 + 32 * n + l;
+        const int qla = gemvw_u16x2(qlp), qlb = gemvw_u16x2(qlp + 4);
+        const int qha = gemvw_u16x2(qhp), qhb = gemvw_u16x2(qhp + 4);
+        const int8_t *q8 = xq + (size_t)sb * 256 + 128 * n;
+        const int2 a0 = *(const int2 *)(q8 + p0), a1 = *(const int2 *)(q8 + p1);
+        const int s0 = 2 * h, s1 = 4 + 2 * h;
+        const int v0a = (qla & 0x0F0F0F0F) | (((qha >> s0) & 0x03030303) << 4);
+        const int v0b = (qlb & 0x0F0F0F0F) | (((qhb >> s0) & 0x03030303) << 4);
+        const int v1a = ((qla >> 4) & 0x0F0F0F0F) | (((qha >> s1) & 0x03030303) << 4);
+        const int v1b = ((qlb >> 4) & 0x0F0F0F0F) | (((qhb >> s1) & 0x03030303) << 4);
+        /* (q - 32) . a = q . a - 32 * sum(a) */
+        const int d0 = gpu_dot4_i8_packed(v0b, a0.y, gpu_dot4_i8_packed(v0a, a0.x, 0))
+                     - 32 * gpu_dot4_i8_packed(0x01010101, a0.y, gpu_dot4_i8_packed(0x01010101, a0.x, 0));
+        const int d1 = gpu_dot4_i8_packed(v1b, a1.y, gpu_dot4_i8_packed(v1a, a1.x, 0))
+                     - 32 * gpu_dot4_i8_packed(0x01010101, a1.y, gpu_dot4_i8_packed(0x01010101, a1.x, 0));
+        const int8_t *sc = (const int8_t *)(b + 192 + 8 * n);
+        const float d = gpu_fp16_to_fp32(*(const uint16_t *)(b + 208));
+        sumf += d * xd[sb] * (float)(d0 * sc[p0 >> 4] + d1 * sc[p1 >> 4]);
     }
-
-    __shared__ float red[GEMV_WARPS > 1 ? GEMV_WARPS - 1 : 1][32];
-    if (warp > 0) red[warp - 1][lane] = sumf;
+    sumf = gemvw_warp_sum(sumf);
+    if (wpr == 1) {
+        if (lane == 0 && o < O) y[o] = sumf;
+        return;
+    }
+    if (lane == 0) part[warp] = sumf;
     gpuSyncthreads();
-    if (warp > 0) return;
-    for (int w = 0; w < GEMV_WARPS - 1; w++) sumf += red[w][lane];
-    for (int off = 16; off > 0; off >>= 1)
-        sumf += gpuShflXorSync(0xFFFFFFFFu, sumf, off);
-    if (lane == 0) y[o] = sumf;
+    if (lane == 0 && ws == 0 && o < O) {
+        for (int k = 1; k < wpr; k++) sumf += part[warp + k];
+        y[o] = sumf;
+    }
 }
 
-/* Q4_K: 256 weights in 144 bytes -- d(2) dmin(2) scales[12] qs[128].
- * Same shape as Q5_K minus the qh array: for j=0..3 the bytes qs[j*32..j*32+31]
- * hold sub-block j*2 in their low nibbles and j*2+1 in their high nibbles.
- * Scales/mins use the same 6-bit utmp packing as Q5_K. */
-__global__ void
-picolm_q4_K_gemv(float *y,
-                 const int8_t *xq, const float *xd, const int16_t *xbsums,
-                 const void *weights,
-                 int I, int O, int row_bytes, int y_stride) {
-    const int lane = (int)(gpuThreadIdx_x & 31);
-    const int warp = (int)(gpuThreadIdx_x >> 5);
-    const int tid  = warp * 32 + lane;
-    const int o    = (int)gpuBlockIdx_x;
-    if (o >= O) return;
-    int ys = y_stride > 0 ? y_stride : O;
-
-    const int n_super = I / 256;
-    const uint8_t *wrow = (const uint8_t *)weights + (size_t)o * row_bytes;
-
-    const int sb0 = tid / GEMVK_THREADS_PER_SB;
-    const int sub = tid % GEMVK_THREADS_PER_SB;
-
-    float sumf = 0.0f;
-
-    for (int sb = sb0; sb < n_super; sb += GEMVK_BLOCKS_PER_ITER) {
-        const uint8_t *wb = wrow + (size_t)sb * GPU_BLOCK_Q4_K_SIZE;
-        const float wd   = gpu_fp16_to_fp32((uint16_t)(wb[0] | ((uint16_t)wb[1] << 8)));
-        const float wdm  = gpu_fp16_to_fp32((uint16_t)(wb[2] | ((uint16_t)wb[3] << 8)));
-        const float d    = xd[sb] * wd;
-        const float dmin = xd[sb] * wdm;
-
-        uint8_t sc2[2];
-        gemv_q5k_scale_min(wb + 4, sub, sc2);   /* same 6-bit packing */
-
-        const uint8_t *qs = wb + 16;
-        const int8_t  *q8 = xq + (size_t)sb * 256;
-
-        const int group = sub >> 1;
-        const int half  = sub & 1;
-        const uint8_t *qsg = qs + group * 32;
-
-        /* 4-bit values 0..15 fit signed int8 directly (no bias needed, unlike
-         * Q5_K's 5-bit). Activations read 4 bytes at a time via
-         * gemv_get_int_b2-style packing -- reading them as separate bytes was
-         * what cost Q5_K 30% before that fix. */
-        int acc = 0;
-        for (int l = 0; l < 32; l += 8) {
-            int8_t wA[4], wB[4];
-            wA[0] = (int8_t)(half ? (qsg[l+0] >> 4) : (qsg[l+0] & 0xF));
-            wA[1] = (int8_t)(half ? (qsg[l+1] >> 4) : (qsg[l+1] & 0xF));
-            wA[2] = (int8_t)(half ? (qsg[l+2] >> 4) : (qsg[l+2] & 0xF));
-            wA[3] = (int8_t)(half ? (qsg[l+3] >> 4) : (qsg[l+3] & 0xF));
-            wB[0] = (int8_t)(half ? (qsg[l+4] >> 4) : (qsg[l+4] & 0xF));
-            wB[1] = (int8_t)(half ? (qsg[l+5] >> 4) : (qsg[l+5] & 0xF));
-            wB[2] = (int8_t)(half ? (qsg[l+6] >> 4) : (qsg[l+6] & 0xF));
-            wB[3] = (int8_t)(half ? (qsg[l+7] >> 4) : (qsg[l+7] & 0xF));
-
-            const int8_t *qa = q8 + (size_t)sub * 32 + l;
-            const int aA = gemv_get_int_b2(qa, 0);
-            const int aB = gemv_get_int_b2(qa, 1);
-            int wAi, wBi;
-            memcpy(&wAi, wA, 4); memcpy(&wBi, wB, 4);
-            acc = gpu_dot4_i8_packed(wAi, aA, acc);
-            acc = gpu_dot4_i8_packed(wBi, aB, acc);
-        }
-
-        const int scale = (int)sc2[0];
-        const int minv  = (int)sc2[1];
-        const int bsum  = (int)xbsums[sb * 16 + sub * 2]
-                        + (int)xbsums[sb * 16 + sub * 2 + 1];
-        sumf += scale * d * (float)acc;
-        sumf -= dmin * (float)minv * (float)bsum;
+/* Q4_K / Q5_K: d dmin sc[12] (qh[32]) qs[128]. The blocks are 144/176 bytes,
+ * so 16-byte aligned: the header (d, dmin, the 12 packed scale bytes) is one
+ * uint4 load and a lane takes 8 qs bytes. Half-warp t>>4 takes every other
+ * super-block; in it, u = t&15: c = u>>2 is the 64-value chunk (groups 2c and
+ * 2c+1), bytes l = 8*(u&3)..+7 of its 32 qs bytes -- low nibbles are values
+ * 64c+l.., high nibbles 64c+32+l.. Q5_K's 5th bit of group g is bit g of
+ * qh[l]. Loading the header byte by byte and 4 qs bytes per lane cost Q4_K
+ * 340 -> 540 GB/s at 4096 x 4096. */
+/* get_scale_min_k4 on the three scale words of the header. */
+__device__ static inline void gemvw_scale_min(int j, uint32_t w1, uint32_t w2, uint32_t w3,
+                                               int *sc, int *mn) {
+    if (j < 4) {
+        *sc = (int)((w1 >> (8 * j)) & 63);
+        *mn = (int)((w2 >> (8 * j)) & 63);
+    } else {
+        const int s = 8 * (j - 4);
+        *sc = (int)(((w3 >> s) & 0x0F) | (((w1 >> s) >> 6 & 3) << 4));
+        *mn = (int)(((w3 >> s) >> 4 & 0x0F) | (((w2 >> s) >> 6 & 3) << 4));
     }
+}
 
-    __shared__ float red[GEMV_WARPS > 1 ? GEMV_WARPS - 1 : 1][32];
-    if (warp > 0) red[warp - 1][lane] = sumf;
+template <int Q5, int wpr>
+__device__ static inline void
+gemvw_q45_row(float *y, const int8_t *xq, const float *xd, const void *weights,
+               int I, int O, int row_bytes) {
+    const int lane = (int)(gpuThreadIdx_x & 31), warp = (int)(gpuThreadIdx_x >> 5);
+    const int o = (int)gpuBlockIdx_x * (GEMVW_ROWS / wpr) + warp / wpr, ws = warp % wpr;
+    __shared__ float part[GEMVW_ROWS];
+    if (wpr == 1 && o >= O) return;
+    const int n_super = I / 256;
+    const int bsz = Q5 ? GPU_BLOCK_Q5_K_SIZE : GPU_BLOCK_Q4_K_SIZE;
+    const uint8_t *wrow = (const uint8_t *)weights + (size_t)(o < O ? o : O - 1) * row_bytes;
+    const int half = lane >> 4, u = lane & 15, c = u >> 2, l = 8 * (u & 3);
+    float sumf = 0.0f;
+#pragma unroll 2
+    for (int sb = 2 * ws + half; sb < n_super; sb += 2 * wpr) {
+        const uint8_t *b = wrow + (size_t)sb * bsz;
+        const uint4 hd = *(const uint4 *)b;
+        const uint2 qs = *(const uint2 *)(b + (Q5 ? 48 : 16) + 32 * c + l);
+        int v0a = (int)(qs.x & 0x0F0F0F0Fu), v0b = (int)(qs.y & 0x0F0F0F0Fu);
+        int v1a = (int)((qs.x >> 4) & 0x0F0F0F0Fu), v1b = (int)((qs.y >> 4) & 0x0F0F0F0Fu);
+        if (Q5) {
+            const uint2 qh = *(const uint2 *)(b + 16 + l);
+            v0a |= (int)(((qh.x >> (2 * c)) & 0x01010101u) << 4);
+            v0b |= (int)(((qh.y >> (2 * c)) & 0x01010101u) << 4);
+            v1a |= (int)(((qh.x >> (2 * c + 1)) & 0x01010101u) << 4);
+            v1b |= (int)(((qh.y >> (2 * c + 1)) & 0x01010101u) << 4);
+        }
+        const int8_t *q8 = xq + (size_t)sb * 256 + 64 * c + l;
+        const int2 a0 = *(const int2 *)q8, a1 = *(const int2 *)(q8 + 32);
+        int sc0, mn0, sc1, mn1;
+        gemvw_scale_min(2 * c, hd.y, hd.z, hd.w, &sc0, &mn0);
+        gemvw_scale_min(2 * c + 1, hd.y, hd.z, hd.w, &sc1, &mn1);
+        const int d0 = gpu_dot4_i8_packed(v0b, a0.y, gpu_dot4_i8_packed(v0a, a0.x, 0));
+        const int d1 = gpu_dot4_i8_packed(v1b, a1.y, gpu_dot4_i8_packed(v1a, a1.x, 0));
+        const int m0 = gpu_dot4_i8_packed(0x01010101, a0.y, gpu_dot4_i8_packed(0x01010101, a0.x, 0));
+        const int m1 = gpu_dot4_i8_packed(0x01010101, a1.y, gpu_dot4_i8_packed(0x01010101, a1.x, 0));
+        const float d    = gpu_fp16_to_fp32((uint16_t)(hd.x & 0xFFFF));
+        const float dmin = gpu_fp16_to_fp32((uint16_t)(hd.x >> 16));
+        sumf += xd[sb] * (d * (float)(d0 * sc0 + d1 * sc1) - dmin * (float)(m0 * mn0 + m1 * mn1));
+    }
+    sumf = gemvw_warp_sum(sumf);
+    if (wpr == 1) {
+        if (lane == 0 && o < O) y[o] = sumf;
+        return;
+    }
+    if (lane == 0) part[warp] = sumf;
     gpuSyncthreads();
-    if (warp > 0) return;
-    for (int w = 0; w < GEMV_WARPS - 1; w++) sumf += red[w][lane];
-    for (int off = 16; off > 0; off >>= 1)
-        sumf += gpuShflXorSync(0xFFFFFFFFu, sumf, off);
-    if (lane == 0) y[o] = sumf;
+    if (lane == 0 && ws == 0 && o < O) {
+        for (int k = 1; k < wpr; k++) sumf += part[warp + k];
+        y[o] = sumf;
+    }
+}
+
+
+template <int wpr>
+__global__ void __launch_bounds__(32 * GEMVW_ROWS)
+picolm_q4_K_gemv_w(float *y, const int8_t *xq, const float *xd, const int16_t *xbsums,
+                   const void *weights, int I, int O, int row_bytes, int y_stride) {
+    (void)xbsums; (void)y_stride;
+    gemvw_q45_row<0, wpr>(y, xq, xd, weights, I, O, row_bytes);
+}
+
+template <int wpr>
+__global__ void __launch_bounds__(32 * GEMVW_ROWS)
+picolm_q5_K_gemv_w(float *y, const int8_t *xq, const float *xd, const int16_t *xbsums,
+                   const void *weights, int I, int O, int row_bytes, int y_stride) {
+    (void)xbsums; (void)y_stride;
+    gemvw_q45_row<1, wpr>(y, xq, xd, weights, I, O, row_bytes);
+}
+
+/* wpr from the shape (V100 sweep): 1 warp per row unless the matrix has few
+ * rows or long ones (Q4_K/Q5_K: 2); Q6_K was fastest at 4 (2 for few rows). */
+int picolm_kquant_gemv_w_launch(int which, gpuStream_t stream, float *y,
+                                const int8_t *xq, const float *xd, const void *weights,
+                                int I, int O, int row_bytes) {
+    int wpr = which == 6 ? (O <= 2048 ? 2 : 4) : (I >= 8192 || O <= 2048 ? 2 : 1);
+    dim3 grid((unsigned)((O + GEMVW_ROWS / wpr - 1) / (GEMVW_ROWS / wpr)));
+#define GEMVW_GO(K) \
+    (wpr == 1 ? K<1><<<grid, 32 * GEMVW_ROWS, 0, stream>>>(y, xq, xd, NULL, weights, I, O, row_bytes, O) : \
+     wpr == 2 ? K<2><<<grid, 32 * GEMVW_ROWS, 0, stream>>>(y, xq, xd, NULL, weights, I, O, row_bytes, O) : \
+                K<4><<<grid, 32 * GEMVW_ROWS, 0, stream>>>(y, xq, xd, NULL, weights, I, O, row_bytes, O))
+    if (which == 4)      GEMVW_GO(picolm_q4_K_gemv_w);
+    else if (which == 5) GEMVW_GO(picolm_q5_K_gemv_w);
+    else if (which == 6) GEMVW_GO(picolm_q6_K_gemv_w);
+    else return 0;
+#undef GEMVW_GO
+    return 1;
 }
 
 /* Q3_K: 256 weights in 110 bytes -- hmask[32] qs[64] scales[12] d(2).
