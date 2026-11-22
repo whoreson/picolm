@@ -5569,14 +5569,26 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
                 picolm_gpu_kv_flush_to_cpu(s->key_cache, s->val_cache,
                                            this_attn_ordinal, seq_len, pos + 1,
                                            s->kv_row_size_k, s->kv_row_size_v, gpu_dev);
+                /* Hand the rest of this token to the CPU properly.
+                 *
+                 * The flag that matters is m->gpu.ACTIVE, not kv_active:
+                 * model_forward() reads
+                 *     int gpu_ok = m->gpu.active;              (model_core.c)
+                 * and then reinstalls the device tensor handles itself
+                 *     tensor_set_gpu_tensor(gl->attn_q, gpu_dev);  ...
+                 * for every projection. Clearing kv_active alone leaves
+                 * gpu_ok == 1, so the CPU pass routes all its matmuls straight
+                 * back to the GPU, against pipeline buffers that belong to the
+                 * abandoned device pass -- which is exactly the fault we were
+                 * seeing ("q8 quantize: 700 illegal memory access" on the first
+                 * matmul of the CPU pass, at pos 8, not context dependent).
+                 *
+                 * Clearing `active` as well makes gpu_ok false, so those calls
+                 * install NULL handles and the CPU does the arithmetic itself.
+                 * The weights stay resident in VRAM; only dispatch stops. */
                 gw->kv_active = 0;
                 m->gpu.kv_active = 0;
-                /* Also drop the global GPU-tensor handle. picolm_gpu_matmul_dev()
-                 * has no kv_active gate of its own -- it launches whenever a
-                 * tensor handle is installed -- so without this the CPU
-                 * model_forward() below still routes every matmul to the GPU,
-                 * against pipeline buffers that no longer belong to it. That is
-                 * the illegal access this whole branch has to avoid. */
+                m->gpu.active = 0;
                 tensor_set_gpu_tensor(NULL, 0);
                 return model_forward(m, token, pos);
             }
