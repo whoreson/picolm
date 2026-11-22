@@ -371,6 +371,20 @@ __global__ void picolm_gpu_attention_prefill_fa2_kernel(
     int n_heads, int n_kv_heads, int head_dim, int max_seq_len,
     size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes, size_t kv_head_stride_v_bytes, int n_swa, int kv_type);
 
+/* Flash attention with the O accumulator in REGISTERS (FA3). Unlike FA2 this
+ * fits head_dim=256 in shared memory (~74 KB at TILE_K 32 vs 136.5 KB), which
+ * is what lets Qwen3.5/3.6 use tensor cores for prefill attention at all.
+ * NOT bit-identical to the CPU reference; validate against llama.cpp logits. */
+#define FA3_ROWS 16
+#define FA3_WARPS 4
+__global__ void picolm_gpu_attention_prefill_fa3_kernel(
+        float *xb_out, const float *q_dev,
+        const uint16_t *kv_k, const uint16_t *kv_v,
+        int layer_ordinal, int start_pos, int n_tokens,
+        int n_heads, int n_kv_heads, int head_dim, int max_seq_len,
+        size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes,
+        size_t kv_head_stride_v_bytes, int n_swa, int kv_type, int tile_k);
+
 /* ---- SSM alpha/beta batched vec_dot kernel ----
  * Each thread block handles one head. Weights: column-major
  * [dim, n_heads], each column is a quantized row.

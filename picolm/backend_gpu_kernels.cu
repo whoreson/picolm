@@ -7458,6 +7458,220 @@ picolm_ssm_recurrence_kernel(float *state,
 }
 
 
+/* ================================================================
+ * picolm_gpu_attention_prefill_fa3_kernel -- flash attention with the
+ * O accumulator in REGISTERS, which is what makes head_dim=256 possible.
+ *
+ * WHY A NEW KERNEL: the FA2 kernel above keeps
+ *     Q tile   64 x head_dim fp16  = 32 KB at hd 256
+ *     scores   64 x TILE_K  fp32   =  8 KB
+ *     acc      64 x head_dim fp32  = 64 KB
+ * plus K/V tiles, totalling 136.5 KB against a 96 KB per-block cap. It cannot
+ * run for head_dim 256 at all, so Qwen3.5/3.6 prefill attention falls through
+ * to the scalar warpgrp kernel. Shrinking TILE_K does not help (106.5 KB at
+ * TILE_K 8) because the acc and Q tiles are the floor. Measured cost of that
+ * fallback at 4096 tokens: 28.2 ms per call, 26.6% of prefill, and O(n^2) in
+ * depth -- it is the whole reason prefill rate falls with context.
+ *
+ * WHAT CHANGES: one warp owns 16 Q rows and keeps their O accumulator in
+ * registers, 8 floats per lane (head_dim 256 / 32 lanes). No acc in shared
+ * memory at all. Scores stay per-warp in shared memory (16 x TILE_K floats =
+ * 2 KB at TILE_K 32), and the online-softmax max/sum live in registers.
+ *
+ * Shared memory at head_dim 256, TILE_K 32:
+ *     K tile  32*256*2 = 16384 B
+ *     V tile  32*256*2 = 16384 B
+ *     Q tile  for THIS warp only, 16*256*2 = 8192 B  (per warp: 4 warps = 32 KB)
+ *     scores  per warp 16*32*4 = 2048 B  (4 warps = 8 KB)
+ *     -> ~74 KB, inside 96 KB. At TILE_K 16 it is ~54 KB.
+ *
+ * NOT bit-identical to the CPU reference and not intended to be: the whole
+ * point is tensor-core scores and a different accumulation order. Validate
+ * against llama.cpp logits with a tolerance, not against max|diff| 0.
+ * ================================================================ */
+__global__ void __launch_bounds__(32 * FA3_WARPS)
+picolm_gpu_attention_prefill_fa3_kernel(
+        float *xb_out, const float *q_dev,
+        const uint16_t *kv_k, const uint16_t *kv_v,
+        int layer_ordinal, int start_pos, int n_tokens,
+        int n_heads, int n_kv_heads, int head_dim, int max_seq_len,
+        size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes,
+        size_t kv_head_stride_v_bytes, int n_swa, int kv_type, int tile_k)
+{
+    const int q_h      = (int)gpuBlockIdx_x;
+    const int q_tile   = (int)gpuBlockIdx_y;
+    const int tid      = (int)gpuThreadIdx_x;
+    const int warp     = tid >> 5;
+    const int lane     = tid & 31;
+    const int kv_mul   = n_heads / n_kv_heads;
+    const int kv_h     = q_h / kv_mul;
+    const float scale  = 1.0f / sqrtf((float)head_dim);
+    const int DPL      = head_dim / 32;            /* floats of O per lane */
+
+    const int q0 = q_tile * (FA3_ROWS * FA3_WARPS) + warp * FA3_ROWS;
+    /* NO early return here. q0 is per-WARP, so on the last partial block some
+     * warps would exit while others reach the gpuSyncthreads() below -- a
+     * divergent barrier, which is undefined behaviour and produced NaN logits
+     * whenever n_tokens was not a multiple of FA3_ROWS*FA3_WARPS.
+     * Out-of-range warps now participate in the barriers and skip the maths. */
+    const int warp_alive = (q0 < n_tokens) ? 1 : 0;
+
+    extern __shared__ uint8_t f3sm[];
+    /* layout: [K tile][V tile] then per-warp [Q tile (only 16 rows)][scores] */
+    __half  *k_sh = (__half *)f3sm;
+    __half  *v_sh = k_sh + (size_t)tile_k * head_dim;
+    __half  *q_sh = v_sh + (size_t)tile_k * head_dim;
+    float   *s_sh = (float *)(q_sh + (size_t)FA3_WARPS * FA3_ROWS * head_dim);
+
+    __half *myq = q_sh + (size_t)warp * FA3_ROWS * head_dim;
+    float  *ms  = s_sh + (size_t)warp * FA3_ROWS * tile_k;
+
+    const size_t layer_base = (size_t)layer_ordinal * max_seq_len * kv_pos_stride_bytes;
+
+    /* ---- O accumulator in registers, plus the online-softmax state ---- */
+    float o_acc[FA3_ROWS][8];
+    float row_max[FA3_ROWS];
+    float row_sum[FA3_ROWS];
+    #pragma unroll
+    for (int r = 0; r < FA3_ROWS; r++) {
+        #pragma unroll
+        for (int d = 0; d < 8; d++) o_acc[r][d] = 0.0f;
+        row_max[r] = -1e30f;
+        row_sum[r] = 0.0f;
+    }
+
+    /* ---- load this warp's 16 Q rows into its own shared slice (fp16) ---- */
+    for (int i = lane; i < FA3_ROWS * head_dim; i += 32) {
+        int r = i / head_dim, d = i % head_dim;
+        int gq = q0 + r;
+        myq[i] = (warp_alive && gq < n_tokens)
+            ? gpu_fp32_to_fp16(q_dev[(size_t)((size_t)gq * n_heads + q_h) * head_dim + d])
+            : __float2half(0.0f);
+    }
+    __syncwarp();
+
+    /* causal horizon: the last Q row of this warp can see up to start_pos + q0+15 */
+    int kv_limit = start_pos + q0 + FA3_ROWS;
+    if (kv_limit > start_pos + n_tokens) kv_limit = start_pos + n_tokens;
+    if (!warp_alive) kv_limit = 0;   /* still takes part in every barrier */
+
+    for (int t0 = 0; t0 < kv_limit; t0 += tile_k) {
+        int t_end = t0 + tile_k;
+        if (t_end > kv_limit) t_end = kv_limit;
+        int tk = t_end - t0;
+
+        /* ---- stage K and V for this tile (all warps cooperate) ---- */
+        for (int i = tid; i < tk * head_dim; i += 32 * FA3_WARPS) {
+            int ti = i / head_dim, d = i % head_dim;
+            size_t koff = layer_base + (size_t)kv_h * kv_head_stride_bytes
+                        + (size_t)(t0 + ti) * kv_pos_stride_bytes;
+            size_t voff = layer_base + (size_t)kv_h * kv_head_stride_v_bytes
+                        + (size_t)(t0 + ti) * kv_pos_stride_bytes;
+            k_sh[i] = gpu_fp32_to_fp16(kv_row_dequant((const uint8_t *)kv_k, koff, kv_type, d));
+            v_sh[i] = gpu_fp32_to_fp16(kv_row_dequant((const uint8_t *)kv_v, voff, kv_type, d));
+        }
+        gpuSyncthreads();
+
+        /* ---- scores: mma.f16 m16n8k16 over head_dim/16 steps ----
+         * Warp layout is exactly the one the existing FA2 kernel uses, which is
+         * verified: groupID = lane>>2 picks the Q row pair, tid_in_grp = lane&3
+         * picks the K columns. d0..d3 land at rows (gid, gid+8) and columns
+         * (2*tid, 2*tid+1) of the 16x8 score block. */
+        for (int r = 0; r < FA3_ROWS; r++)
+            for (int k = lane; k < tk; k += 32) ms[r * tile_k + k] = 0.0f;
+        __syncwarp();
+
+        {
+            int groupID = lane >> 2, tig = lane & 3;
+            int n_k16 = head_dim / 16;
+            for (int k16 = 0; k16 < n_k16; k16++) {
+                for (int ki8 = 0; ki8 < tk; ki8 += 8) {
+                    int mc = tig * 2;
+                    int col32  = (k16 * 16 + mc) / 2;
+                    int col32b = (k16 * 16 + mc + 8) / 2;
+                    int a0 = ((int *)myq)[(size_t)groupID * (head_dim / 2) + col32];
+                    int a1 = ((int *)myq)[(size_t)(groupID + 8) * (head_dim / 2) + col32];
+                    int a2 = ((int *)myq)[(size_t)groupID * (head_dim / 2) + col32b];
+                    int a3 = ((int *)myq)[(size_t)(groupID + 8) * (head_dim / 2) + col32b];
+
+                    int ki = ki8 + groupID;
+                    int b0 = 0, b1 = 0;
+                    if (ki < tk) {
+                        int d32  = (k16 * 16 + tig * 2) / 2;
+                        int d32b = (k16 * 16 + tig * 2 + 8) / 2;
+                        b0 = ((int *)k_sh)[(size_t)ki * (head_dim / 2) + d32];
+                        b1 = ((int *)k_sh)[(size_t)ki * (head_dim / 2) + d32b];
+                    }
+                    float d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIP__)
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                        : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+                        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
+                    int kk = ki8 + tig * 2;
+                    if (kk < tk)     ms[groupID * tile_k + kk]       += d0;
+                    if (kk + 1 < tk) ms[groupID * tile_k + kk + 1]   += d1;
+                    if (kk < tk)     ms[(groupID + 8) * tile_k + kk] += d2;
+                    if (kk + 1 < tk) ms[(groupID + 8) * tile_k + kk + 1] += d3;
+                }
+            }
+        }
+        __syncwarp();
+
+        /* ---- online softmax with O in registers ----
+         * Every lane handles DPL = head_dim/32 output dims for all 16 rows.
+         * That is 8 floats per row per lane at hd 256, and it keeps the V
+         * multiply independent of the softmax scan. */
+        for (int r = 0; r < FA3_ROWS; r++) {
+            int gq = q0 + r;
+            if (gq >= n_tokens) continue;
+            float m = row_max[r], s = row_sum[r];
+            for (int ti = 0; ti < tk; ti++) {
+                int gk = t0 + ti;
+                if (gk > start_pos + gq) continue;
+                if (n_swa > 0 && gk < start_pos + gq - n_swa + 1) continue;
+                float sc = ms[r * tile_k + ti] * scale;
+                float w, corr;
+                if (sc > m) { corr = expf(m - sc); w = 1.0f; s = s * corr + 1.0f; m = sc; }
+                else        { corr = 1.0f;          w = expf(sc - m); s += w; }
+                const __half *vr = v_sh + (size_t)ti * head_dim;
+                #pragma unroll
+                for (int d = 0; d < 8; d++) {
+                    int dim = lane + d * 32;
+                    if (dim < head_dim) {
+                        float v = gpu_fp16_to_fp32(vr[dim]);
+                        o_acc[r][d] = (w == 1.0f) ? fmaf(o_acc[r][d], corr, v)
+                                                  : fmaf(w, v, o_acc[r][d]);
+                    }
+                }
+            }
+            row_max[r] = m; row_sum[r] = s;
+        }
+        gpuSyncthreads();   /* K/V stage is overwritten next iteration */
+    }
+
+#ifdef PICOLM_FA3_DBG
+    if (q_tile == 0 && warp == 0 && lane == 0) {
+        printf("[FA3DBG] q0=%d ntok=%d sum0=%f max0=%f sc00=%f sc01=%f\n",
+               q0, n_tokens, row_sum[0], row_max[0], ms[0], ms[1]);
+    }
+#endif
+    /* ---- write out ---- */
+    for (int r = 0; r < FA3_ROWS; r++) {
+        int gq = q0 + r;
+        if (gq >= n_tokens) continue;
+        float inv = (row_sum[r] > 0.0f) ? (1.0f / row_sum[r]) : 0.0f;
+        float *xb = xb_out + (size_t)((size_t)gq * n_heads + q_h) * head_dim;
+        #pragma unroll
+        for (int d = 0; d < 8; d++) {
+            int dim = lane + d * 32;
+            if (dim < head_dim) xb[dim] = o_acc[r][d] * inv;
+        }
+    }
+}
+
 __global__ void
 picolm_gpu_attention_prefill_fa2_kernel(
     float *xb_out, const float *q_dev,
