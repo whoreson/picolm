@@ -216,6 +216,25 @@ static int q8mm_launch(q8mm_kind_t kind, gpu_device_ctx_t *ctx,
     case Q8MM_HMMA: {
         gpu_dispatch_print("matmul_hmma");
         dim3 grid((unsigned)((O + 63) / 64), (unsigned)((S + 127) / 128));
+        /* A short chunk (one 128-token tile) leaves O/64 blocks, too few
+         * for the card: split I across ~320 blocks, >= 16 Q8_0 blocks each.
+         * Cydonia-24B, 27 tokens: the matmuls ran at ~110 GB/s. */
+        int splits = 1;
+        const unsigned nb = grid.x * grid.y;
+        if (nb < 320) {
+            splits = (int)((320 + nb - 1) / nb);
+            if (splits > I / 32 / 16) splits = I / 32 / 16;
+            if (splits < 1) splits = 1;
+        }
+        if (splits > 1 && reserve(&ctx->splitk, &ctx->splitk_cap, (size_t)splits * S * O * sizeof(float))) {
+            grid.z = (unsigned)splits;
+            picolm_q8_q8_matmul_hmma<<<grid, 128, 0, ctx->stream>>>(
+                ctx->splitk, xq, xd, t->weights, S, I, O, row_bytes, O);
+            const size_t n = (size_t)S * O;
+            picolm_splitk_reduce<<<(unsigned)((n + 255) / 256 < 1024 ? (n + 255) / 256 : 1024), 256, 0, ctx->stream>>>(
+                y, ctx->splitk, splits, S, O, ys);
+            break;
+        }
         picolm_q8_q8_matmul_hmma<<<grid, 128, 0, ctx->stream>>>(
             y, xq, xd, t->weights, S, I, O, row_bytes, ys);
         break;

@@ -1728,6 +1728,15 @@ picolm_q8_q8_matmul_hmma(float *y, const int8_t *xq, const float *xd,
     int o0 = gpuBlockIdx_x * Q8H_TO, s0 = gpuBlockIdx_y * Q8H_TS;
     int ys = y_stride > 0 ? y_stride : O;
     int n_blocks = I / 32;
+    /* gridDim.z > 1: split-K. Block z covers Q8_0 blocks [b_lo, b_hi) and
+     * writes its partial sums at y + z * S * ys; picolm_splitk_reduce adds
+     * them up. A short chunk has one token tile, so only O/64 blocks -- 16
+     * for a 1024-row K/V -- each walking all of I serially. */
+    const int per = ((n_blocks + (int)gpuGridDim_z - 1) / (int)gpuGridDim_z + Q8H_KB - 1) / Q8H_KB * Q8H_KB;
+    const int b_lo = (int)gpuBlockIdx_z * per;
+    const int b_hi = b_lo + per < n_blocks ? b_lo + per : n_blocks;
+    y += (size_t)gpuBlockIdx_z * (size_t)S * ys;
+    const int ts_used = S - s0 >= Q8H_TS ? Q8H_TS : (S - s0 + 31) / 32 * 32;
 
     int qp = (lane >> 2) & 3;
     int r = (lane & 3) + 4 * (lane >> 4);                 /* A row / B col */
@@ -1748,15 +1757,17 @@ picolm_q8_q8_matmul_hmma(float *y, const int8_t *xq, const float *xd,
         for (int h = 0; h < Q8H_WH; h++)
             for (int j = 0; j < 8; j++) sum[g][h][j] = 0.0f;
 
-    for (int b0 = 0; b0 < n_blocks; b0 += Q8H_KB) {
-        /* Stage: one thread per (row or token, block); 2 x 256 units. */
-        for (int it = tid; it < (Q8H_TO + Q8H_TS) * Q8H_KB; it += Q8H_THREADS) {
+    for (int b0 = b_lo; b0 < b_hi; b0 += Q8H_KB) {
+        /* Stage: one thread per (row or token, block); 2 x 256 units. Only
+         * the tokens a working warp reads (up to the next 32 past S): the
+         * rest of a short chunk's tile is never touched. */
+        for (int it = tid; it < (Q8H_TO + ts_used) * Q8H_KB; it += Q8H_THREADS) {
             int kb = it % Q8H_KB, rr = it / Q8H_KB, bi = b0 + kb;
             uint32_t q[8];
             float d = 0.0f;
             if (rr < Q8H_TO) {
                 int o = o0 + rr;
-                if (o < O && bi < n_blocks) {
+                if (o < O && bi < b_hi) {
                     const uint16_t *p = (const uint16_t *)((const uint8_t *)weights
                         + (size_t)o * row_bytes + (size_t)bi * GPU_BLOCK_Q8_0_SIZE);
                     d = gpu_fp16_to_fp32(p[0]);
@@ -1766,7 +1777,7 @@ picolm_q8_q8_matmul_hmma(float *y, const int8_t *xq, const float *xd,
                 for (int i = 0; i < 8; i++) q8h_cvt4((__half2 *)&w_sh[rr][kb * 32 + 4 * i], q[i]);
             } else {
                 int ls = rr - Q8H_TO, s = s0 + ls;
-                if (s < S && bi < n_blocks) {
+                if (s < S && bi < b_hi) {
                     const int4 *p = (const int4 *)(xq + (size_t)s * I + (size_t)bi * 32);
                     ((int4 *)q)[0] = p[0]; ((int4 *)q)[1] = p[1];
                     d = xd[(size_t)s * n_blocks + bi];
@@ -1777,6 +1788,10 @@ picolm_q8_q8_matmul_hmma(float *y, const int8_t *xq, const float *xd,
         }
         gpuSyncthreads();
 
+        /* A warp whose tokens are all past S (a short chunk, e.g. a chat
+         * turn of a few dozen tokens in this 128-token tile) has only zero
+         * padding to multiply: skip it. Warp-uniform, so no divergence. */
+        if (s0 + wc < S)
         for (int kb = 0; kb < Q8H_KB; kb++) {
             float acc[Q8H_WG][Q8H_WH][8];
             for (int g = 0; g < Q8H_WG; g++)
@@ -1821,6 +1836,19 @@ picolm_q8_q8_matmul_hmma(float *y, const int8_t *xq, const float *xd,
                 int o = o0 + drow[g][(j >> 1) & 1], s = s0 + dcol[h][(j & 1) | (j >> 2) << 1];
                 if (o < O && s < S) y[(size_t)s * ys + o] = sum[g][h][j];
             }
+}
+
+/* y[s*ys + o] = sum over the splits of part[z][s][o], in split order
+ * (deterministic, unlike atomics). */
+__global__ void
+picolm_splitk_reduce(float *y, const float *part, int splits, int S, int O, int ys) {
+    const size_t n = (size_t)S * O;
+    for (size_t i = gpuBlockIdx_x * (size_t)gpuBlockDim_x + gpuThreadIdx_x; i < n;
+         i += (size_t)gpuGridDim_x * gpuBlockDim_x) {
+        float v = 0.0f;
+        for (int z = 0; z < splits; z++) v += part[(size_t)z * n + i];
+        y[(i / O) * ys + i % O] = v;
+    }
 }
 
 /* ---- FP16 tiled matmul kernel ----
@@ -5683,25 +5711,29 @@ picolm_gpu_attention_decode_merge_kernel(
     float *global_max_sh = smem_f;         /* [kv_mul] */
     float *global_sum_sh = global_max_sh + kv_mul; /* [kv_mul] */
 
-    for (int g = tid; g < kv_mul; g += n_threads) {
+    /* Global max and sum per query head: one warp per head, lanes striding
+     * over the splits. With one thread per head walking all n_splits serially
+     * this merge took ~20 us per layer on a V100 whatever the context --
+     * ~0.8 ms of a Cydonia-24B decode token. (blockDim is a multiple of 32.) */
+    const int lane = tid & 31, n_warps = n_threads >> 5;
+    /* blockIdx.y / gridDim.y: the query heads of this KV head are split across
+     * blocks (the host launches kv_mul of them), so the output phase below
+     * is not 8 blocks walking all splits for every head. */
+    const int g0 = (int)gpuBlockIdx_y, gs = (int)gpuGridDim_y;
+    for (int g = g0 + gs * (tid >> 5); g < kv_mul; g += gs * n_warps) {
         float m = -1e30f;
-        for (int sp = 0; sp < n_splits; sp++) {
-            int idx = (kv_h * n_splits + sp) * kv_mul + g;
-            float v = partial_max[idx];
+        for (int sp = lane; sp < n_splits; sp += 32) {
+            float v = partial_max[(kv_h * n_splits + sp) * kv_mul + g];
             if (v > m) m = v;
         }
-        global_max_sh[g] = m;
-    }
-    gpuSyncthreads();
-
-    for (int g = tid; g < kv_mul; g += n_threads) {
-        float m = global_max_sh[g];
+        for (int off = 16; off > 0; off >>= 1) m = fmaxf(m, gpuShflXorSync(0xFFFFFFFFu, m, off));
         float s = 0.0f;
-        for (int sp = 0; sp < n_splits; sp++) {
+        for (int sp = lane; sp < n_splits; sp += 32) {
             int idx = (kv_h * n_splits + sp) * kv_mul + g;
             s += partial_sum[idx] * expf(partial_max[idx] - m);
         }
-        global_sum_sh[g] = s;
+        for (int off = 16; off > 0; off >>= 1) s += gpuShflXorSync(0xFFFFFFFFu, s, off);
+        if (lane == 0) { global_max_sh[g] = m; global_sum_sh[g] = s; }
     }
     gpuSyncthreads();
 
@@ -5716,7 +5748,7 @@ picolm_gpu_attention_decode_merge_kernel(
         static const int MERGE_W_MAX = 512;   /* == ATTN_DECODE_MAX_SPLITS */
         float *w_sh = smem_f + kv_mul * 2;      /* [kv_mul][min(n_splits,MAX)] */
         int nw = n_splits < MERGE_W_MAX ? n_splits : MERGE_W_MAX;
-        for (int g2 = 0; g2 < kv_mul; g2++) {
+        for (int g2 = g0; g2 < kv_mul; g2 += gs) {
             float m2 = global_max_sh[g2];
             for (int sp = tid; sp < nw; sp += n_threads) {
                 int idx = (kv_h * n_splits + sp) * kv_mul + g2;
@@ -5725,7 +5757,7 @@ picolm_gpu_attention_decode_merge_kernel(
         }
         gpuSyncthreads();
 
-        for (int g = 0; g < kv_mul; g++) {
+        for (int g = g0; g < kv_mul; g += gs) {
             float inv_sum = 1.0f / global_sum_sh[g];
             float *xbhg = xb_out + (size_t)(first_qh + g) * head_dim;
             for (int d = tid; d < head_dim; d += n_threads) {

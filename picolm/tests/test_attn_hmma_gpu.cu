@@ -60,6 +60,13 @@ int main(void) {
     f |= run(500, 129, 8, 8, 100);
     f |= run(0, 1900, 32, 8, 0);
     f |= run(0, 5500, 32, 8, 0);
+    /* short chunks: a chat turn on a long cached history, and a short prompt */
+    f |= run(2048, 5, 32, 8, 0);
+    f |= run(2048, 27, 32, 8, 0);
+    f |= run(6000, 33, 32, 8, 0);
+    f |= run(0, 5, 32, 8, 0);
+    f |= run(0, 27, 32, 8, 0);
+    f |= run(100, 2, 32, 8, 0);
     printf(f ? "FAILED\n" : "all ok\n");
     return f;
 }

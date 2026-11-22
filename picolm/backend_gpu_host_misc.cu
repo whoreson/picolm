@@ -805,14 +805,15 @@ attn_decode_dispatch(float *xb_dev, const float *q_dev,
     }
     int warp_kernel = attn_decode_warp_ok(head_dim, kv_mul, kv_type);
     if (warp_kernel) {
-        /* ~240 blocks fill the GPU; keep at least 16 keys per split.
+        /* ~384 blocks; keep at least 16 keys per split.
          *
-         * That 240 is a V100 (80 SM) figure measured by the author of this
-         * kernel, and it has not been re-derived on anything else. It only
-         * matters once this kernel is reachable on a wider device (it is F16-KV
-         * only), so whoever enables it elsewhere should re-measure rather than
-         * inherit the constant -- a 4090 has 128 SMs and would want ~384. */
-        n_splits = (240 + n_kv_heads - 1) / n_kv_heads;
+         * A V100 (80 SM) figure. It was 240 while the merge kernel cost grew
+         * with the split count; with the merge on one block per query head,
+         * a sweep at 8 KV heads gave 48 splits as the best (3k keys 36.3 ->
+         * 32.5 us, 6k keys 64.1 -> 52.3 us per layer, against 30). Not
+         * re-derived on anything else: whoever enables this kernel on a wider
+         * device (it is F16-KV only) should re-measure. */
+        n_splits = (384 + n_kv_heads - 1) / n_kv_heads;
         if (n_splits > (total_kv + 15) / 16) n_splits = (total_kv + 15) / 16;
         if (n_splits < 1) n_splits = 1;
     }
@@ -881,7 +882,7 @@ attn_decode_dispatch(float *xb_dev, const float *q_dev,
     gpu_dispatch_print("attn_decode_merge");
     int _ps_merge = picolm_gpu_prof_slot("attn_decode_merge");
     picolm_gpu_prof_begin(device);
-    dim3 grid_merge((unsigned)n_kv_heads, 1, 1);
+    dim3 grid_merge((unsigned)n_kv_heads, (unsigned)(n_heads / n_kv_heads), 1);   /* one block per query head */
     picolm_gpu_attention_decode_merge_kernel<<<grid_merge, 128, (unsigned)merge_shared, ctx->stream>>>(
         xb_dev, partial_max, partial_sum, partial_acc,
         n_heads, n_kv_heads, head_dim, n_splits);
@@ -1059,8 +1060,12 @@ ensure_attn_fa2_shared_mem(size_t bytes) {
 static int picolm_gpu_attn_hmma(const gpu_device_ctx_t *ctx, int n_tokens, int head_dim, int kv_type) {
     static int off = -1;
     if (off < 0) off = getenv("PICOLM_NO_ATTN_HMMA") || getenv("PICOLM_FORCE_SCALAR_ATTN");
-    /* kv_type 0 == F16; the HMMA prefill kernel has no quantised-KV read path. */
-    return !off && ctx->has_hmma && n_tokens >= 64 && head_dim == 128 && kv_type == 0;
+    /* kv_type 0 == F16; the HMMA prefill kernel has no quantised-KV read path.
+     * Any n_tokens > 1: it was >= 64, which sent every chat turn (a few dozen
+     * new tokens on a long cached history) to the scalar warpgrp kernel --
+     * 8.8 ms per layer for 27 tokens at position 2048 on Cydonia-24B, against
+     * 0.38 for this one (make test-attn-hmma-gpu has those shapes). */
+    return !off && ctx->has_hmma && n_tokens >= 2 && head_dim == 128 && kv_type == 0;
 }
 
 static size_t
