@@ -148,6 +148,7 @@ typedef hipEvent_t gpuEvent_t;
 #define gpuBlockDim_z hipBlockDim_z
 #define gpuGridDim_x hipGridDim_x
 #define gpuGridDim_y hipGridDim_y
+#define gpuGridDim_z hipGridDim_z
 #define gpuHostRegister hipHostRegister
 #define gpuHostUnregister hipHostUnregister
 #define gpuMallocManaged hipMallocManaged
@@ -220,6 +221,7 @@ static inline cudaError_t picolm_cudaMemcpy2D(void *dst, size_t dpitch,
 #define gpuBlockDim_z blockDim.z
 #define gpuGridDim_x gridDim.x
 #define gpuGridDim_y gridDim.y
+#define gpuGridDim_z gridDim.z
 #define gpuDeviceSynchronize cudaDeviceSynchronize
 #define gpuShflSync __shfl_sync
 #define gpuShflUpSync __shfl_up_sync
@@ -417,6 +419,8 @@ typedef struct {
      * d[(S)*(I/256)], and this holds bsums[(S)*(I/256)][16]. Separate from the
      * Q8_0 scratch above because the block sizes differ (256 vs 32 values). */
     int16_t *q8_k_bsums; size_t q8_k_bsums_cap;
+    /* Split-K partial sums of a short-chunk matmul: [splits][S][O]. */
+    float *splitk; size_t splitk_cap;
     gpuStream_t stream;
     size_t tensor_count, tensor_bytes;
     float *pipe_x, *pipe_xb, *pipe_q, *pipe_k, *pipe_v,
