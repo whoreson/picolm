@@ -5711,25 +5711,29 @@ picolm_gpu_attention_decode_merge_kernel(
     float *global_max_sh = smem_f;         /* [kv_mul] */
     float *global_sum_sh = global_max_sh + kv_mul; /* [kv_mul] */
 
-    for (int g = tid; g < kv_mul; g += n_threads) {
+    /* Global max and sum per query head: one warp per head, lanes striding
+     * over the splits. With one thread per head walking all n_splits serially
+     * this merge took ~20 us per layer on a V100 whatever the context --
+     * ~0.8 ms of a Cydonia-24B decode token. (blockDim is a multiple of 32.) */
+    const int lane = tid & 31, n_warps = n_threads >> 5;
+    /* blockIdx.y / gridDim.y: the query heads of this KV head are split across
+     * blocks (the host launches kv_mul of them), so the output phase below
+     * is not 8 blocks walking all splits for every head. */
+    const int g0 = (int)gpuBlockIdx_y, gs = (int)gpuGridDim_y;
+    for (int g = g0 + gs * (tid >> 5); g < kv_mul; g += gs * n_warps) {
         float m = -1e30f;
-        for (int sp = 0; sp < n_splits; sp++) {
-            int idx = (kv_h * n_splits + sp) * kv_mul + g;
-            float v = partial_max[idx];
+        for (int sp = lane; sp < n_splits; sp += 32) {
+            float v = partial_max[(kv_h * n_splits + sp) * kv_mul + g];
             if (v > m) m = v;
         }
-        global_max_sh[g] = m;
-    }
-    gpuSyncthreads();
-
-    for (int g = tid; g < kv_mul; g += n_threads) {
-        float m = global_max_sh[g];
+        for (int off = 16; off > 0; off >>= 1) m = fmaxf(m, gpuShflXorSync(0xFFFFFFFFu, m, off));
         float s = 0.0f;
-        for (int sp = 0; sp < n_splits; sp++) {
+        for (int sp = lane; sp < n_splits; sp += 32) {
             int idx = (kv_h * n_splits + sp) * kv_mul + g;
             s += partial_sum[idx] * expf(partial_max[idx] - m);
         }
-        global_sum_sh[g] = s;
+        for (int off = 16; off > 0; off >>= 1) s += gpuShflXorSync(0xFFFFFFFFu, s, off);
+        if (lane == 0) { global_max_sh[g] = m; global_sum_sh[g] = s; }
     }
     gpuSyncthreads();
 
@@ -5744,7 +5748,7 @@ picolm_gpu_attention_decode_merge_kernel(
         static const int MERGE_W_MAX = 512;   /* == ATTN_DECODE_MAX_SPLITS */
         float *w_sh = smem_f + kv_mul * 2;      /* [kv_mul][min(n_splits,MAX)] */
         int nw = n_splits < MERGE_W_MAX ? n_splits : MERGE_W_MAX;
-        for (int g2 = 0; g2 < kv_mul; g2++) {
+        for (int g2 = g0; g2 < kv_mul; g2 += gs) {
             float m2 = global_max_sh[g2];
             for (int sp = tid; sp < nw; sp += n_threads) {
                 int idx = (kv_h * n_splits + sp) * kv_mul + g2;
@@ -5753,7 +5757,7 @@ picolm_gpu_attention_decode_merge_kernel(
         }
         gpuSyncthreads();
 
-        for (int g = 0; g < kv_mul; g++) {
+        for (int g = g0; g < kv_mul; g += gs) {
             float inv_sum = 1.0f / global_sum_sh[g];
             float *xbhg = xb_out + (size_t)(first_qh + g) * head_dim;
             for (int d = tid; d < head_dim; d += n_threads) {

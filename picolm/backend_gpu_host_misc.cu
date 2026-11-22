@@ -881,7 +881,7 @@ attn_decode_dispatch(float *xb_dev, const float *q_dev,
     gpu_dispatch_print("attn_decode_merge");
     int _ps_merge = picolm_gpu_prof_slot("attn_decode_merge");
     picolm_gpu_prof_begin(device);
-    dim3 grid_merge((unsigned)n_kv_heads, 1, 1);
+    dim3 grid_merge((unsigned)n_kv_heads, (unsigned)(n_heads / n_kv_heads), 1);   /* one block per query head */
     picolm_gpu_attention_decode_merge_kernel<<<grid_merge, 128, (unsigned)merge_shared, ctx->stream>>>(
         xb_dev, partial_max, partial_sum, partial_acc,
         n_heads, n_kv_heads, head_dim, n_splits);

@@ -41,7 +41,7 @@ static int run(int pos, int n_heads, int n_kv, int D, int n_swa, int splits_new)
                 picolm_gpu_attention_decode_split_kernel<<<dim3(n_kv, ns), 256, sh>>>(pm, psum, pacc, dq, dk, dv, 0, pos, n_heads, n_kv, D, max_seq, pos_stride, head_stride, head_stride, ns, chunk, n_swa, 0);
             else
                 picolm_gpu_attention_decode_warp_launch(dim3(n_kv, ns), 0, pm, psum, pacc, dq, dk, dv, 0, pos, n_heads, n_kv, D, max_seq, pos_stride, head_stride, head_stride, ns, chunk, n_swa);
-            picolm_gpu_attention_decode_merge_kernel<<<n_kv, 128, msh>>>(dy, pm, psum, pacc, n_heads, n_kv, D, ns);
+            picolm_gpu_attention_decode_merge_kernel<<<dim3(n_kv, kv_mul), 128, msh>>>(dy, pm, psum, pacc, n_heads, n_kv, D, ns);
             cudaEventRecord(b); cudaEventSynchronize(b);
         }
         cudaEventElapsedTime(&ms[which], a, b);
