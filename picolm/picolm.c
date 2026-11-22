@@ -2401,6 +2401,23 @@ int main(int argc, char **argv) {
         for (start_pos = 0; start_pos < min_len; start_pos++) {
             if (prompt_tokens[start_pos] != cache_tokens[start_pos]) break;
         }
+        if (getenv("PICOLM_TAIL_DBG")) {
+            /* What does the CACHE think the end of the prompt is, and what does
+             * the prompt actually tokenize to? If these differ, the cached
+             * state belongs to a different prompt than the one being continued
+             * -- and every later token will be a continuation of the wrong text.
+             * "N/N tokens match" cannot detect that: it only compares the cache
+             * against itself. */
+            int cp_end = cache_pos < n_prompt ? cache_pos : n_prompt;
+            fprintf(stderr, "[tail] cache_pos=%d n_prompt=%d\n", cache_pos, n_prompt);
+            fprintf(stderr, "[tail] last 12 prompt tokens:");
+            for (int i = n_prompt - 12; i < n_prompt; i++)
+                if (i >= 0) fprintf(stderr, " %d", prompt_tokens[i]);
+            fprintf(stderr, "\n[tail] last 12 cached tokens:");
+            for (int i = cp_end - 12; i < cp_end; i++)
+                if (i >= 0) fprintf(stderr, " %d", cache_tokens[i]);
+            fprintf(stderr, "\n");
+        }
         if (getenv("PICOLM_CP_DBG")) {
             fprintf(stderr, "[cli] prefix match stops at %d (min_len=%d)\n", start_pos, min_len);
             int lo = start_pos - 3; if (lo < 0) lo = 0;

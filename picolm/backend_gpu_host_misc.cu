@@ -792,6 +792,17 @@ attn_decode_dispatch(float *xb_dev, const float *q_dev,
     int n_splits = (total_kv + ATTN_DECODE_TARGET_CHUNK - 1) / ATTN_DECODE_TARGET_CHUNK;
     if (n_splits > ATTN_DECODE_MAX_SPLITS) n_splits = ATTN_DECODE_MAX_SPLITS;
     if (n_splits < 1) n_splits = 1;
+    /* PICOLM_ATTN_DECODE_CPU=1: refuse the GPU decode attention entirely so
+     * the caller falls back to the CPU kernel. Everything else (matmuls, SSM,
+     * KV store/read) stays on the GPU. This is the switch that separates
+     * "our attention kernel disagrees with the CPU's" from "some other part
+     * of the forward pass disagrees", which is otherwise very hard to tell
+     * apart when the logits differ. */
+    {
+        static int no_gpu_attn = -1;
+        if (no_gpu_attn < 0) no_gpu_attn = getenv("PICOLM_ATTN_DECODE_CPU") ? 1 : 0;
+        if (no_gpu_attn) return 0;
+    }
     int warp_kernel = attn_decode_warp_ok(head_dim, kv_mul, kv_type);
     if (warp_kernel) {
         /* ~240 blocks fill the GPU; keep at least 16 keys per split.
@@ -1315,7 +1326,8 @@ attn_prefill_dev_impl(float *xb_out_dev, const float *q_dev,
             && (head_dim % 32) == 0) {
             size_t f3 = (size_t)2 * fa3_tk * head_dim * sizeof(uint16_t)
                       + (size_t)FA3_WARPS * FA3_ROWS * head_dim * sizeof(uint16_t)
-                      + (size_t)FA3_WARPS * FA3_ROWS * fa3_tk * sizeof(float);
+                      + (size_t)FA3_WARPS * FA3_ROWS * fa3_tk * sizeof(float)
+                      + (size_t)FA3_WARPS * FA3_ROWS * fa3_tk * sizeof(uint16_t);
             static size_t f3_ok_for = 0;
             if (f3 != f3_ok_for) {
                 if (!ensure_attn_fa3_shared_mem(f3)) { f3 = 0; }
