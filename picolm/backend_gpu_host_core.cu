@@ -891,7 +891,7 @@ void *picolm_gpu_upload_int(const int *host, size_t n, int device) {
 }
 
 extern "C"
-int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, int device) {
+static int matmul_host_impl(picolm_gpu_tensor_t *t, float *y, const float *x, int S, int device) {
     if (!t || !y || !x || S < 1) return 0;
     /* Minimum I for GPU to be worthwhile vs CPU kernel launch overhead.
      * Smaller tensors: kernel launch (~200us) dominates compute. */
@@ -1384,6 +1384,28 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
     /* Scratch buffers are in device memory. Explicit D2H copy needed. */
     if (!gpu_ok(gpuMemcpy(y, ctx->y, yb, gpuMemcpyDeviceToHost), "output download")) return 0;
     return 1;
+}
+
+/* Profiled wrapper for the HOST matmul path.
+ *
+ * The dev wrapper (matmul_dev_impl) has per-quant slots; this one had NONE, and
+ * prefill uses both. That is how q6_K's prefill cost became invisible while
+ * matmul_q6_imma_mt_dev was still running: the FFN down projection dispatches
+ * here, not through the dev path. Same slot names, so a quant type reports one
+ * line whichever path served it -- add "_host" only if the split is needed.
+ *
+ * NOTE the slot is taken with S as passed, so this uses the same decode/prefill
+ * split as matmul_dev_prof_slot(): S<=1 is decode and is already covered by the
+ * GEMV slots inside the branches, so only S>1 is timed here. */
+static int matmul_dev_prof_slot(const picolm_gpu_tensor_t *t, int S);
+
+extern "C" int
+picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, int device) {
+    int ps = (t && S > 1) ? matmul_dev_prof_slot(t, S) : -1;
+    if (ps >= 0) picolm_gpu_prof_begin(device);
+    int rc = matmul_host_impl(t, y, x, S, device);
+    if (ps >= 0) picolm_gpu_prof_end(ps);
+    return rc;
 }
 
 /* Device-native matmul: x_dev and y_dev are already device-resident

@@ -2735,7 +2735,7 @@ int picolm_gpu_ssm_chunked_recurrence_dev(const float *conv_dev, const float *al
  * printed at exit. Costs two event records per launch when enabled, nothing
  * when not.
  */
-#define PROF_MAX_SLOTS 16
+#define PROF_MAX_SLOTS 48
 #define PROF_MAX_EVENTS 262144
 
 typedef struct {
