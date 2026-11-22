@@ -805,14 +805,15 @@ attn_decode_dispatch(float *xb_dev, const float *q_dev,
     }
     int warp_kernel = attn_decode_warp_ok(head_dim, kv_mul, kv_type);
     if (warp_kernel) {
-        /* ~240 blocks fill the GPU; keep at least 16 keys per split.
+        /* ~384 blocks; keep at least 16 keys per split.
          *
-         * That 240 is a V100 (80 SM) figure measured by the author of this
-         * kernel, and it has not been re-derived on anything else. It only
-         * matters once this kernel is reachable on a wider device (it is F16-KV
-         * only), so whoever enables it elsewhere should re-measure rather than
-         * inherit the constant -- a 4090 has 128 SMs and would want ~384. */
-        n_splits = (240 + n_kv_heads - 1) / n_kv_heads;
+         * A V100 (80 SM) figure. It was 240 while the merge kernel cost grew
+         * with the split count; with the merge on one block per query head,
+         * a sweep at 8 KV heads gave 48 splits as the best (3k keys 36.3 ->
+         * 32.5 us, 6k keys 64.1 -> 52.3 us per layer, against 30). Not
+         * re-derived on anything else: whoever enables this kernel on a wider
+         * device (it is F16-KV only) should re-measure. */
+        n_splits = (384 + n_kv_heads - 1) / n_kv_heads;
         if (n_splits > (total_kv + 15) / 16) n_splits = (total_kv + 15) / 16;
         if (n_splits < 1) n_splits = 1;
     }
