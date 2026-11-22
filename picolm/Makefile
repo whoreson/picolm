@@ -543,6 +543,10 @@ test-attn-fa3-gpu: tests/test_attn_fa3_gpu.cu backend_gpu_kernels-cuda.o
 test-attn-decode-gpu: tests/test_attn_decode_gpu.cu backend_gpu_kernels-cuda.o
 	$(NVCC) $(CUDAFLAGS) $(CUDA_GENCODE) -DPICOLM_GPU=1 -o test_attn_decode_gpu $^ -I.
 
+# GPU check: Volta tensor-core IQ6_K GEMM against a CPU reference.
+test-iq6k-gemm-gpu: tests/test_iq6k_gemm_gpu.cu backend_gpu_kernels-cuda.o
+	$(NVCC) $(CUDAFLAGS) $(CUDA_GENCODE) -DPICOLM_GPU=1 -o test_iq6k_gemm_gpu $^ -I.
+
 .PHONY: cuda
 cuda: $(CUDA_OBJS) gpu-clean-objs
 	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) $(NATIVE_MARCH) $(call simd_defines_for,$(NATIVE_MARCH)) -DPICOLM_GPU=1 -DPICOLM_CUDA=1 -I$(CUDA_INC)" GPU_OBJS="$(CUDA_OBJS)" GPU_LIBS="-L$(CUDA_LIB) -lcudart -lstdc++ -Wl,-rpath,$(CUDA_LIB)"

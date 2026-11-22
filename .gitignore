@@ -70,3 +70,4 @@ check_iq_gemv
 picolm/test_q8_gemm_gpu
 picolm/test_attn_hmma_gpu
 picolm/test_attn_decode_gpu
+picolm/test_iq6k_gemm_gpu
