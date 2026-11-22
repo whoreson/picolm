@@ -2311,7 +2311,10 @@ int main(int argc, char **argv) {
                                         }
                                     }
                                     { int nc = 0; for (cli_checkpoint_t *c = cli_checkpoints; c; c = c->next) nc++;
-                                      fprintf(stderr, "[cli] Loaded %d SSM checkpoints from cache file\n", nc); }
+                                      fprintf(stderr, "[cli] Loaded %d SSM checkpoints from cache file\n", nc);
+                                      if (getenv("PICOLM_CP_DBG"))
+                                          for (cli_checkpoint_t *c = cli_checkpoints; c; c = c->next)
+                                              fprintf(stderr, "[cli]   cp n_tokens=%d\n", c->n_tokens); }
                                 }
                             }
                         }
@@ -2398,6 +2401,14 @@ int main(int argc, char **argv) {
         for (start_pos = 0; start_pos < min_len; start_pos++) {
             if (prompt_tokens[start_pos] != cache_tokens[start_pos]) break;
         }
+        if (getenv("PICOLM_CP_DBG")) {
+            fprintf(stderr, "[cli] prefix match stops at %d (min_len=%d)\n", start_pos, min_len);
+            int lo = start_pos - 3; if (lo < 0) lo = 0;
+            for (int i = lo; i < start_pos + 3 && i < min_len; i++)
+                fprintf(stderr, "[cli]   tok[%d] prompt=%d cache=%d %s\n",
+                        i, prompt_tokens[i], cache_tokens[i],
+                        prompt_tokens[i] == cache_tokens[i] ? "" : "<-- MISMATCH");
+        }
         /* For SSM models: the cached SSM state corresponds to position cache_pos.
          * If cache_pos > start_pos, the SSM state is from a point beyond where the
          * matching prefix ends, so we can't trust it.  Only use the cache when the
@@ -2413,6 +2424,7 @@ int main(int argc, char **argv) {
             /* SSM state in the file is from position cache_pos, but we need it at start_pos.
              * Try to restore a checkpoint at or before start_pos. */
             int cp_found = 0;
+            int start_pos_pre = start_pos;
             cli_checkpoint_t *best = NULL;
             for (cli_checkpoint_t *cp = cli_checkpoints; cp; cp = cp->next) {
                 if (cp->n_tokens <= start_pos) best = cp;
@@ -2423,8 +2435,19 @@ int main(int argc, char **argv) {
                 if (rd == cli_checkpoint_snapshot_size) {
                     start_pos = best->n_tokens;
                     cp_found = 1;
+                    /* Report the REAL match count. This used to print
+                     * n_prompt/n_prompt, so it could never say anything but
+                     * "fully cached" -- a partial match (70784/79407 here)
+                     * read as a complete one and the extra prefill that
+                     * followed looked like the cache itself was corrupt.
+                     * start_pos has already been moved back to the checkpoint
+                     * at this point, hence start_pos_pre. */
                     fprintf(stderr, "KV cache: %d/%d tokens match, restored SSM checkpoint at pos %d (%d new to prefill)\n",
-                            n_prompt, n_prompt, start_pos, n_prompt - start_pos);
+                            start_pos_pre, n_prompt, start_pos, n_prompt - start_pos);
+                    if (start_pos_pre < n_prompt)
+                        fprintf(stderr, "NOTE: prompt diverges from the cache at token %d; "
+                                "everything after it is re-prefilled even though it may match\n",
+                                start_pos_pre);
                 }
             }
             if (!cp_found) {
