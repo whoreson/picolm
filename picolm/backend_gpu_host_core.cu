@@ -107,6 +107,147 @@ static int picolm_gpu_q8_dp4a(gpu_device_ctx_t *ctx) {
     return cached && ctx && !ctx->has_imma;
 #endif
 }
+
+/* ================================================================
+ * Q8_0 matmul kernel selection -- ONE place, used by all three callers
+ * ================================================================
+ *
+ * The Q8_0 dispatch used to be written out three times:
+ *     picolm_gpu_matmul()  (host pointers, does its own H2D/D2H)
+ *     matmul_dev_impl()    (device pointers, no sync)
+ *     imma_dev_q8()        (device pointers already quantised, used by the
+ *                           fused QKV / gate-up paths)
+ * with subtly different thresholds, and they had already drifted:
+ *
+ *     path            smw16          tiled fallback gate
+ *     host            MISSING        S > 1
+ *     dev             S>=32&&O>=16   S >= Q8_TILE_S   <- different!
+ *     imma_dev_q8     S>=32&&O>=16   S >= Q8_TILE_S   <- different!
+ *
+ * The dev chains therefore sent every 2..31-row matmul to the SCALAR kernel
+ * that the host chain happily ran tiled. That is a silent slowdown on the
+ * hottest path in the backend, and exactly the class of bug the duplication
+ * invites.
+ *
+ * Now: q8mm_pick() decides, q8mm_launch() launches. The callers pass the same
+ * (xq, xd, weights, S, I, O, row_bytes, ys) they always had; only their
+ * own scratch-buffer names differ, which is why the launcher takes those
+ * directly rather than a ctx.
+ *
+ * Review concern #2 is also resolved here: picolm_gpu_q8_dp4a()'s
+ * "!ctx->has_imma" precondition is tested INSIDE q8mm_pick(), which runs
+ * before every branch, so reordering the chain can no longer silently
+ * dead-code the DP4A path.
+ */
+typedef enum {
+    Q8MM_GEMV = 0,      /* S==1 decode, warps cooperate on one row   */
+    Q8MM_SMW16,         /* shared-memory staged IMMA, 32x16 tiles    */
+    Q8MM_IMMA_W16,
+    Q8MM_IMMA,
+    Q8MM_HMMA,          /* Volta fp16 tensor cores                   */
+    Q8MM_DP4A,          /* Volta/Pascal int8 dot                     */
+    Q8MM_TILED,
+    Q8MM_SCALAR
+} q8mm_kind_t;
+
+/* Pick the kernel. `allow_gemv` is false for the host path, which uploads its
+ * activation panel once and always wants a tile kernel. */
+static q8mm_kind_t q8mm_pick(gpu_device_ctx_t *ctx, int S, int O,
+                             size_t row_bytes, int allow_gemv) {
+    if (allow_gemv && S == 1 && O >= 1 && !picolm_gpu_no_gemv())
+        return Q8MM_GEMV;
+
+#ifndef __HIP__
+    /* Shared-memory staged IMMA. Needs 544 B of dynamic shared memory and a
+     * full 32-row tile to be worth the setup. */
+    if (!picolm_gpu_no_sm_imma() && ctx->has_imma && !picolm_gpu_no_imma()
+        && S >= 32 && O >= 16)
+        return Q8MM_SMW16;
+#endif
+#if defined(PICOLM_IMMA_W16)
+    if (ctx->has_imma && !picolm_gpu_no_imma() && S >= 16 && O >= 16)
+        return Q8MM_IMMA_W16;
+#endif
+    if (ctx->has_imma && !picolm_gpu_no_imma() && S >= 1 && O >= 8)
+        return Q8MM_IMMA;
+    if (S > 1 && ctx->has_hmma && picolm_gpu_q8_hmma())
+        return Q8MM_HMMA;
+    if (S > 1 && picolm_gpu_q8_dp4a(ctx))
+        return Q8MM_DP4A;
+    /* S > 1, not S >= Q8_TILE_S: the tiled kernel handles short batches fine
+     * and the scalar kernel is much slower. This is the threshold the host
+     * chain always used; the dev chains were the ones that disagreed. */
+    if (S > 1 && row_bytes + 2048 <= 49152)
+        return Q8MM_TILED;
+    return Q8MM_SCALAR;
+}
+
+/* Launch the chosen kernel. Returns 0 if the launch itself failed, so the
+ * callers can fall through to what they did before. */
+static int q8mm_launch(q8mm_kind_t kind, gpu_device_ctx_t *ctx,
+                       float *y, const int8_t *xq, const float *xd,
+                       const picolm_gpu_tensor_t *t, int S, int I, int O,
+                       int row_bytes, int ys) {
+    switch (kind) {
+    case Q8MM_SMW16: {
+        gpu_dispatch_print("matmul_imma_smw16");
+        dim3 grid((unsigned)((O + 15) / 16), (unsigned)((S + 31) / 32));
+        int smem = 16 * GPU_BLOCK_Q8_0_SIZE;
+        picolm_q8_q8_matmul_imma_smw16<<<grid, 64, smem, ctx->stream>>>(
+            y, xq, xd, t->weights, S, I, O, row_bytes, ys);
+        break;
+    }
+#if defined(PICOLM_IMMA_W16)
+    case Q8MM_IMMA_W16: {
+        gpu_dispatch_print("matmul_imma_w16");
+        dim3 grid((unsigned)((O + 15) / 16), (unsigned)((S + 15) / 16));
+        picolm_q8_q8_matmul_imma_w16<<<grid, 32, 0, ctx->stream>>>(
+            y, xq, xd, t->weights, S, I, O, row_bytes, ys);
+        break;
+    }
+#endif
+    case Q8MM_IMMA: {
+        gpu_dispatch_print("matmul_imma");
+        dim3 grid((unsigned)((O + 7) / 8), (unsigned)((S + 15) / 16));
+        picolm_q8_q8_matmul_imma<<<grid, 32, 0, ctx->stream>>>(
+            y, xq, xd, t->weights, S, I, O, row_bytes, ys);
+        break;
+    }
+    case Q8MM_HMMA: {
+        gpu_dispatch_print("matmul_hmma");
+        dim3 grid((unsigned)((O + 63) / 64), (unsigned)((S + 127) / 128));
+        picolm_q8_q8_matmul_hmma<<<grid, 128, 0, ctx->stream>>>(
+            y, xq, xd, t->weights, S, I, O, row_bytes, ys);
+        break;
+    }
+    case Q8MM_DP4A: {
+        gpu_dispatch_print("matmul_dp4a");
+        dim3 grid((unsigned)((O + 7) / 8), (unsigned)((S + 7) / 8));
+        picolm_q8_q8_matmul_dp4a<<<grid, 256, 0, ctx->stream>>>(
+            y, xq, xd, t->weights, S, I, O, row_bytes, ys);
+        break;
+    }
+    case Q8MM_TILED: {
+        gpu_dispatch_print("matmul_tiled");
+        dim3 grid((unsigned)O, (unsigned)((S + Q8_TILE_S - 1) / Q8_TILE_S));
+        picolm_q8_q8_matmul_tiled<<<grid, 256, (unsigned)row_bytes, ctx->stream>>>(
+            y, xq, xd, t->weights, S, I, O, row_bytes, ys);
+        break;
+    }
+    case Q8MM_SCALAR: {
+        gpu_dispatch_print("matmul_scalar");
+        dim3 grid((unsigned)O, (unsigned)S);
+        picolm_q8_q8_matmul<<<grid, 256, 0, ctx->stream>>>(
+            y, xq, xd, t->weights, S, I, O, row_bytes, ys);
+        break;
+    }
+    case Q8MM_GEMV:
+    default:
+        return 0;   /* callers handle GEMV themselves (needs its own args) */
+    }
+    return gpu_ok(gpuGetLastError(), "q8 matmul launch");
+}
+
 static int picolm_gpu_force_f32(void) {
     static int cached = -1;
     if (cached < 0) cached = picolm_gpu_env_flag("PICOLM_FORCE_F32_MATMUL");
@@ -957,40 +1098,12 @@ static int matmul_host_impl(picolm_gpu_tensor_t *t, float *y, const float *x, in
         if (!gpu_ok(gpuGetLastError(), "q8 quantize") ||
             !gpu_ok(gpuDeviceSynchronize(), "q8 quantize sync")) return 0;
 
-        #if defined(PICOLM_IMMA_W16)
-        if (ctx->has_imma && !picolm_gpu_no_imma() && S >= 16 && O >= 16) {
-            gpu_dispatch_print("matmul_imma_w16_host");
-            dim3 grid((unsigned)((O + 15) / 16), (unsigned)((S + 15) / 16));
-            picolm_q8_q8_matmul_imma_w16<<<grid, 32, 0, ctx->stream>>>(
-                ctx->y, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, O);
-        } else
-#endif
-        if (ctx->has_imma && !picolm_gpu_no_imma() && S >= 1 && O >= 8) {
-            gpu_dispatch_print("matmul_imma_host");
-            dim3 grid((unsigned)((O + 7) / 8), (unsigned)((S + 15) / 16));
-            picolm_q8_q8_matmul_imma<<<grid, 32, 0, ctx->stream>>>(
-                ctx->y, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, O);
-        } else if (S > 1 && ctx->has_hmma && picolm_gpu_q8_hmma()) {
-            gpu_dispatch_print("matmul_hmma_host");
-            dim3 grid((unsigned)((O + 63) / 64), (unsigned)((S + 127) / 128));
-            picolm_q8_q8_matmul_hmma<<<grid, 128, 0, ctx->stream>>>(
-                ctx->y, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, O);
-        } else if (S > 1 && picolm_gpu_q8_dp4a(ctx)) {
-            gpu_dispatch_print("matmul_dp4a_host");
-            dim3 grid((unsigned)((O + 7) / 8), (unsigned)((S + 7) / 8));
-            picolm_q8_q8_matmul_dp4a<<<grid, 256, 0, ctx->stream>>>(
-                ctx->y, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, O);
-        } else if (S > 1 && t->row_bytes + 2048 <= 49152) {
-            gpu_dispatch_print("matmul_tiled_host");
-            dim3 grid((unsigned)O, (unsigned)((S + Q8_TILE_S - 1) / Q8_TILE_S));
-            picolm_q8_q8_matmul_tiled<<<grid, 256, (unsigned)t->row_bytes, ctx->stream>>>(
-                ctx->y, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, O);
-        } else {
-            gpu_dispatch_print("matmul_scalar_host");
-            dim3 grid((unsigned)O, (unsigned)S);
-            picolm_q8_q8_matmul<<<grid, 256, 0, ctx->stream>>>(
-                ctx->y, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, O);
-        }
+        /* One selector for all three chains -- see q8mm_pick(). The host path
+         * never uses the GEMV (it uploads a full activation panel), and it now
+         * gets the smw16 kernel it was previously missing. */
+        if (!q8mm_launch(q8mm_pick(ctx, S, O, t->row_bytes, 0), ctx,
+                         ctx->y, ctx->q8_xq, ctx->q8_xd, t, S, I, O,
+                         (int)t->row_bytes, O)) return 0;
         if (!gpu_ok(gpuGetLastError(), "q8 matmul") ||
             !gpu_ok(gpuDeviceSynchronize(), "q8 matmul sync")) return 0;
 
@@ -1602,52 +1715,11 @@ matmul_dev_impl(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
             /* fall through to the tile paths if the GEMV launch failed */
         }
 
-        /* Phase 6 abandoned: Q8_0 34-byte blocks cause misaligned access. */
-        #ifndef __HIP__
-        /* Phase 8: shared-memory staged IMMA (32x16 tiles, 64 threads). */
-        if (!picolm_gpu_no_sm_imma() && ctx->has_imma && !picolm_gpu_no_imma() && S >= 32 && O >= 16) {
-            gpu_dispatch_print("matmul_imma_smw16_dev");
-            dim3 grid((unsigned)((O + 15) / 16), (unsigned)((S + 31) / 32));
-            int smem = 16 * GPU_BLOCK_Q8_0_SIZE;
-            picolm_q8_q8_matmul_imma_smw16<<<grid, 64, smem, ctx->stream>>>(
-                y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, ys);
-            if (gpu_ok(gpuGetLastError(), "q8 smw16 matmul (dev)")) return 1;
-        }
-#endif
-#if defined(PICOLM_IMMA_W16)
-        if (ctx->has_imma && !picolm_gpu_no_imma() && S >= 16 && O >= 16) {
-            gpu_dispatch_print("matmul_imma_w16_dev");
-            dim3 grid((unsigned)((O + 15) / 16), (unsigned)((S + 15) / 16));
-            picolm_q8_q8_matmul_imma_w16<<<grid, 32, 0, ctx->stream>>>(
-                y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, ys);
-        } else
-#endif
-        if (ctx->has_imma && !picolm_gpu_no_imma() && S >= 1 && O >= 8) {
-            gpu_dispatch_print("matmul_imma_dev");
-            dim3 grid((unsigned)((O + 7) / 8), (unsigned)((S + 15) / 16));
-            picolm_q8_q8_matmul_imma<<<grid, 32, 0, ctx->stream>>>(
-                y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, ys);
-        } else if (S > 1 && ctx->has_hmma && picolm_gpu_q8_hmma()) {
-            gpu_dispatch_print("matmul_hmma_dev");
-            dim3 grid((unsigned)((O + 63) / 64), (unsigned)((S + 127) / 128));
-            picolm_q8_q8_matmul_hmma<<<grid, 128, 0, ctx->stream>>>(
-                y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, ys);
-        } else if (S > 1 && picolm_gpu_q8_dp4a(ctx)) {
-            gpu_dispatch_print("matmul_dp4a_dev");
-            dim3 grid((unsigned)((O + 7) / 8), (unsigned)((S + 7) / 8));
-            picolm_q8_q8_matmul_dp4a<<<grid, 256, 0, ctx->stream>>>(
-                y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, ys);
-        } else if (S >= Q8_TILE_S && t->row_bytes + 2048 <= 49152) {
-            gpu_dispatch_print("matmul_tiled_dev");
-            dim3 grid((unsigned)O, (unsigned)((S + Q8_TILE_S - 1) / Q8_TILE_S));
-            picolm_q8_q8_matmul_tiled<<<grid, 256, (unsigned)t->row_bytes, ctx->stream>>>(
-                y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, ys);
-        } else {
-            gpu_dispatch_print("matmul_scalar_dev");
-            dim3 grid((unsigned)O, (unsigned)S);
-            picolm_q8_q8_matmul<<<grid, 256, 0, ctx->stream>>>(
-                y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, ys);
-        }
+        /* Same selector as the host path. GEMV was already tried above, so
+         * allow_gemv=0 here; everything else is shared. */
+        if (!q8mm_launch(q8mm_pick(ctx, S, O, t->row_bytes, 0), ctx,
+                         y_dev, ctx->q8_xq, ctx->q8_xd, t, S, I, O,
+                         (int)t->row_bytes, ys)) return 0;
         if (!gpu_ok(gpuGetLastError(), "q8 matmul (dev)")) return 0;
         return 1;
     }
@@ -2336,54 +2408,8 @@ picolm_gpu_matmul_dev_strided(picolm_gpu_tensor_t *t, float *y_dev,
 static int imma_dev_q8(picolm_gpu_tensor_t *t, float *y_dev,
     const int8_t *xq, const float *xd, int S, int I, int O,
     int ys, gpu_device_ctx_t *ctx) {
-    /* Phase 6 abandoned: Q8_0 34-byte blocks cause misaligned access. */
-#ifndef __HIP__
-    /* Phase 8: try shared-memory staged IMMA W16 (32x16 tiles, 64 threads). */
-    if (!picolm_gpu_no_sm_imma() && ctx->has_imma && !picolm_gpu_no_imma() && S >= 32 && O >= 16) {
-        gpu_dispatch_print("matmul_imma_smw16_dev");
-        dim3 grid((unsigned)((O + 15) / 16), (unsigned)((S + 31) / 32));
-        int smem = 16 * GPU_BLOCK_Q8_0_SIZE; /* ~544 bytes */
-        picolm_q8_q8_matmul_imma_smw16<<<grid, 64, smem, ctx->stream>>>(
-            y_dev, xq, xd, t->weights, S, I, O, (int)t->row_bytes, ys);
-        if (gpu_ok(gpuGetLastError(), "q8 smw16 matmul (dev)")) return 1;
-        /* Fall through to regular IMMA on error. */
-    }
-#endif
-#if defined(PICOLM_IMMA_W16)
-    if (ctx->has_imma && !picolm_gpu_no_imma() && S >= 16 && O >= 16) {
-        gpu_dispatch_print("matmul_imma_w16_dev");
-        dim3 grid((unsigned)((O + 15) / 16), (unsigned)((S + 15) / 16));
-        picolm_q8_q8_matmul_imma_w16<<<grid, 32, 0, ctx->stream>>>(
-            y_dev, xq, xd, t->weights, S, I, O, (int)t->row_bytes, ys);
-    } else
-#endif
-    if (ctx->has_imma && !picolm_gpu_no_imma() && S >= 1 && O >= 8) {
-        gpu_dispatch_print("matmul_imma_dev");
-        dim3 grid((unsigned)((O + 7) / 8), (unsigned)((S + 15) / 16));
-        picolm_q8_q8_matmul_imma<<<grid, 32, 0, ctx->stream>>>(
-            y_dev, xq, xd, t->weights, S, I, O, (int)t->row_bytes, ys);
-    } else if (S > 1 && ctx->has_hmma && picolm_gpu_q8_hmma()) {
-        gpu_dispatch_print("matmul_hmma_dev");
-        dim3 grid((unsigned)((O + 63) / 64), (unsigned)((S + 127) / 128));
-        picolm_q8_q8_matmul_hmma<<<grid, 128, 0, ctx->stream>>>(
-            y_dev, xq, xd, t->weights, S, I, O, (int)t->row_bytes, ys);
-    } else if (S > 1 && picolm_gpu_q8_dp4a(ctx)) {
-        gpu_dispatch_print("matmul_dp4a_dev");
-        dim3 grid((unsigned)((O + 7) / 8), (unsigned)((S + 7) / 8));
-        picolm_q8_q8_matmul_dp4a<<<grid, 256, 0, ctx->stream>>>(
-            y_dev, xq, xd, t->weights, S, I, O, (int)t->row_bytes, ys);
-    } else if (S >= Q8_TILE_S && t->row_bytes + 2048 <= 49152) {
-        gpu_dispatch_print("matmul_tiled_dev");
-        dim3 grid((unsigned)O, (unsigned)((S + Q8_TILE_S - 1) / Q8_TILE_S));
-        picolm_q8_q8_matmul_tiled<<<grid, 256, (unsigned)t->row_bytes, ctx->stream>>>(
-            y_dev, xq, xd, t->weights, S, I, O, (int)t->row_bytes, ys);
-    } else {
-        gpu_dispatch_print("matmul_scalar_dev");
-        dim3 grid((unsigned)O, (unsigned)S);
-        picolm_q8_q8_matmul<<<grid, 256, 0, ctx->stream>>>(
-            y_dev, xq, xd, t->weights, S, I, O, (int)t->row_bytes, ys);
-    }
-    return gpu_ok(gpuGetLastError(), "q8 matmul (dev)");
+    return q8mm_launch(q8mm_pick(ctx, S, O, t->row_bytes, 0), ctx,
+                       y_dev, xq, xd, t, S, I, O, (int)t->row_bytes, ys);
 }
 
 extern "C"
