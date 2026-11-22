@@ -2102,6 +2102,13 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                      * Spark support; the weights are still uploaded so that work
                      * can start from a warm cache. */
                     if (c->is_spark25) { eligible = 0; el_reason = 9; }
+                    /* GLM-5 / GLM-5.3-Flash (glm5next) has its own CPU forward
+                     * (model_glm5.c): hyper-connection streams, KDA and MLA
+                     * layers. model_forward_gpu() knows none of that, so with
+                     * PICOLM_GPU=1 it ran the llama pipeline over a glm5 model
+                     * and emitted garbage (tiny-model check: 1 token vs the CPU
+                     * path's 13). Veto it like Spark. */
+                    if (c->is_glm5) { eligible = 0; el_reason = 12; }
                     /* PICOLM_NGL with a partial layer count is NOT supported by
                      * the GPU pipeline. n_gpu_layers only limits how many layers
                      * get uploaded; model_forward_gpu()/_prefill_gpu_ubatch()
@@ -2457,6 +2464,7 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                         const char *reason = "unknown";
                         if (el_reason == 1) reason = "unsupported rope_type";
                         else if (el_reason == 2) reason = "KV cache not F16 (GPU attention requires F16 std430)";
+                        else if (el_reason == 12) reason = "GLM-5 (glm5next) is not implemented by the GPU decode pipeline";
                         else if (el_reason == 9) reason = "Spark-X2.5 not implemented by the GPU decode pipeline "
                                                         "(no head-wise attn gate / per-layer SWA rope dim)";
                         else if (el_reason == 11) reason = "PICOLM_NGL is a partial layer count and the GPU "
