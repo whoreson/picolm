@@ -98,6 +98,8 @@ picolm_gpu_kv_cache_clear(int device) {
         gpuMemset(g_kv_v_dev[device], 0, g_kv_v_cap[device]);
 }
 
+
+
 extern "C" void
 picolm_gpu_kv_free(void) {
     for (int i = 0; i < PICOLM_GPU_MAX_DEVICES; i++) {
@@ -1183,7 +1185,7 @@ picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
                 xb_out_dev, q_dev,
                 g_kv_k_dev[device], g_kv_v_dev[device],
                 layer_ordinal, start_pos, n_tokens, n_heads, n_kv_heads, head_dim, max_seq_len,
-                kv_pos_stride_bytes, kv_head_stride_bytes, tile_q, n_swa);
+                kv_pos_stride_bytes, kv_head_stride_bytes, kv_head_stride_v_bytes, tile_q, n_swa, kv_type);
             if (!gpu_ok(gpuGetLastError(), "attn prefill warpgrp dot2 (dev)")) return 0;
             return 1;
         }

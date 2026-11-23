@@ -58,6 +58,13 @@ typedef struct {
                             digit grouping; see qwen_tokenize.c QWEN_PRETOK_GLM4). */
     int is_glm5;        /* 1 if model architecture is glm5next / glm5-next */
     int is_spark25;     /* 1 if model architecture is spark2_5 */
+    int is_granite;     /* 1 if model architecture is granite (IBM Granite 4.x) */
+    int is_mistral3;    /* 1 if model architecture is mistral3 (Mistral/Ministral 3) */
+    /* Model-specified scaling factors (Granite 4.x stores these explicitly).
+     * 0.0 / 1.0f = default (no scaling). Applied in model_forward_range(). */
+    float attn_score_scale; /* attention-logit scale; 0 = 1/sqrt(head_dim) */
+    float embd_scale;       /* embedding output scale (default 1.0) */
+    float logit_scale;      /* final logits scale (default 1.0) */
     int rope_dim_swa;   /* RoPE dim for SWA layers (0=inherit rope_dim) */
     int max_seq_len;    /* maximum sequence length (e.g. 2048) */
     int head_dim;       /* = n_embd / n_heads */
