@@ -51,6 +51,16 @@ void grammar_init(grammar_state_t *g, grammar_mode_t mode,
 
     if (mode == GRAMMAR_NONE) return;
 
+    /* The native Qwen BPE tokenizer keeps its vocabulary in qwen_enc_t, not
+     * in tokenizer_t::vocab, so tok->vocab is NULL for those models. The
+     * brace-counting JSON mode has always needed tokenizer_t; degrade to no
+     * constraining rather than dereferencing NULL. */
+    if (!tok->vocab) {
+        fprintf(stderr, "WARN: --json needs a tokenizer with a vocab table "
+                        "(not available for this tokenizer); JSON mode disabled\n");
+        g->mode = GRAMMAR_NONE;
+        return;
+    }
     int vs = tok->vocab_size;
     g->token_brace_delta    = (int8_t *)calloc((size_t)vs, sizeof(int8_t));
     g->token_bracket_delta  = (int8_t *)calloc((size_t)vs, sizeof(int8_t));

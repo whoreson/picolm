@@ -123,7 +123,7 @@ endif
 # model.c has been split into modular files
 MODEL_SRCS = model_core.c model_recurrent_state.c model_attention.c model_moe.c model_gemma3n.c model_glm5.c model_sensenova.c model_ssm.c model_kv_cache.c model_gguf.c
 SGEMM_SRCS = sgemm.c sgemm_q0_neon_fast.c sgemm_q2_k_r4_neon.c sgemm_iq4nl_neon_fast.c sgemm_k_q8k_neon_fast.c sgemm_q2_k_neon.c sgemm_k_q8k_neon.c sgemm_q4_0x8.c sgemm_q4i_0x8.c sgemm_q4_0_r8.c sgemm_q8_0_r8.c sgemm_q8_k_r8.c sgemm_q8_k_r8_neon.c sgemm_iq2_k.c sgemm_iq2_k_r4.c sgemm_iq3_k.c sgemm_iq3_k_r4.c sgemm_iq4_k.c sgemm_iq4_nl_r4.c sgemm_q4_k_r4.c sgemm_q6_k_r4.c sgemm_iq6_k.c sgemm_iq4_xs.c
-SRCS    = picolm.c $(MODEL_SRCS) steer.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) tokenizer.c qwen_tokenize.c sampler.c grammar.c cJSON.c server.c csafetensors.c json.c safetensors.c
+SRCS    = picolm.c $(MODEL_SRCS) steer.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) tokenizer.c qwen_tokenize.c sampler.c grammar.c gbnf.c cJSON.c server.c csafetensors.c json.c safetensors.c
 OBJS    = $(SRCS:.c=.o)
 TARGET  = picolm
 
@@ -313,6 +313,7 @@ sgemm.o:  sgemm.c  sgemm.h quant.h
 tokenizer.o: tokenizer.c tokenizer.h
 sampler.o: sampler.c sampler.h
 grammar.o: grammar.c grammar.h
+gbnf.o:   gbnf.c   gbnf.h
 
 # --- Static build for single-binary deployment ---
 # Uses SSE2 (not -march=native) so the binary runs on any x86-64, not just the build machine.

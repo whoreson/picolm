@@ -4,6 +4,7 @@
 #include "steer.h"
 #include "sampler.h"
 #include "grammar.h"
+#include "gbnf.h"
 #include "qwen_tokenize.h"
 #include "picolm_server.h"
 #ifdef PICOLM_VIZ
@@ -354,6 +355,8 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --slot-save-path <dir>  Directory for /slots save/restore files\n");
     fprintf(stderr, "\nAdvanced options:\n");
     fprintf(stderr, "  --json         Grammar-constrained JSON output mode\n");
+    fprintf(stderr, "  --grammar <f>  GBNF grammar file; output is constrained to it\n");
+    fprintf(stderr, "  --grammar-root <rule>  Start rule for --grammar (default: root)\n");
     fprintf(stderr, "  --cache <file> KV cache file (saves/loads prompt state)\n");
     fprintf(stderr, "  -ctk <type>    Key cache type: f16, q8_0, q4_0, tq3, tq4 (default: f16)\n");
     fprintf(stderr, "  -ctv <type>    Val cache type: f16, q8_0, q4_0, tq3, tq4 (default: f16)\n");
@@ -1519,6 +1522,8 @@ int main(int argc, char **argv) {
     int    context_override = 0;
     int    num_threads = 0; /* 0 = auto-detect from physical cores */
     int    json_mode = 0;
+    const char *grammar_file = NULL;   /* --grammar <file.gbnf> */
+    const char *grammar_root = NULL;   /* --grammar-root <rule> */
     int    benchmark_mode = 0;
     int    benchmark_live = 0;   /* --benchmark-live: per-layer timing during normal generation */
     const char *cache_file = NULL;
@@ -1666,6 +1671,10 @@ int main(int argc, char **argv) {
             server_host[sizeof(server_host) - 1] = '\0';
         } else if (strcmp(argv[i], "--json") == 0) {
             json_mode = 1;
+        } else if (strcmp(argv[i], "--grammar") == 0 && i + 1 < argc) {
+            grammar_file = argv[++i];
+        } else if (strcmp(argv[i], "--grammar-root") == 0 && i + 1 < argc) {
+            grammar_root = argv[++i];
         } else if (strcmp(argv[i], "--steer") == 0 && i + 1 < argc) {
             if (steer_add(argv[++i])) { fprintf(stderr, "ERROR: bad --steer spec '%s' (want LAYER:NEURON:DOSE, e.g. 14:8949:+1)\n", argv[i]); return 1; }
         } else if (strcmp(argv[i], "--steer-norm") == 0 && i + 1 < argc) {
@@ -2222,9 +2231,91 @@ int main(int argc, char **argv) {
 
     /* Init grammar constraint */
     grammar_state_t grammar;
-    grammar_init(&grammar, json_mode ? GRAMMAR_JSON : GRAMMAR_NONE, &tokenizer);
-    if (json_mode) {
+    grammar_init(&grammar, (json_mode && !grammar_file) ? GRAMMAR_JSON : GRAMMAR_NONE, &tokenizer);
+    if (json_mode && !grammar_file) {
         fprintf(stderr, "JSON grammar mode enabled\n");
+    }
+
+    /* GBNF grammar (--grammar). This is a real grammar engine, unlike the
+     * brace-counting GRAMMAR_JSON above; when a file is supplied it takes
+     * over entirely and --json is ignored. */
+    static gbnf_t gbnf;
+    int gbnf_active = 0;
+    char **gbnf_vocab = NULL;
+    if (grammar_file) {
+        char *text = NULL;
+        FILE *gf = fopen(grammar_file, "rb");
+        if (!gf) {
+            fprintf(stderr, "ERROR: cannot open grammar file '%s'\n", grammar_file);
+            return 1;
+        }
+        fseek(gf, 0, SEEK_END);
+        long glen = ftell(gf);
+        fseek(gf, 0, SEEK_SET);
+        if (glen > 0) {
+            text = (char *)malloc((size_t)glen + 1);
+            if (text && fread(text, 1, (size_t)glen, gf) != (size_t)glen) {
+                free(text);
+                text = NULL;
+            }
+            if (text) text[glen] = '\0';
+        }
+        fclose(gf);
+        if (!text) {
+            fprintf(stderr, "ERROR: cannot read grammar file '%s'\n", grammar_file);
+            return 1;
+        }
+
+        int root_id = gbnf_parse(&gbnf, text, grammar_root);
+        free(text);
+        if (root_id < 0) {
+            fprintf(stderr, "ERROR: failed to parse grammar '%s'\n", grammar_file);
+            return 1;
+        }
+
+        /* Build the token-string table the grammar matches against.
+         *
+         * This MUST be the text the model actually emits, not the raw vocab
+         * entry: a byte-level BPE vocab stores a leading space as U+0100
+         * ("\xc4\xa0", Qwen/SmolLM) or U+2581 ("\xe2\x96\x81",
+         * SentencePiece), and maps bytes through the GPT-2 byte<->code-point
+         * table. Feeding the raw entries to the grammar made every
+         * space-bearing token look like it started with U+0100, so a grammar
+         * that allows " " rejected all of them: the model produced
+         * "TheKeeperonceheld" with no spaces at all.
+         *
+         * The decode callbacks below are the same ones the print path uses,
+         * so what the grammar sees is exactly what the user will read. */
+        int vsz = model.config.vocab_size;
+        gbnf_vocab = (char **)calloc((size_t)vsz, sizeof(char *));
+        if (!gbnf_vocab) { fprintf(stderr, "ERROR: OOM for grammar vocab\n"); return 1; }
+        char dbuf[512];
+        for (int i = 0; i < vsz; i++) {
+            dbuf[0] = '\0';
+            if (use_qwen_tok) {
+                qwen_tokenize_decode2(&qwen_enc, i, dbuf, (int)sizeof(dbuf), 0);
+            } else if (tokenizer.vocab && i < tokenizer.vocab_size) {
+                /* tokenizer_decode() returns a pointer to an internal buffer;
+                 * copy it because the grammar keeps the strings. */
+                const char *d = tokenizer_decode(&tokenizer, -1, i);
+                if (d) snprintf(dbuf, sizeof(dbuf), "%s", d);
+            }
+            /* Special/control tokens decode to "" -- they are never emitted
+             * as text, so leave them empty (the grammar treats an empty token
+             * as always acceptable, which is what we want for EOS/BOS). */
+            gbnf_vocab[i] = strdup(dbuf);
+        }
+        gbnf_set_vocab(&gbnf, gbnf_vocab, vsz, (int)tokenizer.eos_id);
+        /* PICOLM_GBNF_PROF: time one refresh, so grammar cost is visible
+         * instead of showing up as mysterious CPU time. */
+        int nroots = gbnf_start(&gbnf);
+        gbnf_active = 1;
+        fprintf(stderr, "GBNF grammar loaded: %s (root '%s', %d rules, %d start states)\n",
+                grammar_file, grammar_root ? grammar_root : "root", gbnf.n_rules, nroots);
+        if (nroots == 0) {
+            fprintf(stderr, "WARN: grammar start rule matches the empty string only; "
+                            "every token will be masked. Check --grammar-root.\n");
+        }
     }
 
     /* Neuron steering: extract W_down columns, calibrate median residual norms on a clean
@@ -2772,11 +2863,13 @@ int main(int argc, char **argv) {
                 bench.is_prefill = 0;
                 int token = 0, next = 0;
                 for (int g = 0; g < bench_max_tokens; g++) {
-                    grammar_apply(&grammar, logits, model.config.vocab_size);
+                    if (gbnf_active) gbnf_apply(&gbnf, logits, model.config.vocab_size);
+                    else            grammar_apply(&grammar, logits, model.config.vocab_size);
                     if (getenv("PICOLM_LOGITS_DUMP"))
                         dump_top_logits(logits, model.config.vocab_size, pos, 5);
                     next = sampler_sample(&sampler, logits, model.config.vocab_size);
-                    grammar_advance(&grammar, &tokenizer, next);
+                    if (gbnf_active) gbnf_accept_token(&gbnf, next);
+                    else            grammar_advance(&grammar, &tokenizer, next);
                     token = next;
                     bench.gen_tokens++;
                     pos++;
@@ -3026,7 +3119,8 @@ int main(int argc, char **argv) {
             t_first_token = get_time_ms();
         }
 
-                grammar_apply(&grammar, logits, model.config.vocab_size);
+                if (gbnf_active) gbnf_apply(&gbnf, logits, model.config.vocab_size);
+                else            grammar_apply(&grammar, logits, model.config.vocab_size);
         if (getenv("PICOLM_LOGITS_DUMP")) {
             dump_top_logits(logits, model.config.vocab_size, pos, 5);
             /* Also show what the top candidates decode to: a sane model should
@@ -3060,7 +3154,8 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[GEN] pos=%d next=%d eos=%d\n", pos, next, (int)tokenizer.eos_id);
         }
         /* Update grammar state with the generated token */
-        grammar_advance(&grammar, &tokenizer, next);
+        if (gbnf_active) gbnf_accept_token(&gbnf, next);
+        else            grammar_advance(&grammar, &tokenizer, next);
 
         /* Decode and print */
         static char qwen_decode_buf[64];
@@ -3100,7 +3195,7 @@ int main(int argc, char **argv) {
         static int ignore_eos = -1;
         if (ignore_eos < 0) ignore_eos = getenv("PICOLM_IGNORE_EOS") ? 1 : 0;
         if (!ignore_eos && next == (int)tokenizer.eos_id) break;
-        if (grammar_is_complete(&grammar)) break;
+        if (gbnf_active ? gbnf_is_complete(&gbnf) : grammar_is_complete(&grammar)) break;
 
         token = next;
         /* PICOLM_SPLITTEST=<k>: run the layer range [0,k) then [k,N) via
@@ -3317,6 +3412,10 @@ int main(int argc, char **argv) {
     if (model.locked_layers > 0)
         model_unlock_layers(&model);
     grammar_free(&grammar);
+    if (gbnf_active) {
+        gbnf_free(&gbnf);
+        if (gbnf_vocab) { for (int i = 0; i < model.config.vocab_size; i++) free(gbnf_vocab[i]); free(gbnf_vocab); }
+    }
     if (g_logits_dump_fp) fclose(g_logits_dump_fp);
     free(prompt_tokens);
     free(prompt_buf);
