@@ -1098,8 +1098,29 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
             s->kv_hadamard_v = 0;
         } else {
             s->kv_hadamard_size = nrot;
-            fprintf(stderr, "KV Hadamard rotation enabled: K=%d V=%d (nrot=%d)\n",
-                    s->kv_hadamard_k, s->kv_hadamard_v, nrot);
+            /* TQ3/TQ4 rotate every 32-value block internally (the WHT with the
+             * golden-ratio signs, see quantize_row_tq3). At nrot == 32 the flag
+             * applies the SAME transform, so it is not additive: applying it
+             * twice is the identity and destroys the outlier-spreading that
+             * makes TQ quantise well, while skipping it changes nothing. At
+             * nrot > 32 it is a different (larger) block transform, and TQ then
+             * rotates each 32-block on top of it: mathematically consistent
+             * (both are undone on read) but pure extra work and extra error.
+             * There is no case where the combination helps, so refuse it
+             * instead of silently cancelling or double-rotating. */
+            if (kv_type_k == KV_CACHE_TQ3 || kv_type_k == KV_CACHE_TQ4 ||
+                kv_type_v == KV_CACHE_TQ3 || kv_type_v == KV_CACHE_TQ4) {
+                fprintf(stderr, "INFO: -khad/-vhad ignored for a TQ3/TQ4 cache: "
+                                "the TurboQuant quantiser already applies a 32-point "
+                                "Hadamard rotation internally (nrot=%d would %s it)\n",
+                        nrot, nrot == 32 ? "cancel" : "stack on top of");
+                s->kv_hadamard_k = 0;
+                s->kv_hadamard_v = 0;
+                s->kv_hadamard_size = 0;
+            } else {
+                fprintf(stderr, "KV Hadamard rotation enabled: K=%d V=%d (nrot=%d)\n",
+                        s->kv_hadamard_k, s->kv_hadamard_v, nrot);
+            }
         }
     }
 
