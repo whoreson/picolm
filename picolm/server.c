@@ -608,6 +608,7 @@ typedef struct picolm_checkpoint {
     int n_tokens;             /* total tokens processed at checkpoint time */
     uint8_t *data;            /* heap-allocated SSM state snapshot */
     struct picolm_checkpoint *next; /* linked list, ordered by n_tokens ascending */
+    int is_protected;         /* 1: exempt from eviction (tail checkpoint) */
 } picolm_checkpoint_t;
 
 /* Shared completion parameters (parsed from either OpenAI or llama.cpp JSON) */
@@ -666,8 +667,16 @@ static struct _server_state {
     int checkpoint_interval;              /* --checkpoint-every-nt (default: 256) */
     int checkpoint_interval_gen;          /* --checkpoint-every-nt-gen (default: 64) */
     int checkpoint_tail_offset;           /* --checkpoint-tail-offset (default: 1) */
+    int checkpoint_rolling_interval;      /* --checkpoint-rolling-interval (default: 10000 ms) */
     size_t checkpoint_snapshot_size;      /* cached snapshot size from model */
     uint8_t *checkpoint_scratch;          /* pre-allocated buffer for save/restore */
+    /* Rolling checkpoint: independent of the linked list, updated in-place
+     * every checkpoint_rolling_interval ms during decode.  Saved to file
+     * alongside others on explicit save, but not counted against max_checkpoints. */
+    uint8_t *rolling_checkpoint_data;     /* pre-allocated rolling snapshot buffer */
+    int rolling_checkpoint_n_tokens;      /* current position of rolling checkpoint */
+    double rolling_checkpoint_last_ms;    /* wall-clock ms of last rolling update */
+    int rolling_checkpoint_active;        /* 1 during decode, 0 otherwise */
 
 #ifdef PICOLM_VIZ
     int viz_initialized;                  /* 1 if viz_init succeeded */
@@ -803,16 +812,20 @@ static void checkpoint_print_list(const char *label) {
 
 /* Variance-based eviction: remove the checkpoint whose removal produces
  * the lowest variance of gaps between remaining checkpoints.
- * Prints detailed information about each candidate and the removal. */
+ * Prints detailed information about each candidate and the removal.
+ * Protected checkpoints (is_protected=1) are never evicted. */
 static void checkpoint_evict_one(void) {
     int n = checkpoint_count();
     if (n <= 2) return; /* Never remove if 2 or fewer */
 
-    /* Collect checkpoint positions */
+    /* Collect checkpoint positions and protection flags */
     int *tokens = alloca((size_t)n * sizeof(int));
+    int *protected = alloca((size_t)n * sizeof(int));
     int i = 0;
     for (picolm_checkpoint_t *cp = srv.checkpoints; cp; cp = cp->next) {
-        tokens[i++] = cp->n_tokens;
+        tokens[i] = cp->n_tokens;
+        protected[i] = cp->is_protected;
+        i++;
     }
 
     /* Log current state - commented out: too verbose */
@@ -827,11 +840,12 @@ static void checkpoint_evict_one(void) {
     fprintf(stderr, "\n");
     */
 
-    /* Never remove first (index 0) or last (index n-1) */
+    /* Never remove first (index 0) or last (index n-1), nor protected checkpoints */
     double best_var = 1e30;
     int best_idx = -1;
 
     for (int remove = 1; remove < n - 1; remove++) {
+        if (protected[remove]) continue; /* skip protected */
         double sum_sq = 0;
         int gap_count = 0;
         for (int j = 0; j < n - 1; j++) {
@@ -978,6 +992,45 @@ static int checkpoint_prune_after(int pos) {
     return n_dropped;
 }
 
+/* Rolling checkpoint: update the in-place rolling snapshot during decode.
+ * Called periodically (every checkpoint_rolling_interval ms) to keep a
+ * recent checkpoint at hand, independent of the linked list and max_checkpoints.
+ * The rolling checkpoint is NOT counted against max_checkpoints and is never
+ * evicted during runtime. On save-to-file, it is written alongside others. */
+static void checkpoint_rolling_update(int n_tokens) {
+    if (!srv.rolling_checkpoint_active) return;
+    if (srv.rolling_checkpoint_data == NULL) return;
+    if (srv.checkpoint_snapshot_size == 0) return;
+
+    double now = get_time_ms();
+    if (now - srv.rolling_checkpoint_last_ms < (double)srv.checkpoint_rolling_interval) return;
+
+    double t_create_start = get_time_ms();
+    size_t written = model_recurrent_state_save(&srv.model, srv.rolling_checkpoint_data, srv.checkpoint_snapshot_size);
+    if (written == 0) return;
+
+    srv.rolling_checkpoint_n_tokens = n_tokens;
+    srv.rolling_checkpoint_last_ms = now;
+    double creation_ms = get_time_ms() - t_create_start;
+    fprintf(stderr, "  [ssm rolling checkpoint] updated (n_tokens=%d, %.1f ms)\n", n_tokens, creation_ms);
+}
+
+/* Mark the latest checkpoint in the linked list as protected (tail checkpoint).
+ * Called at the beginning of the decode phase to ensure the last prefill-tail
+ * checkpoint is never evicted, even when decode checkpoints fill the list. */
+static void checkpoint_protect_tail(void) {
+    if (!srv.checkpoints) return;
+    /* Find the checkpoint with the largest n_tokens (last in sorted list) */
+    picolm_checkpoint_t *last = NULL;
+    for (picolm_checkpoint_t *cp = srv.checkpoints; cp; cp = cp->next) {
+        last = cp;
+    }
+    if (last) {
+        last->is_protected = 1;
+        fprintf(stderr, "  [ssm checkpoint] protected tail checkpoint at n_tokens=%d\n", last->n_tokens);
+    }
+}
+
 /* Restore checkpoint at or before the given n_tokens.
  * Returns 0 on success (checkpoint restored), -1 if no suitable checkpoint found.
  * On success, *actual_n_tokens is set to the checkpoint's n_tokens.
@@ -990,10 +1043,12 @@ static int checkpoint_restore(int n_tokens, int *actual_n_tokens) {
     /* Allow restore even when checkpoint-max=0, as long as checkpoints
      * were loaded from a slot save file. Saving is gated by max_checkpoints. */
     if (srv.checkpoint_snapshot_size == 0) return -1;
-    if (!srv.checkpoints) return -1;
+    if (!srv.checkpoints && !srv.rolling_checkpoint_active) return -1;
 
-    /* Find the latest checkpoint with n_tokens <= target */
+    /* Find the latest checkpoint with n_tokens <= target.
+     * Consider BOTH the linked list and the rolling checkpoint. */
     picolm_checkpoint_t *best = NULL;
+    int from_rolling = 0;
     for (picolm_checkpoint_t *cp = srv.checkpoints; cp; cp = cp->next) {
         if (cp->n_tokens <= n_tokens) {
             best = cp;
@@ -1001,17 +1056,32 @@ static int checkpoint_restore(int n_tokens, int *actual_n_tokens) {
             break; /* list is sorted, no need to continue */
         }
     }
+    /* Also consider the rolling checkpoint if it's more recent */
+    if (srv.rolling_checkpoint_active && srv.rolling_checkpoint_data) {
+        if (srv.rolling_checkpoint_n_tokens <= n_tokens) {
+            if (!best || srv.rolling_checkpoint_n_tokens > best->n_tokens) {
+                best = NULL; /* sentinel: use rolling */
+                from_rolling = 1;
+            }
+        }
+    }
 
-    if (!best) return -1;
+    if (!best && !from_rolling) return -1;
 
     /* Drop the now-useless checkpoints beyond the rewind point */
-    checkpoint_prune_after(best->n_tokens);
+    int rewind_pos = from_rolling ? srv.rolling_checkpoint_n_tokens : best->n_tokens;
+    checkpoint_prune_after(rewind_pos);
 
     /* Restore SSM state from checkpoint */
-    size_t read = model_recurrent_state_restore(&srv.model, best->data, srv.checkpoint_snapshot_size);
+    size_t read;
+    if (from_rolling) {
+        read = model_recurrent_state_restore(&srv.model, srv.rolling_checkpoint_data, srv.checkpoint_snapshot_size);
+    } else {
+        read = model_recurrent_state_restore(&srv.model, best->data, srv.checkpoint_snapshot_size);
+    }
     if (read == 0) return -1;
 
-    *actual_n_tokens = best->n_tokens;
+    *actual_n_tokens = rewind_pos;
     return 0;
 }
 
@@ -1062,7 +1132,7 @@ static void cache_adjust_stepback(model_t *model, int n_prompt, int *start_pos) 
 /* Clear all checkpoints and free their memory */
 static void checkpoint_clear(void) {
     int n = checkpoint_count();
-    if (n == 0) return;
+    if (n == 0 && !srv.rolling_checkpoint_active) return;
     /* Commented out: too verbose */
     /*
     fprintf(stderr, "  [ssm checkpoint] clearing %d checkpoints\n", n);
@@ -1077,6 +1147,12 @@ static void checkpoint_clear(void) {
         cp = next;
     }
     srv.checkpoints = NULL;
+    /* Also clear rolling checkpoint */
+    free(srv.rolling_checkpoint_data);
+    srv.rolling_checkpoint_data = NULL;
+    srv.rolling_checkpoint_active = 0;
+    srv.rolling_checkpoint_last_ms = 0;
+    srv.rolling_checkpoint_n_tokens = 0;
 }
 
 /* Checkpoint-aware prefill: processes tokens in chunks so that interval-based
@@ -1386,6 +1462,7 @@ static float *prefill_with_checkpoints(SOCKET sock, model_t *model,
 
 static int server_init(const char *model_path, int num_threads, int do_prefault, int context_override, int mem_mb,
                        int checkpoint_max, int checkpoint_interval, int checkpoint_interval_gen, int checkpoint_tail_offset,
+                       int checkpoint_rolling_interval,
                        kv_cache_type_t kv_type_k, kv_cache_type_t kv_type_v,
                        int k_cache_hadamard, int v_cache_hadamard,
                        int viz_port, int viz_width, int viz_height) {
@@ -1397,6 +1474,7 @@ static int server_init(const char *model_path, int num_threads, int do_prefault,
     srv.checkpoint_interval = checkpoint_interval;
     srv.checkpoint_interval_gen = checkpoint_interval_gen;
     srv.checkpoint_tail_offset = checkpoint_tail_offset;
+    srv.checkpoint_rolling_interval = checkpoint_rolling_interval;
     fprintf(stderr, "[server] Loading model: %s\n", model_path);
     fp16_table_init();
 
@@ -1525,11 +1603,18 @@ static int server_init(const char *model_path, int num_threads, int do_prefault,
     srv.checkpoint_snapshot_size = model_recurrent_state_size(&srv.model);
     srv.checkpoints = NULL;
     srv.checkpoint_scratch = NULL;
+    srv.rolling_checkpoint_data = NULL;
+    srv.rolling_checkpoint_active = 0;
+    srv.rolling_checkpoint_last_ms = 0;
+    srv.rolling_checkpoint_n_tokens = 0;
     if (srv.max_checkpoints > 0 && srv.checkpoint_snapshot_size > 0) {
         srv.checkpoint_scratch = (uint8_t *)malloc(srv.checkpoint_snapshot_size);
-        fprintf(stderr, "[server] SSM checkpointing enabled: max=%d, interval=%d, gen_interval=%d, tail=%d, snapshot_size=%.1fMB\n",
+        /* Rolling checkpoint buffer: always allocated when checkpointing is enabled */
+        srv.rolling_checkpoint_data = (uint8_t *)malloc(srv.checkpoint_snapshot_size);
+        fprintf(stderr, "[server] SSM checkpointing enabled: max=%d, interval=%d, gen_interval=%d, tail=%d, rolling_interval=%dms, snapshot_size=%.1fMB\n",
                 srv.max_checkpoints, srv.checkpoint_interval, srv.checkpoint_interval_gen,
-                srv.checkpoint_tail_offset, (double)srv.checkpoint_snapshot_size / (1024.0 * 1024.0));
+                srv.checkpoint_tail_offset, srv.checkpoint_rolling_interval,
+                (double)srv.checkpoint_snapshot_size / (1024.0 * 1024.0));
     } else if (srv.checkpoint_snapshot_size > 0) {
         fprintf(stderr, "[server] Model has SSM layers but checkpointing is disabled (checkpoint-max=0)\n");
     }
@@ -1870,9 +1955,12 @@ static void handle_slots_post(SOCKET sock, const char *body) {
             return;
         }
 
-        /* Append checkpoints to the file (after main KV+SSM data) */
+        /* Append checkpoints to the file (after main KV+SSM data).
+         * Includes the rolling checkpoint if active, written after linked-list
+         * checkpoints since it's typically the most recent. */
         int n_cps = checkpoint_count();
-        if (n_cps > 0 && srv.checkpoint_snapshot_size > 0) {
+        int has_rolling = (srv.rolling_checkpoint_active && srv.rolling_checkpoint_data != NULL);
+        if ((n_cps > 0 || has_rolling) && srv.checkpoint_snapshot_size > 0) {
             /* Open file for appending */
 #ifdef _WIN32
             int fd = _open(full_path, _O_WRONLY | _O_APPEND | _O_BINARY);
@@ -1882,7 +1970,9 @@ static void handle_slots_post(SOCKET sock, const char *body) {
             if (fd >= 0) {
                 /* Checkpoint header: 2 uint32_t = [CHECKPOINT_MAGIC, count] */
                 uint32_t cp_magic = 0x43505350; /* "CSPS" backwards */
-                uint32_t cp_count = (uint32_t)n_cps;
+                /* Dedup: skip rolling if its position already exists in the linked list */
+                int rolling_written = has_rolling && !checkpoint_exists(srv.rolling_checkpoint_n_tokens);
+                uint32_t cp_count = (uint32_t)(n_cps + rolling_written);
                 /* Every write is checked. These used to ignore their return
                  * values, so a slot file that ran out of space at this point
                  * was reported as fully saved while being truncated: the
@@ -1895,7 +1985,7 @@ static void handle_slots_post(SOCKET sock, const char *body) {
                 if (write(fd, &cp_magic, sizeof(cp_magic)) != (ssize_t)sizeof(cp_magic) ||
                     write(fd, &cp_count, sizeof(cp_count)) != (ssize_t)sizeof(cp_count)) cp_ok = 0;
 #endif
-                /* Write each checkpoint: [n_tokens (uint32_t), data (bytes)] */
+                /* Write each linked-list checkpoint: [n_tokens (uint32_t), data (bytes)] */
                 picolm_checkpoint_t *cp = srv.checkpoints;
                 while (cp && cp_ok) {
                     uint32_t cp_n = (uint32_t)cp->n_tokens;
@@ -1909,6 +1999,19 @@ static void handle_slots_post(SOCKET sock, const char *body) {
                                  != (ssize_t)srv.checkpoint_snapshot_size) cp_ok = 0;
 #endif
                     cp = cp->next;
+                }
+                /* Write rolling checkpoint after linked-list ones (already deduped above) */
+                if (rolling_written && cp_ok) {
+                    uint32_t cp_n = (uint32_t)srv.rolling_checkpoint_n_tokens;
+#ifdef _WIN32
+                    if (_write(fd, (char *)&cp_n, sizeof(cp_n)) != (int)sizeof(cp_n)) cp_ok = 0;
+                    if (cp_ok && _write(fd, (char *)srv.rolling_checkpoint_data, (unsigned)srv.checkpoint_snapshot_size)
+                                 != (int)srv.checkpoint_snapshot_size) cp_ok = 0;
+#else
+                    if (write(fd, &cp_n, sizeof(cp_n)) != (ssize_t)sizeof(cp_n)) cp_ok = 0;
+                    if (cp_ok && write(fd, srv.rolling_checkpoint_data, srv.checkpoint_snapshot_size)
+                                 != (ssize_t)srv.checkpoint_snapshot_size) cp_ok = 0;
+#endif
                 }
 #ifdef _WIN32
                 _close(fd);
@@ -1940,7 +2043,7 @@ static void handle_slots_post(SOCKET sock, const char *body) {
                     }
                 }
                 fprintf(stderr, "\n[server] Saved %d SSM checkpoints (%.1f MB total)\n",
-                        n_cps, (double)n_cps * (double)srv.checkpoint_snapshot_size / (1024*1024));
+                        n_cps + rolling_written, (double)(n_cps + rolling_written) * (double)srv.checkpoint_snapshot_size / (1024*1024));
             }
         }
 
@@ -2905,6 +3008,12 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
 
         /* ---- Generation phase ---- */
         int gen_count = 0;
+        /* Activate rolling checkpoint and protect the tail checkpoint */
+        if (srv.rolling_checkpoint_data && model_has_recurrent_state(model)) {
+            checkpoint_protect_tail();
+            srv.rolling_checkpoint_active = 1;
+            srv.rolling_checkpoint_last_ms = 0; /* force first update */
+        }
         /* KV_WRITTEN: number of generated tokens actually EVALUATED this
          * request, i.e. the number of KV rows written past the prompt. The
          * last sampled token is only forwarded at the BOTTOM of the loop body,
@@ -3009,12 +3118,17 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             if (srv.max_checkpoints > 0 && model_has_recurrent_state(model) && gen_count % srv.checkpoint_interval_gen == 0) {
                 checkpoint_save(n_prompt + gen_count - 1); /* see GEN_CKPT_POS note */
             }
+            /* Rolling checkpoint: time-based, independent of token interval */
+            checkpoint_rolling_update(n_prompt + gen_count - 1);
 
             if (stopped || next == (int)tokenizer->eos_id) break;
             token = next;
             logits = server_model_forward(model, token, pos);
             gen_written++;                      /* see KV_WRITTEN above */
         }
+
+        /* Deactivate rolling checkpoint after generation ends */
+        srv.rolling_checkpoint_active = 0;
 
         double t_end = get_time_ms();
         double t_prefill_ms = t_prefill_end > 0 ? t_prefill_end - t_start : t_end - t_start;
@@ -3165,6 +3279,11 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             }
 
             /* Generation phase */
+            if (srv.rolling_checkpoint_data && model_has_recurrent_state(model)) {
+                checkpoint_protect_tail();
+                srv.rolling_checkpoint_active = 1;
+                srv.rolling_checkpoint_last_ms = 0; /* force first update */
+            }
             if (n_prefill_ns <= 0) {
                 int token = ptokens[n_prompt - 1];
                 logits_ns = server_model_forward(model, token, n_prompt);
@@ -3194,6 +3313,8 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
                 if (srv.max_checkpoints > 0 && model_has_recurrent_state(model) && gen_count % srv.checkpoint_interval_gen == 0) {
                     checkpoint_save(n_prompt + gen_count - 1); /* see GEN_CKPT_POS note */
                 }
+                /* Rolling checkpoint: time-based, independent of token interval */
+                checkpoint_rolling_update(n_prompt + gen_count - 1);
 
                 /* Check stop words (full match only, no withholding) */
                 {
@@ -3213,6 +3334,8 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
                 logits_ns = server_model_forward(model, token, pos);
                 gen_written_cs++;               /* see KV_WRITTEN */
             }
+            /* Deactivate rolling checkpoint after generation ends */
+            srv.rolling_checkpoint_active = 0;
             total_generation_tokens += gen_count;
             /* The KV cache holds the LAST choice's state, and ptokens[] above is
              * overwritten per choice, so the cache length must come from this
@@ -3636,6 +3759,11 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         fprintf(stderr, "[server] %.1fms: starting generation (%d threads)\n", get_time_ms() - t0, tensor_get_threads());
 
         /* ---- Generation phase ---- */
+        if (srv.rolling_checkpoint_data && model_has_recurrent_state(model)) {
+            checkpoint_protect_tail();
+            srv.rolling_checkpoint_active = 1;
+            srv.rolling_checkpoint_last_ms = 0; /* force first update */
+        }
         if (n_prefill <= 0) {
             token = ptokens[n_prompt - 1];
             logits = server_model_forward(model, token, n_prompt);
@@ -3719,6 +3847,8 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             if (srv.max_checkpoints > 0 && model_has_recurrent_state(model) && gen_count % srv.checkpoint_interval_gen == 0) {
                 checkpoint_save(n_prompt + gen_count - 1); /* see GEN_CKPT_POS note */
             }
+            /* Rolling checkpoint: time-based, independent of token interval */
+            checkpoint_rolling_update(n_prompt + gen_count - 1);
 
             if (!ignore_eos && next == (int)tokenizer->eos_id) {
                 stop_type = "eos";
@@ -3728,6 +3858,9 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             logits = server_model_forward(model, token, pos);
             gen_written++;                      /* see KV_WRITTEN */
         }
+
+        /* Deactivate rolling checkpoint after generation ends */
+        srv.rolling_checkpoint_active = 0;
 
         double t_end = get_time_ms();
         double t_prefill_ms = t_prefill_end > 0 ? t_prefill_end - t_start : t_end - t_start;
@@ -3858,6 +3991,11 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         fflush(stderr);
 
         /* ---- Generation phase ---- */
+        if (srv.rolling_checkpoint_data && model_has_recurrent_state(model)) {
+            checkpoint_protect_tail();
+            srv.rolling_checkpoint_active = 1;
+            srv.rolling_checkpoint_last_ms = 0; /* force first update */
+        }
         if (n_prefill_ns2 <= 0) {
             token = ptokens[n_prompt - 1];
             logits_ns2 = server_model_forward(model, token, n_prompt);
@@ -3889,6 +4027,8 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             if (srv.max_checkpoints > 0 && model_has_recurrent_state(model) && gen_count % srv.checkpoint_interval_gen == 0) {
                 checkpoint_save(n_prompt + gen_count - 1); /* see GEN_CKPT_POS note */
             }
+            /* Rolling checkpoint: time-based, independent of token interval */
+            checkpoint_rolling_update(n_prompt + gen_count - 1);
 
             /* Check stop words (full match, no withholding) */
             {
@@ -3914,6 +4054,9 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             if (getenv("PICOLM_LOGITS_DUMP"))
                 dump_top_logits("LOGITS", logits_ns2, model->config.vocab_size, pos, 5);
         }
+
+        /* Deactivate rolling checkpoint after generation ends */
+        srv.rolling_checkpoint_active = 0;
 
         double t_end = get_time_ms();
         double t_prefill_ms_ns = t_prefill_end_ns > 0 ? t_prefill_end_ns - t_start : t_end - t_start;
@@ -4240,6 +4383,7 @@ int server_main(server_config_t *sc) {
     /* Load model once at startup */
     if (server_init(sc->model_path, sc->num_threads, sc->do_prefault, sc->context_override, sc->mem_mb,
                     sc->checkpoint_max, sc->checkpoint_interval, sc->checkpoint_interval_gen, sc->checkpoint_tail_offset,
+                    sc->checkpoint_rolling_interval,
                     sc->kv_type_k, sc->kv_type_v, sc->k_cache_hadamard, sc->v_cache_hadamard,
                     sc->viz_port, sc->viz_width, sc->viz_height) != 0) {
         return -1;

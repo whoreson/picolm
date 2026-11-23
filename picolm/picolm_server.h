@@ -23,6 +23,7 @@ typedef struct {
     int checkpoint_interval;
     int checkpoint_interval_gen;
     int checkpoint_tail_offset;
+    int checkpoint_rolling_interval;  /* ms between rolling checkpoint updates */
     const char *slot_save_path;
     kv_cache_type_t kv_type_k;
     kv_cache_type_t kv_type_v;

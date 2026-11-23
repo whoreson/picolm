@@ -364,6 +364,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --checkpoint-every-nt <N>   Checkpoint every N tokens during prefill (default: 256)\n");
     fprintf(stderr, "  --checkpoint-every-nt-gen <N> Checkpoint every N tokens during generation (default: 64)\n");
     fprintf(stderr, "  --checkpoint-tail-offset <N> Checkpoint N tokens before end of prompt (default: 5)\n");
+    fprintf(stderr, "  --checkpoint-rolling-interval <ms> Rolling checkpoint interval during decode (default: 10000)\n");
     fprintf(stderr, "  --ssm-serial      Use serial per-token SSM prefill (default is batched)\n");
     fprintf(stderr, "  --prefill-ubatch <N>  Chunk CLI prefill into N-token ubatches (default: whole\n");
     fprintf(stderr, "                       prompt in one batch). Use this to measure per-layer cost at\n");
@@ -1403,10 +1404,17 @@ typedef struct cli_checkpoint {
     int n_tokens;
     uint8_t *data;
     struct cli_checkpoint *next;
+    int is_protected;         /* 1: exempt from eviction (tail checkpoint) */
 } cli_checkpoint_t;
 static cli_checkpoint_t *cli_checkpoints = NULL;
 static size_t cli_checkpoint_snapshot_size = 0;
 static uint8_t *cli_checkpoint_scratch = NULL;
+/* Rolling checkpoint: independent of the linked list, updated in-place
+ * every checkpoint_rolling_interval ms during decode. */
+static uint8_t *cli_rolling_checkpoint_data = NULL;
+static int cli_rolling_checkpoint_n_tokens = 0;
+static double cli_rolling_checkpoint_last_ms = 0;
+static int cli_rolling_checkpoint_active = 0;
 
 /* Helper: save a CLI SSM checkpoint at position n_tokens.
  * Evicts oldest (smallest n_tokens) if at capacity.
@@ -1418,10 +1426,15 @@ static int cli_checkpoint_save(model_t *model, int checkpoint_max, int n_tokens)
     for (cli_checkpoint_t *c = cli_checkpoints; c; c = c->next) {
         if (c->n_tokens == n_tokens) return 0;
     }
-    /* Evict oldest if at capacity */
+    /* Evict oldest if at capacity, but skip protected checkpoints */
     { int n_cp = 0; for (cli_checkpoint_t *c = cli_checkpoints; c; c = c->next) n_cp++;
       while (n_cp >= checkpoint_max && cli_checkpoints) {
-          cli_checkpoint_t *old = cli_checkpoints; cli_checkpoints = old->next;
+          cli_checkpoint_t *old = cli_checkpoints;
+          if (old->is_protected) {
+              /* Protected checkpoint blocks eviction; stop to avoid infinite loop */
+              break;
+          }
+          cli_checkpoints = old->next;
           free(old->data); free(old); n_cp--; } }
     cli_checkpoint_t *cp = (cli_checkpoint_t *)calloc(1, sizeof(*cp));
     if (!cp) return 0;
@@ -1441,6 +1454,41 @@ static int cli_checkpoint_save(model_t *model, int checkpoint_max, int n_tokens)
             n_now, checkpoint_max, n_tokens,
             (double)cli_checkpoint_snapshot_size / (1024.0 * 1024.0));
     return 1;
+}
+
+/* Rolling checkpoint: update the in-place rolling snapshot during decode.
+ * Independent of the linked list and max_checkpoints. */
+static void cli_checkpoint_rolling_update(model_t *model, int n_tokens, int rolling_interval) {
+    if (!cli_rolling_checkpoint_active) return;
+    if (cli_rolling_checkpoint_data == NULL) return;
+    if (cli_checkpoint_snapshot_size == 0) return;
+
+    double now = get_time_ms();
+    if (now - cli_rolling_checkpoint_last_ms < (double)rolling_interval) return;
+
+    double t_create_start = get_time_ms();
+    size_t written = model_recurrent_state_save(model, cli_rolling_checkpoint_data, cli_checkpoint_snapshot_size);
+    if (written == 0) return;
+
+    cli_rolling_checkpoint_n_tokens = n_tokens;
+    cli_rolling_checkpoint_last_ms = now;
+    double creation_ms = get_time_ms() - t_create_start;
+    fprintf(stderr, "  [ssm rolling checkpoint] updated (n_tokens=%d, %.1f ms)\n", n_tokens, creation_ms);
+}
+
+/* Mark the latest checkpoint in the linked list as protected (tail checkpoint).
+ * Called at the beginning of the decode phase to ensure the last prefill-tail
+ * checkpoint is never evicted. */
+static void cli_checkpoint_protect_tail(void) {
+    if (!cli_checkpoints) return;
+    cli_checkpoint_t *last = NULL;
+    for (cli_checkpoint_t *cp = cli_checkpoints; cp; cp = cp->next) {
+        last = cp;
+    }
+    if (last) {
+        last->is_protected = 1;
+        fprintf(stderr, "  [ssm checkpoint] protected tail checkpoint at n_tokens=%d\n", last->n_tokens);
+    }
 }
 
 int main(int argc, char **argv) {
@@ -1509,6 +1557,7 @@ int main(int argc, char **argv) {
     int    checkpoint_interval = 256;
     int    checkpoint_interval_gen = 64;
     int    checkpoint_tail_offset = 1;  /* 1: ensures checkpoint at n_prompt-1 for stepback */
+    int    checkpoint_rolling_interval = 10000; /* 10s rolling checkpoint during decode */
     int    prefill_ubatch = 0;          /* --prefill-ubatch N: chunk CLI prefill into N-token ubatches.
                                          * 0 = single batch (legacy behaviour). Needed to measure
                                          * per-layer cost at deep context: a one-shot prefill only
@@ -1676,6 +1725,9 @@ int main(int argc, char **argv) {
             checkpoint_interval_gen = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--checkpoint-tail-offset") == 0 && i + 1 < argc) {
             checkpoint_tail_offset = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--checkpoint-rolling-interval") == 0 && i + 1 < argc) {
+            checkpoint_rolling_interval = atoi(argv[++i]);
+            if (checkpoint_rolling_interval < 1000) checkpoint_rolling_interval = 1000; /* min 1s */
         } else if (strcmp(argv[i], "--prefill-ubatch") == 0 && i + 1 < argc) {
             prefill_ubatch = atoi(argv[++i]);
             if (prefill_ubatch < 0) prefill_ubatch = 0;
@@ -1940,6 +1992,7 @@ int main(int argc, char **argv) {
         sc.checkpoint_interval = checkpoint_interval;
         sc.checkpoint_interval_gen = checkpoint_interval_gen;
         sc.checkpoint_tail_offset = checkpoint_tail_offset;
+        sc.checkpoint_rolling_interval = checkpoint_rolling_interval;
         sc.slot_save_path = slot_save_path;
         sc.kv_type_k = kv_type_k;
         sc.kv_type_v = kv_type_v;
@@ -2233,8 +2286,12 @@ int main(int argc, char **argv) {
             cli_checkpoint_snapshot_size = model_recurrent_state_size(&model);
             if (cli_checkpoint_snapshot_size > 0) {
                 cli_checkpoint_scratch = (uint8_t *)malloc(cli_checkpoint_snapshot_size);
-                fprintf(stderr, "[cli] SSM checkpointing: max=%d, prefill_interval=%d, gen_interval=%d, snapshot=%.1fMB\n",
-                        checkpoint_max, checkpoint_interval, checkpoint_interval_gen,
+                cli_rolling_checkpoint_data = (uint8_t *)malloc(cli_checkpoint_snapshot_size);
+                cli_rolling_checkpoint_active = 0;
+                cli_rolling_checkpoint_last_ms = 0;
+                cli_rolling_checkpoint_n_tokens = 0;
+                fprintf(stderr, "[cli] SSM checkpointing: max=%d, prefill_interval=%d, gen_interval=%d, rolling_interval=%dms, snapshot=%.1fMB\n",
+                        checkpoint_max, checkpoint_interval, checkpoint_interval_gen, checkpoint_rolling_interval,
                         (double)cli_checkpoint_snapshot_size / (1024.0 * 1024.0));
                 /* Load checkpoints appended to the cache file (after main KV+SSM data).
                  * Same format as the server's slot save: 0x43505350 magic + count + entries. */
@@ -2443,15 +2500,36 @@ int main(int argc, char **argv) {
             int cp_found = 0;
             int start_pos_pre = start_pos;
             cli_checkpoint_t *best = NULL;
+            int from_rolling = 0;
             for (cli_checkpoint_t *cp = cli_checkpoints; cp; cp = cp->next) {
                 if (cp->n_tokens <= start_pos) best = cp;
                 else break; /* sorted list */
             }
-            if (best && best->data) {
-                size_t rd = model_recurrent_state_restore(&model, best->data, cli_checkpoint_snapshot_size);
-                if (rd == cli_checkpoint_snapshot_size) {
-                    start_pos = best->n_tokens;
-                    cp_found = 1;
+            /* Also consider the rolling checkpoint if it's more recent */
+            if (cli_rolling_checkpoint_active && cli_rolling_checkpoint_data) {
+                if (cli_rolling_checkpoint_n_tokens <= start_pos) {
+                    if (!best || cli_rolling_checkpoint_n_tokens > best->n_tokens) {
+                        best = NULL; /* sentinel: use rolling */
+                        from_rolling = 1;
+                    }
+                }
+            }
+            if ((best && best->data) || from_rolling) {
+                size_t rd;
+                if (from_rolling) {
+                    rd = model_recurrent_state_restore(&model, cli_rolling_checkpoint_data, cli_checkpoint_snapshot_size);
+                    if (rd == cli_checkpoint_snapshot_size) {
+                        start_pos = cli_rolling_checkpoint_n_tokens;
+                        cp_found = 1;
+                    }
+                } else {
+                    rd = model_recurrent_state_restore(&model, best->data, cli_checkpoint_snapshot_size);
+                    if (rd == cli_checkpoint_snapshot_size) {
+                        start_pos = best->n_tokens;
+                        cp_found = 1;
+                    }
+                }
+                if (cp_found) {
                     /* Report the REAL match count. This used to print
                      * n_prompt/n_prompt, so it could never say anything but
                      * "fully cached" -- a partial match (70784/79407 here)
@@ -2935,6 +3013,13 @@ int main(int argc, char **argv) {
      * prompt + generated history, not just what this process produced). */
     sampler_set_history(&sampler, prompt_tokens, n_prompt);
 
+    /* Activate rolling checkpoint at the start of decode */
+    if (cli_rolling_checkpoint_data && model_has_recurrent_state(&model)) {
+        cli_checkpoint_protect_tail();
+        cli_rolling_checkpoint_active = 1;
+        cli_rolling_checkpoint_last_ms = 0; /* force first update */
+    }
+
     for (; pos < total_steps; pos++) {
         /* Generation: apply grammar constraints, then sample */
         if (t_first_token == 0) {
@@ -3003,6 +3088,8 @@ int main(int argc, char **argv) {
             && total_gen % checkpoint_interval_gen == 0) {
             cli_checkpoint_save(&model, checkpoint_max, start_pos + n_prompt + total_gen);
         }
+        /* Rolling checkpoint: time-based, independent of token interval */
+        cli_checkpoint_rolling_update(&model, start_pos + n_prompt + total_gen - 1, checkpoint_rolling_interval);
 
         /* Stop on EOS or grammar completion.
          * PICOLM_IGNORE_EOS=1 keeps going past EOS, which the HTTP server
@@ -3104,6 +3191,8 @@ int main(int argc, char **argv) {
     }
 
     printf("\n");
+    /* Deactivate rolling checkpoint after generation ends */
+    cli_rolling_checkpoint_active = 0;
     t_end = get_time_ms();
 
     /* Save KV cache if requested: save the FULL conversation (prompt + generated tokens),
@@ -3125,9 +3214,11 @@ int main(int argc, char **argv) {
 
         kvcache_save(&model, cache_file, total_tokens, all_tokens);
 
-        /* Append checkpoints to the file (after main KV+SSM data) */
+        /* Append checkpoints to the file (after main KV+SSM data).
+         * Includes the rolling checkpoint if active. */
         { int n_cps = 0; for (cli_checkpoint_t *c = cli_checkpoints; c; c = c->next) n_cps++;
-          if (n_cps > 0 && cli_checkpoint_snapshot_size > 0) {
+          int cli_has_rolling = (cli_rolling_checkpoint_active && cli_rolling_checkpoint_data != NULL);
+          if ((n_cps > 0 || cli_has_rolling) && cli_checkpoint_snapshot_size > 0) {
 #ifdef _WIN32
               int fd = _open(cache_file, _O_WRONLY | _O_APPEND | _O_BINARY);
 #else
@@ -3135,7 +3226,12 @@ int main(int argc, char **argv) {
 #endif
               if (fd >= 0) {
                   uint32_t cp_magic = 0x43505350; /* "CSPS" backwards */
-                  uint32_t cp_count = (uint32_t)n_cps;
+                  /* Dedup: skip rolling if its position already exists in linked list */
+                  int cli_rolling_dup = 0;
+                  for (cli_checkpoint_t *dc = cli_checkpoints; dc && !cli_rolling_dup; dc = dc->next)
+                      if (dc->n_tokens == cli_rolling_checkpoint_n_tokens) cli_rolling_dup = 1;
+                  int cli_rolling_written = cli_has_rolling && !cli_rolling_dup;
+                  uint32_t cp_count = (uint32_t)(n_cps + cli_rolling_written);
 #ifdef _WIN32
                   _write(fd, (char *)&cp_magic, sizeof(cp_magic));
                   _write(fd, (char *)&cp_count, sizeof(cp_count));
@@ -3155,13 +3251,24 @@ int main(int argc, char **argv) {
 #endif
                       cp = cp->next;
                   }
+                  /* Write rolling checkpoint after linked-list ones (deduped above) */
+                  if (cli_rolling_written) {
+                      uint32_t cp_n = (uint32_t)cli_rolling_checkpoint_n_tokens;
+#ifdef _WIN32
+                      _write(fd, (char *)&cp_n, sizeof(cp_n));
+                      _write(fd, (char *)cli_rolling_checkpoint_data, (unsigned)cli_checkpoint_snapshot_size);
+#else
+                      write(fd, &cp_n, sizeof(cp_n));
+                      write(fd, cli_rolling_checkpoint_data, (unsigned)cli_checkpoint_snapshot_size);
+#endif
+                  }
 #ifdef _WIN32
                   _close(fd);
 #else
                   close(fd);
 #endif
                   fprintf(stderr, "\n[cli] Saved %d SSM checkpoints (%.1f MB total)\n",
-                          n_cps, (double)n_cps * (double)cli_checkpoint_snapshot_size / (1024*1024));
+                          n_cps + cli_rolling_written, (double)(n_cps + cli_rolling_written) * (double)cli_checkpoint_snapshot_size / (1024*1024));
               }
           } }
         free(all_tokens);
@@ -3170,6 +3277,7 @@ int main(int argc, char **argv) {
     /* Free checkpoints */
     { for (cli_checkpoint_t *c = cli_checkpoints; c; ) { cli_checkpoint_t *n = c->next; free(c->data); free(c); c = n; } cli_checkpoints = NULL; }
     free(cli_checkpoint_scratch); cli_checkpoint_scratch = NULL;
+    free(cli_rolling_checkpoint_data); cli_rolling_checkpoint_data = NULL;
 
     double total_time = (t_end - t_start) / 1000.0;
     if (t_first_token == 0) t_first_token = t_end;
