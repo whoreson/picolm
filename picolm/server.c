@@ -898,11 +898,34 @@ static int checkpoint_evict_one(void) {
 }
 
 /* Reconstruct KV row stride from kv_cache_type enum value */
+/* Bytes of one GQA row (n_elements = n_kv_heads * head_dim) for a KV storage
+ * type. MUST cover every type the server can save, because the result is used
+ * to seek to the SSM/checkpoint section at the end of a slot file: get it
+ * wrong and every checkpoint lookup lands somewhere else.
+ *
+ * The old version stopped at Q4_0 and fell through to "F32: 4 bytes/element"
+ * for anything else. With -ctk tq4 -ctv tq4 that is 4096 bytes/row where the
+ * writer used 576 (TQ4 stores 18 bytes per 32 values), so kv_end came out at
+ * 13670173520 for a 4.7 GB file -- past EOF -- and the restore reported
+ * "No SSM checkpoint section found at offset 13670173520 (magic=0x00064ADC)".
+ * The comment above the seek even says kv_end "MUST be" right; it silently
+ * was not.
+ *
+ * Keep in sync with kv_row_size_gqa() in model_core.c, kv_block_bytes() in
+ * backend_gpu_dequant.cuh and fa3_block_bytes() in backend_gpu_attn_fa3.cuh.
+ * The F32 case is now only reachable for an unknown type, and it is loud. */
 static size_t kv_stride_from_type(int kv_type, int n_elements) {
-    if (kv_type == 0) return (size_t)n_elements * sizeof(uint16_t);          /* KV_CACHE_F16 */
-    if (kv_type == 1) return ((size_t)(n_elements / 32)) * sizeof(block_q8_0); /* KV_CACHE_Q8_0 */
-    if (kv_type == 2) return ((size_t)(n_elements / 32)) * sizeof(block_q4_0); /* KV_CACHE_Q4_0 */
-    return (size_t)n_elements * sizeof(float); /* fallback F32 */
+    switch (kv_type) {
+        case 0: return (size_t)n_elements * sizeof(uint16_t);                    /* F16    */
+        case 1: return ((size_t)(n_elements / 32)) * 34;                         /* Q8_0   */
+        case 2: return ((size_t)(n_elements / 32)) * 18;                         /* Q4_0   */
+        case 3: return ((size_t)(n_elements / 32)) * 14;                         /* TQ3    */
+        case 4: return ((size_t)(n_elements / 32)) * 18;                         /* TQ4    */
+        default: break;
+    }
+    fprintf(stderr, "kv_stride_from_type: unknown kv_type %d, cannot compute the "
+                    "row size -- slot checkpoint lookup will be wrong\n", kv_type);
+    return (size_t)n_elements * sizeof(uint16_t);
 }
 
 /* Create a checkpoint at current SSM state position.
