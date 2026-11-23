@@ -7490,7 +7490,12 @@ static int fa3_launch_t(gpuStream_t stream, float *out, const float *q,
     int dev = 0, optin = 0;
     cudaGetDevice(&dev);
     cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
-    if ((size_t)optin < L.total) return 0;            /* does not fit on this GPU: caller falls back */
+    if ((size_t)optin < L.total) {                    /* does not fit on this GPU: caller falls back */
+        if (getenv("PICOLM_FA3_DEBUG"))
+            fprintf(stderr, "[FA3] reject: smem hd=%d bn=%d needs %zu B, device opt-in max %d B\n",
+                    HD, BN, L.total, optin);
+        return 0;
+    }
     static size_t configured[16];                     /* per instantiation, per device */
     if (dev >= 0 && dev < 16 && L.total > configured[dev]) {
         if (cudaFuncSetAttribute((const void *)picolm_gpu_attention_prefill_fa3_kernel<HD, BN>,
@@ -7504,7 +7509,11 @@ static int fa3_launch_t(gpuStream_t stream, float *out, const float *q,
     picolm_gpu_attention_prefill_fa3_kernel<HD, BN><<<grid, FA3_THREADS, L.total, stream>>>(
         out, q, k, v, layer, start_pos, n_tokens, n_heads, n_kv, max_seq,
         kps, khs, vps, vhs, n_swa, kt, vt);
-    return cudaGetLastError() == cudaSuccess;
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess && getenv("PICOLM_FA3_DEBUG"))
+        fprintf(stderr, "[FA3] reject: launch failed: %s (hd=%d bn=%d grid=%ux%u smem=%zu)\n",
+                cudaGetErrorString(e), HD, BN, grid.x, grid.y, L.total);
+    return e == cudaSuccess;
 }
 #endif
 
@@ -7522,15 +7531,28 @@ int picolm_gpu_attention_prefill_fa3_launch(
     (void)n_swa; (void)kt; (void)vt;
     return 0;
 #else
-    if (n_tokens < 1 || n_kv_heads < 1 || n_heads % n_kv_heads != 0) return 0;
-    if (kt < 0 || kt > 2 || vt < 0 || vt > 2) return 0;
-    if (head_dim != 64 && head_dim != 128 && head_dim != 256) return 0;
+    /* PICOLM_FA3_DEBUG prints which precondition rejected the launch; every one
+     * of these returns 0 silently by design (the caller falls back), which
+     * makes "why is FA3 not running" unanswerable without it. */
+    static const int fa3dbg = getenv("PICOLM_FA3_DEBUG") ? 1 : 0;
+#define FA3_REJECT(cond, ...) do { if (cond) { if (fa3dbg) { fprintf(stderr, "[FA3] reject: " __VA_ARGS__); fprintf(stderr, "\n"); } return 0; } } while (0)
+    FA3_REJECT(n_tokens < 1 || n_kv_heads < 1 || n_heads % n_kv_heads != 0,
+               "geometry n_tokens=%d n_kv=%d n_heads=%d", n_tokens, n_kv_heads, n_heads);
+    FA3_REJECT(kt < 0 || kt > 4 || vt < 0 || vt > 4, "kv types kt=%d vt=%d", kt, vt);
+    FA3_REJECT(head_dim != 64 && head_dim != 128 && head_dim != 256,
+               "head_dim=%d (need 64/128/256)", head_dim);
     /* the kernel addresses rows as contiguous [head_dim] fp16 / [head_dim/32] blocks */
     const size_t krow = kt == 0 ? (size_t)head_dim * 2 : (size_t)fa3_raw_row_bytes(head_dim, kt);
     const size_t vrow = vt == 0 ? (size_t)head_dim * 2 : (size_t)fa3_raw_row_bytes(head_dim, vt);
-    if (k_head_stride != krow || v_head_stride != vrow) return 0;
-    if ((k_pos_stride & (kt == 0 ? 15 : 3)) || (v_pos_stride & (vt == 0 ? 15 : 3))) return 0;
-    if (((uintptr_t)kv_k & 15) || ((uintptr_t)kv_v & 15) || ((uintptr_t)q & 15) || ((uintptr_t)out & 7)) return 0;
+    FA3_REJECT(k_head_stride != krow || v_head_stride != vrow,
+               "head_stride k=%zu (need %zu) v=%zu (need %zu)",
+               k_head_stride, krow, v_head_stride, vrow);
+    FA3_REJECT((k_pos_stride & (kt == 0 ? 15 : 3)) || (v_pos_stride & (vt == 0 ? 15 : 3)),
+               "pos_stride not aligned k=%zu (mask %d) v=%zu (mask %d)",
+               k_pos_stride, kt == 0 ? 15 : 3, v_pos_stride, vt == 0 ? 15 : 3);
+    FA3_REJECT(((uintptr_t)kv_k & 15) || ((uintptr_t)kv_v & 15) || ((uintptr_t)q & 15) || ((uintptr_t)out & 7),
+               "pointer alignment k=%p v=%p q=%p out=%p",
+               (const void *)kv_k, (const void *)kv_v, (const void *)q, (const void *)out);
     const uint8_t *k = (const uint8_t *)kv_k, *v = (const uint8_t *)kv_v;
     if (head_dim == 256)
         return fa3_launch_t<256, 32>(stream, out, q, k, v, layer_ordinal, start_pos, n_tokens, n_heads,

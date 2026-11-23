@@ -12,6 +12,7 @@
  *
  *   make test-attn-fa3-gpu && ./test_attn_fa3_gpu            (needs sm_80+) */
 #include "backend_gpu_kernels.cuh"
+#include "backend_gpu_attn_fa3.cuh"
 #include <cuda_fp16.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,13 +23,16 @@ static uint32_t rng = 1234;
 static float frand(void) { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; return (rng % 20001) / 10000.0f - 1.0f; }
 static uint16_t f2h(float f) { __half h = __float2half(f); return *(uint16_t *)&h; }
 
-static size_t head_bytes(int hd, int t) { return t == 0 ? (size_t)hd * 2 : t == 1 ? (size_t)(hd / 32) * 34 : (size_t)(hd / 32) * 18; }
+static size_t head_bytes(int hd, int t) {
+    if (t == 0) return (size_t)hd * 2;
+    return (size_t)(hd / 32) * (size_t)fa3_block_bytes(t);   /* 34/18/14/18 */
+}
 
 static void fill_kv(uint8_t *buf, size_t bytes, int t, float amp) {
     if (t == 0) {
         for (size_t i = 0; i + 1 < bytes; i += 2) { uint16_t h = f2h(frand() * amp); memcpy(buf + i, &h, 2); }
     } else {
-        const int bsz = t == 1 ? 34 : 18;
+        const int bsz = fa3_block_bytes(t);
         for (size_t b = 0; b + bsz <= bytes; b += bsz) {
             uint16_t d = f2h(0.01f + 0.05f * (frand() * 0.5f + 0.5f)); memcpy(buf + b, &d, 2);
             for (int i = 2; i < bsz; i++) { rng = rng * 1664525u + 1013904223u; buf[b + i] = (uint8_t)(rng >> 24); }
@@ -120,7 +124,7 @@ int main(void) {
     printf("device: %s (sm_%d%d), max opt-in smem/block %zu B\n", prop.name, prop.major, prop.minor, prop.sharedMemPerBlockOptin);
     if (prop.major < 8) { printf("needs sm_80+ (mma.m16n8k16, cp.async): skipped\n"); return 0; }
     int f = 0;
-    for (int kvt = 0; kvt <= 2; kvt++) {
+    for (int kvt = 0; kvt <= 4; kvt++) {
         /* Qwen3.5/3.6 shape (head_dim 256, 24 q heads / 4 kv heads), ragged tails first */
         f |= run(256, kvt, 0, 32, 24, 4, 0, 0);
         f |= run(256, kvt, 0, 33, 24, 4, 0, 0);
@@ -132,7 +136,7 @@ int main(void) {
     }
     /* performance: a ubatch at depth, the case the benchmark shows collapsing */
     printf("--- performance (512-token ubatch at depth, Qwen shape) ---\n");
-    for (int kvt = 0; kvt <= 2; kvt++) {
+    for (int kvt = 0; kvt <= 4; kvt++) {
         f |= run(256, kvt, 0, 512, 24, 4, 0, 1);
         f |= run(256, kvt, 4096, 512, 24, 4, 0, 1);
         f |= run(256, kvt, 16384, 512, 24, 4, 0, 1);

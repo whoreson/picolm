@@ -59,8 +59,28 @@
 #endif
 
 /* bytes of one head row of raw quantised KV: (hd/32) blocks of 34 (q8_0) / 18 (q4_0) */
+/* Bytes of one quantised head row. t is kv_cache_type_t numbering:
+ *   1 = Q8_0 (34 B/block), 2 = Q4_0 (18), 3 = TQ3 (14), 4 = TQ4 (18).
+ * 0 (F16) returns 0 on purpose -- F16 rows are not "raw", the kernel copies
+ * them straight into the swizzled tile. */
 static inline FA3_HD int fa3_raw_row_bytes(int hd, int t) {
-    return t == 1 ? (hd / 32) * 34 : (t == 2 ? (hd / 32) * 18 : 0);
+    switch (t) {
+        case 1:  return (hd / 32) * 34;   /* Q8_0 */
+        case 2:  return (hd / 32) * 18;   /* Q4_0 */
+        case 3:  return (hd / 32) * 14;   /* TQ3  */
+        case 4:  return (hd / 32) * 18;   /* TQ4  */
+        default: return 0;
+    }
+}
+/* Bytes per 32-value block, same numbering. */
+static inline FA3_HD int fa3_block_bytes(int t) {
+    switch (t) {
+        case 1:  return 34;
+        case 2:  return 18;
+        case 3:  return 14;
+        case 4:  return 18;
+        default: return 0;
+    }
 }
 static inline FA3_HD size_t fa3_up16(size_t x) { return (x + 15) & ~(size_t)15; }
 
@@ -133,9 +153,109 @@ __device__ __forceinline__ int   fa3_any(int p) { return __any_sync(0xffffffffu,
 
 __device__ static inline uint32_t fa3_ld16(const uint8_t *p) { return *(const uint16_t *)p; }
 
+/* fp16 bit pattern -> fp32. Only the TQ dequant needs this (Q8_0/Q4_0 use the
+ * packed half2 trick). backend_gpu_common.cuh already provides it for both
+ * host and device passes; tests/fa3_emu.cpp supplies its own. */
+#ifndef PICOLM_FA3_EMU
+static inline FA3_HD float fa3_h2f(uint16_t h) { return gpu_fp16_to_fp32(h); }
+#endif
+
+/* ---- TurboQuant tables -------------------------------------------------
+ * Duplicated from backend_gpu_dequant.cuh rather than included: this header is
+ * also compiled standalone by tests/fa3_emu.cpp, which supplies its own
+ * emulated primitives. They MUST match quant.c's tq3_codebook / tq4_codebook /
+ * tq3_signs bit for bit, since the same bytes have to decode identically
+ * through this path, the scalar kv_row_dequant() path and the CPU. */
+/* ---- TQ3/TQ4 dequant ----
+ * The codebook and sign tables are NOT duplicated here. backend_gpu_dequant.cuh
+ * already defines tq3_codebook_dev / tq4_codebook_dev / tq3_signs_dev, and for
+ * the nvcc build this header is included from backend_gpu_kernels.cu after
+ * backend_gpu_kernels.cuh (which pulls that in), so they are already in scope.
+ *
+ * Only the emulator, which compiles this header standalone, needs its own
+ * copies -- and it gets them for the host pass by aliasing the device names. */
+#ifdef PICOLM_FA3_EMU
+static const float tq3_codebook_dev[8] = {
+    -2.1519f, -1.3439f, -0.7560f, -0.2451f,
+     0.2451f,  0.7560f,  1.3439f,  2.1519f
+};
+static const float tq4_codebook_dev[16] = {
+    -2.7326f, -2.0690f, -1.6180f, -1.2562f, -0.9423f, -0.6568f, -0.3880f, -0.1284f,
+     0.1284f,  0.3880f,  0.6568f,  0.9423f,  1.2562f,  1.6180f,  2.0690f,  2.7326f
+};
+static const float tq3_signs_dev[32] = {
+    1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f,
+   -1.0f,-1.0f, 1.0f,-1.0f, 1.0f, 1.0f,-1.0f, 1.0f,
+   -1.0f,-1.0f, 1.0f,-1.0f, 1.0f,-1.0f,-1.0f, 1.0f,
+   -1.0f, 1.0f, 1.0f,-1.0f, 1.0f,-1.0f,-1.0f, 1.0f
+};
+#  define FA3_TQ_FN static inline
+#else
+#  define FA3_TQ_FN static __device__ inline
+#endif
+
+/* Unpack 8 3-bit indices (3 bytes) / 8 4-bit indices (4 bytes). */
+static inline FA3_HD void fa3_tq_unpack3(uint8_t *dst, const uint8_t *src) {
+    dst[0] = src[0] & 7;
+    dst[1] = (src[0] >> 3) & 7;
+    dst[2] = (uint8_t)(((src[0] >> 6) | (src[1] << 2)) & 7);
+    dst[3] = (src[1] >> 1) & 7;
+    dst[4] = (src[1] >> 4) & 7;
+    dst[5] = (uint8_t)(((src[1] >> 7) | (src[2] << 1)) & 7);
+    dst[6] = (src[2] >> 2) & 7;
+    dst[7] = (src[2] >> 5) & 7;
+}
+static inline FA3_HD void fa3_tq_unpack4(uint8_t *dst, const uint8_t *src) {
+    dst[0] = src[0] & 0xF;
+    dst[1] = src[0] >> 4;
+    dst[2] = src[1] & 0xF;
+    dst[3] = src[1] >> 4;
+    dst[4] = src[2] & 0xF;
+    dst[5] = src[2] >> 4;
+    dst[6] = src[3] & 0xF;
+    dst[7] = src[3] >> 4;
+}
+
+/* TQ3/TQ4 block -> 16 fp16x2 words: codebook lookup in the rotated domain,
+ * 32-point inverse WHT, /sqrt(32), undo the sign flips, times the block RMS.
+ * Same order as tq3_dequant_block() in backend_gpu_dequant.cuh. */
+FA3_TQ_FN void fa3_dequant_tq(const uint8_t *blk, int t, uint32_t out[16]) {
+    float rot[32];
+    if (t == 3) {
+        for (int g = 0; g < 4; g++) {
+            uint8_t idx[8];
+            fa3_tq_unpack3(idx, blk + 2 + g * 3);
+            for (int k = 0; k < 8; k++) rot[g * 8 + k] = tq3_codebook_dev[idx[k]];
+        }
+    } else {
+        for (int g = 0; g < 4; g++) {
+            uint8_t idx[8];
+            fa3_tq_unpack4(idx, blk + 2 + g * 4);
+            for (int k = 0; k < 8; k++) rot[g * 8 + k] = tq4_codebook_dev[idx[k]];
+        }
+    }
+    for (int step = 1; step < 32; step <<= 1) {
+        for (int i = 0; i < 32; i += step << 1) {
+            for (int j = i; j < i + step; j++) {
+                const float a = rot[j], b = rot[j + step];
+                rot[j] = a + b;
+                rot[j + step] = a - b;
+            }
+        }
+    }
+    const float norm = 0.176776695f;                 /* 1/sqrt(32) */
+    const float scale = fa3_h2f((uint16_t)(blk[0] | ((uint16_t)blk[1] << 8)));
+    for (int k = 0; k < 16; k++) {
+        const float lo = rot[2 * k] * norm * tq3_signs_dev[2 * k] * scale;
+        const float hi = rot[2 * k + 1] * norm * tq3_signs_dev[2 * k + 1] * scale;
+        out[k] = fa3_pack2(lo, hi);
+    }
+}
+
 /* Dequantise one 32-element block (raw bytes at `blk`) into 16 fp16x2 words
  * (elements 2k, 2k+1 in word k). Bit-identical to kv_row_dequant()+fp32->fp16. */
 __device__ static inline void fa3_dequant_block(const uint8_t *blk, int t, uint32_t out[16]) {
+    if (t == 3 || t == 4) { fa3_dequant_tq(blk, t, out); return; }   /* TQ3 / TQ4 */
     const uint32_t d  = fa3_ld16(blk);
     const uint32_t d2 = d | (d << 16);
     if (t == 2) {                                   /* Q4_0: 16 bytes of nibbles */
@@ -157,6 +277,9 @@ __device__ static inline void fa3_dequant_block(const uint8_t *blk, int t, uint3
         }
     }
 }
+
+
+
 
 template <int HD, int BN>
 __global__ void __launch_bounds__(FA3_THREADS, 1)
@@ -188,7 +311,7 @@ picolm_gpu_attention_prefill_fa3_kernel(
     uint8_t *Kr = sm + L.kr;
     uint8_t *Vr = sm + L.vr;
     const int krow = fa3_raw_row_bytes(HD, kt), vrow = fa3_raw_row_bytes(HD, vt);
-    const int kbsz = kt == 1 ? 34 : 18, vbsz = vt == 1 ? 34 : 18;
+    const int kbsz = fa3_block_bytes(kt), vbsz = fa3_block_bytes(vt);
 
     /* ---- block geometry: ALL of this is block-uniform ------------------- */
     const int kv_total = start_pos + n_tokens;

@@ -189,6 +189,9 @@ static inline int fa3_any(int p) {
     g_wi[w][l] = p; wbar(); int r = 0; for (int i = 0; i < 32; i++) r |= g_wi[w][i] != 0; wbar(); return r;
 }
 
+/* the header's TQ dequant uses fa3_h2f; the emulator's software h2f IS the
+ * IEEE binary16 decode the GPU performs, so reuse it. */
+#define fa3_h2f h2f
 #include "backend_gpu_attn_fa3.cuh"
 
 /* ---- host harness --------------------------------------------------------- */
@@ -205,7 +208,7 @@ static int run_case(int kt, int vt, int start_pos, int n_tokens, int n_heads, in
     auto fill = [&](std::vector<uint8_t> &buf, int t, float amp) {
         if (t == 0) { uint16_t *p = (uint16_t *)buf.data(); for (size_t i = 0; i < buf.size() / 2; i++) p[i] = f2h(frand() * amp); }
         else {
-            const int bsz = t == 1 ? 34 : 18;
+            const int bsz = fa3_block_bytes(t);   /* 34 Q8_0 / 18 Q4_0 / 14 TQ3 / 18 TQ4 */
             for (size_t b = 0; b + bsz <= buf.size(); b += bsz) {
                 uint16_t d = f2h(0.01f + 0.05f * (frand() * 0.5f + 0.5f)); memcpy(&buf[b], &d, 2);
                 for (int i = 2; i < bsz; i++) buf[b + i] = (uint8_t)(rng_s = rng_s * 1664525u + 1013904223u, rng_s >> 24);
@@ -217,11 +220,30 @@ static int run_case(int kt, int vt, int start_pos, int n_tokens, int n_heads, in
     auto deq = [&](const std::vector<uint8_t> &buf, int t, size_t pos_stride, size_t head_stride, int pos, int h, int i) -> float {
         const uint8_t *row = &buf[(size_t)layer * max_seq * pos_stride + (size_t)pos * pos_stride + (size_t)h * head_stride];
         if (t == 0) return h2f(((const uint16_t *)row)[i]);
-        const int bsz = t == 1 ? 34 : 18; const uint8_t *b = row + (i >> 5) * bsz; const int e = i & 31;
-        uint16_t dr; memcpy(&dr, b, 2); const float d = h2f(dr);
+        const int bsz = fa3_block_bytes(t); const uint8_t *b = row + (i >> 5) * bsz; const int e = i & 31;
+        uint16_t dr; memcpy(&dr, b, 2);
         float v;
-        if (t == 1) v = (float)((const int8_t *)(b + 2))[e] * d;
-        else { const int nb = e < 16 ? (b[2 + e] & 0xF) : (b[2 + e - 16] >> 4); v = (float)(nb - 8) * d; }
+        if (t == 1) { const float d = h2f(dr); v = (float)((const int8_t *)(b + 2))[e] * d; }
+        else if (t == 2) { const float d = h2f(dr); const int nb = e < 16 ? (b[2 + e] & 0xF) : (b[2 + e - 16] >> 4); v = (float)(nb - 8) * d; }
+        else {
+            /* TQ3/TQ4: reuse the header's own inverse transform so this
+             * reference is independent of the kernel's fp16 packing, only
+             * sharing the (fixed) codebook/WHT definition. */
+            float rot[32];
+            uint8_t idx[8];
+            for (int g = 0; g < 4; g++) {
+                if (t == 3) fa3_tq_unpack3(idx, b + 2 + g * 3); else fa3_tq_unpack4(idx, b + 2 + g * 4);
+                for (int k = 0; k < 8; k++)
+                    rot[g * 8 + k] = (t == 3) ? tq3_codebook_dev[idx[k]] : tq4_codebook_dev[idx[k]];
+            }
+            for (int step = 1; step < 32; step <<= 1)
+                for (int ii = 0; ii < 32; ii += step << 1)
+                    for (int j = ii; j < ii + step; j++) {
+                        const float a = rot[j], c = rot[j + step];
+                        rot[j] = a + c; rot[j + step] = a - c;
+                    }
+            return h2f(dr) * rot[e] * 0.176776695f * tq3_signs_dev[e];
+        }
         return h2f(f2h(v));
     };
     const size_t qn = (size_t)n_tokens * n_heads * HD;
@@ -303,6 +325,8 @@ int main(int argc, char **argv) {
     f |= run_case<256, 32>(0, 0, 37, 100, 6, 1, 0);
     f |= run_case<256, 32>(1, 1, 5, 70, 6, 1, 0);
     f |= run_case<256, 32>(2, 2, 11, 130, 6, 1, 0);     /* the long-context production config: q4_0 KV */
+    f |= run_case<256, 32>(3, 3, 7, 96, 6, 1, 0);       /* TQ3 */
+    f |= run_case<256, 32>(4, 4, 13, 110, 6, 1, 0);     /* TQ4 */
     if (!quick) {
         f |= run_case<256, 32>(0, 2, 3, 90, 6, 2, 0);   /* mixed K/V types */
         f |= run_case<256, 32>(2, 1, 0, 50, 4, 2, 0);
@@ -313,6 +337,10 @@ int main(int argc, char **argv) {
         f |= run_case<128, 64>(0, 0, 9, 140, 4, 2, 0);
         f |= run_case<128, 64>(2, 2, 0, 75, 4, 2, 0);
         f |= run_case<128, 64>(1, 1, 33, 64, 2, 1, 0);
+        f |= run_case<128, 64>(3, 3, 0, 70, 2, 1, 0);   /* TQ3 */
+        f |= run_case<128, 64>(4, 4, 5, 80, 2, 1, 0);   /* TQ4 */
+        f |= run_case<256, 32>(3, 0, 4, 60, 4, 2, 0);   /* TQ3 K, F16 V: differing pos strides */
+        f |= run_case<256, 32>(4, 1, 9, 90, 4, 2, 0);   /* TQ4 K, Q8_0 V */
         f |= run_case<64, 64>(0, 0, 0, 100, 2, 1, 0);
         f |= run_case<64, 64>(2, 1, 7, 66, 2, 1, 0);
     }

@@ -1386,6 +1386,14 @@ attn_prefill_dev_impl(float *xb_out_dev, const float *q_dev,
     {
         static int no_fa3 = -1;
         if (no_fa3 < 0) no_fa3 = getenv("PICOLM_FA3_ATTN") ? 0 : 1;
+        if (no_fa3 && getenv("PICOLM_FA3_DEBUG"))
+            fprintf(stderr, "[FA3] not used: PICOLM_FA3_ATTN is unset (opt-in)\n");
+        if (!no_fa3 && getenv("PICOLM_FA3_DEBUG") && !ctx->has_imma)
+            fprintf(stderr, "[FA3] not used: device has no IMMA (needs sm_80+)\n");
+        if (!no_fa3 && getenv("PICOLM_FA3_DEBUG") && n_tokens < 32)
+            fprintf(stderr, "[FA3] not used: n_tokens=%d < 32\n", n_tokens);
+        if (!no_fa3 && getenv("PICOLM_FA3_DEBUG") && getenv("PICOLM_FORCE_SCALAR_ATTN"))
+            fprintf(stderr, "[FA3] not used: PICOLM_FORCE_SCALAR_ATTN is set\n");
         if (!no_fa3 && ctx->has_imma && n_tokens >= 32 && !getenv("PICOLM_FORCE_SCALAR_ATTN")) {
             if (picolm_gpu_attention_prefill_fa3_launch(
                     ctx->stream, xb_out_dev, q_dev, g_kv_k_dev[device], g_kv_v_dev[device],
