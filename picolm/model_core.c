@@ -612,9 +612,11 @@ static size_t kv_row_size_gqa(kv_cache_type_t kv_type, int n_elements) {
 
 /* True when a KV cache type has a device attention/dequant path. Mirrors
  * kv_block_bytes() in backend_gpu_dequant.cuh and picolm_gpu_kv_set_type().
- * TQ3/TQ4 have no GPU reader and must not take the GPU attention path. */
+ * TQ3/TQ4 have both a GPU reader (kv_row_dequant / kv_row_load_f16) and a
+ * GPU writer (picolm_gpu_kv_quant_store_kernel). */
 static int kv_type_gpu_capable(kv_cache_type_t t) {
-    return t == KV_CACHE_F16 || t == KV_CACHE_Q8_0 || t == KV_CACHE_Q4_0;
+    return t == KV_CACHE_F16 || t == KV_CACHE_Q8_0 || t == KV_CACHE_Q4_0 ||
+           t == KV_CACHE_TQ3  || t == KV_CACHE_TQ4;
 }
 
 /* kv_head_stride: byte offset between consecutive heads within a GQA row
@@ -2136,13 +2138,15 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                                 m->gpu.n_gpu_layers - 1, m->gpu.n_gpu_layers, c->n_layers - 1);
                     }
                     /* KV cache types the device attention kernels can read.
-                     * F16, Q8_0 and Q4_0 have device dequant paths (kv_block_bytes()
-                     * in backend_gpu_dequant.cuh); TQ3/TQ4 do not and stay CPU-only.
+                     * F16, Q8_0, Q4_0, TQ3 and TQ4 have device read and write paths
+                     * (backend_gpu_dequant.cuh / picolm_gpu_kv_quant_store_kernel).
                      * Quantized KV additionally requires head_dim to be a multiple of
                      * 32 because a block must not straddle a KV head. */
                     if (kv_type_k != KV_CACHE_F16 || kv_type_v != KV_CACHE_F16) {
-                        int kk = (kv_type_k == KV_CACHE_Q8_0 || kv_type_k == KV_CACHE_Q4_0);
-                        int vv = (kv_type_v == KV_CACHE_Q8_0 || kv_type_v == KV_CACHE_Q4_0);
+                        int kk = (kv_type_k == KV_CACHE_Q8_0 || kv_type_k == KV_CACHE_Q4_0 ||
+                                  kv_type_k == KV_CACHE_TQ3 || kv_type_k == KV_CACHE_TQ4);
+                        int vv = (kv_type_v == KV_CACHE_Q8_0 || kv_type_v == KV_CACHE_Q4_0 ||
+                                  kv_type_v == KV_CACHE_TQ3 || kv_type_v == KV_CACHE_TQ4);
                         int quant_ok = 1;
                         if (kv_type_k != KV_CACHE_F16 && !kk) quant_ok = 0;
                         if (kv_type_v != KV_CACHE_F16 && !vv) quant_ok = 0;
@@ -2192,6 +2196,10 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                         size_t total_k = (size_t)gpu_kv_layers * layer_bytes_k;
                         size_t total_v = (size_t)gpu_kv_layers * layer_bytes_v;
 
+                        if (getenv("PICOLM_TQ_SELFTEST")) {
+                            extern int picolm_gpu_tq_selftest(int device);
+                            picolm_gpu_tq_selftest(device);
+                        }
                         if (picolm_gpu_kv_alloc(total_k, total_v, device)) {
                             /* Tell the cache how its rows are laid out. If the
                              * backend has no dequant path for these types it

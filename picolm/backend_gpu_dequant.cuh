@@ -428,6 +428,115 @@ __device__ static inline float dequant_iq4_nl(const void *blk, int i) {
  * Values are pure C (no PTX), so this is HIP- and any-backend-safe.
  */
 
+/* TurboQuant TQ3/TQ4 GPU dequant support
+ *
+ * TQ3: 3-bit codebook (8 entries) + WHT rotation, 14 bytes/block (2B scale + 12B packed indices)
+ * TQ4: 4-bit codebook (16 entries) + WHT rotation, 18 bytes/block (2B scale + 16B packed indices)
+ *
+ * Dequant requires block-at-a-time processing: unpack indices, codebook lookup,
+ * inverse WHT (32-element butterfly), then scale. Cannot be expressed as a
+ * per-element formula like Q4_0/Q8_0. */
+
+/* TQ3 codebook (8-entry Lloyd-Max for N(0,1)) */
+__device__ static const float tq3_codebook_dev[8] = {
+    -2.1519f, -1.3439f, -0.7560f, -0.2451f,
+     0.2451f,  0.7560f,  1.3439f,  2.1519f
+};
+
+/* TQ4 codebook (16-entry Lloyd-Max for N(0,1)) */
+__device__ static const float tq4_codebook_dev[16] = {
+    -2.7326f, -2.0690f, -1.6180f, -1.2562f, -0.9423f, -0.6568f, -0.3880f, -0.1284f,
+     0.1284f,  0.3880f,  0.6568f,  0.9423f,  1.2562f,  1.6180f,  2.0690f,  2.7326f
+};
+
+/* TQ3 deterministic sign pattern (golden ratio hash) */
+__device__ static const float tq3_signs_dev[32] = {
+    1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f,
+   -1.0f,-1.0f, 1.0f,-1.0f, 1.0f, 1.0f,-1.0f, 1.0f,
+   -1.0f,-1.0f, 1.0f,-1.0f, 1.0f,-1.0f,-1.0f, 1.0f,
+   -1.0f, 1.0f, 1.0f,-1.0f, 1.0f,-1.0f,-1.0f, 1.0f
+};
+
+/* Unpack 8 3-bit indices from 3 bytes (TQ3) */
+__device__ static inline void tq3_unpack_3bit_8_dev(uint8_t *dst, const uint8_t *src) {
+    dst[0] = src[0] & 7;
+    dst[1] = (src[0] >> 3) & 7;
+    dst[2] = ((src[0] >> 6) | (src[1] << 2)) & 7;
+    dst[3] = (src[1] >> 1) & 7;
+    dst[4] = (src[1] >> 4) & 7;
+    dst[5] = ((src[1] >> 7) | (src[2] << 1)) & 7;
+    dst[6] = (src[2] >> 2) & 7;
+    dst[7] = (src[2] >> 5) & 7;
+}
+
+/* Unpack 8 4-bit indices from 4 bytes (TQ4) */
+__device__ static inline void tq4_unpack_4bit_8_dev(uint8_t *dst, const uint8_t *src) {
+    dst[0] = src[0] & 0xF;
+    dst[1] = src[0] >> 4;
+    dst[2] = src[1] & 0xF;
+    dst[3] = src[1] >> 4;
+    dst[4] = src[2] & 0xF;
+    dst[5] = src[2] >> 4;
+    dst[6] = src[3] & 0xF;
+    dst[7] = src[3] >> 4;
+}
+
+/* Inverse Walsh-Hadamard Transform for 32 elements (out-of-place).
+ * Used by both TQ3 and TQ4. Same butterfly as the CPU tq3_wht_inverse_32(). */
+__device__ static inline void tq_wht_inverse_32_dev(float *out, const float *in) {
+    for (int i = 0; i < 32; i++) out[i] = in[i];
+    for (int step = 1; step < 32; step <<= 1) {
+        for (int i = 0; i < 32; i += step << 1) {
+            for (int j = i; j < i + step; j++) {
+                float a = out[j];
+                float b = out[j + step];
+                out[j] = a + b;
+                out[j + step] = a - b;
+            }
+        }
+    }
+    const float norm = 1.0f / 5.656854249f; /* 1/sqrt(32) */
+    for (int i = 0; i < 32; i++) out[i] *= norm;
+    /* Undo sign flips */
+    for (int i = 0; i < 32; i++) out[i] *= tq3_signs_dev[i];
+}
+
+/* Dequantize one TQ3 block (32 values, 14 bytes) into FP16 output.
+ * packed: pointer to 12 bytes of 3-bit packed indices.
+ * scale: block RMS scale (already converted from FP16).
+ * dst: FP16 output, 32 elements. */
+__device__ static inline void tq3_dequant_block(const uint8_t *packed, float scale, uint16_t *dst) {
+    float rotated[32];
+    for (int g = 0; g < 4; g++) {
+        uint8_t indices[8];
+        tq3_unpack_3bit_8_dev(indices, packed + g * 3);
+        for (int k = 0; k < 8; k++)
+            rotated[g * 8 + k] = tq3_codebook_dev[indices[k]];
+    }
+    float reconstructed[32];
+    tq_wht_inverse_32_dev(reconstructed, rotated);
+    for (int i = 0; i < 32; i++)
+        dst[i] = gpu_fp32_to_fp16(reconstructed[i] * scale);
+}
+
+/* Dequantize one TQ4 block (32 values, 18 bytes) into FP16 output.
+ * packed: pointer to 16 bytes of 4-bit packed indices (nibbles).
+ * scale: block RMS scale (already converted from FP16).
+ * dst: FP16 output, 32 elements. */
+__device__ static inline void tq4_dequant_block(const uint8_t *packed, float scale, uint16_t *dst) {
+    float rotated[32];
+    for (int g = 0; g < 4; g++) {
+        uint8_t indices[8];
+        tq4_unpack_4bit_8_dev(indices, packed + g * 4);
+        for (int k = 0; k < 8; k++)
+            rotated[g * 8 + k] = tq4_codebook_dev[indices[k]];
+    }
+    float reconstructed[32];
+    tq_wht_inverse_32_dev(reconstructed, rotated);
+    for (int i = 0; i < 32; i++)
+        dst[i] = gpu_fp32_to_fp16(reconstructed[i] * scale);
+}
+
 /* Bytes per 32-value block for a KV cache storage format. Keep in sync with
  * kv_head_stride() in model_core.c and with picolm_gpu_kv_store/load callers.
  * Returns 0 for formats with no GPU dequant path.
@@ -441,12 +550,16 @@ __device__ static inline int kv_block_bytes(int kv_type) {
         case 0:  return 2;    /* KV_CACHE_F16: 32 values * 2 bytes */
         case 1:  return 34;   /* KV_CACHE_Q8_0: block_q8_0 */
         case 2:  return 18;   /* KV_CACHE_Q4_0: block_q4_0 */
-        default: return 0;    /* TQ3/TQ4 and anything else: CPU only */
+        case 3:  return 14;   /* KV_CACHE_TQ3: block_tq3 */
+        case 4:  return 18;   /* KV_CACHE_TQ4: block_tq4 */
+        default: return 0;
     }
 }
 
 /* Dequantize one value out of a KV cache row whose base byte offset is
- * `row_bytes_off`. `i` is the element index within the head (0..head_dim-1). */
+ * `row_bytes_off`. `i` is the element index within the head (0..head_dim-1).
+ * TQ3/TQ4 use the block-at-a-time kv_row_load_tq_block() path instead,
+ * so this function is not called for those types. */
 __device__ static inline float kv_row_dequant(const uint8_t *kv_base,
                                               size_t row_bytes_off, int kv_type, int i) {
     switch (kv_type) {
@@ -462,8 +575,50 @@ __device__ static inline float kv_row_dequant(const uint8_t *kv_base,
             const uint8_t *b = kv_base + row_bytes_off + (size_t)(i >> 5) * kv_block_bytes(2);
             return dequant_q4_0(b, i & 31);
         }
+        case 3:   /* TQ3 */
+        case 4: { /* TQ4 */
+            /* TQ needs the whole 32-value block, so this path dequantizes the
+             * block for every element it is asked for: 32x redundant, but it
+             * keeps every caller of kv_row_dequant() correct without each
+             * kernel needing a block-shaped special case. Kernels that stage
+             * whole tiles should use kv_row_load_f16()/kv_row_load_tq_block()
+             * instead, which decode each block once.
+             *
+             * Note this is the half of the pair that used to be missing: the
+             * tile loader knew TQ3/TQ4 and this scalar accessor silently
+             * returned 0.0f, so attention read all-zero K/V for TQ caches
+             * while the store wrote perfectly good bytes. */
+            int bb = kv_block_bytes(kv_type);
+            const uint8_t *blk = kv_base + row_bytes_off + (size_t)(i >> 5) * bb;
+            float scale = gpu_fp16_to_fp32((uint16_t)(blk[0] | ((uint16_t)blk[1] << 8)));
+            uint16_t vals[32];
+            if (kv_type == 3) tq3_dequant_block(blk + 2, scale, vals);
+            else              tq4_dequant_block(blk + 2, scale, vals);
+            return gpu_fp16_to_fp32(vals[i & 31]);
+        }
         default:
             return 0.0f;
+    }
+}
+
+/* Load one TQ3/TQ4 KV head row into the FP16 shared tile, block-at-a-time.
+ * Each thread processes one or more 32-element blocks. */
+__device__ static inline void kv_row_load_tq_block(const uint8_t *kv_base,
+                                                    size_t row_bytes_off, int kv_type,
+                                                    int head_dim, int tid, int n_threads,
+                                                    uint16_t *dst16) {
+    int nb = head_dim / 32;
+    int bb = kv_block_bytes(kv_type); /* 14 for TQ3, 18 for TQ4 */
+    const uint8_t *row = kv_base + row_bytes_off;
+
+    for (int bi = tid; bi < nb; bi += n_threads) {
+        const uint8_t *blk = row + (size_t)bi * bb;
+        float scale = gpu_fp16_to_fp32((uint16_t)(blk[0] | ((uint16_t)blk[1] << 8)));
+        const uint8_t *packed = blk + 2;
+        uint16_t *dst = dst16 + bi * 32;
+
+        if (kv_type == 3) tq3_dequant_block(packed, scale, dst);
+        else              tq4_dequant_block(packed, scale, dst);
     }
 }
 
@@ -490,8 +645,13 @@ __device__ static inline void kv_row_load_f16(const uint8_t *kv_base,
             dst16[d] = src[d];
         return;
     }
-    /* Quantized: dequantize into the tile. The kernels consume the tile as
-     * FP16, so round exactly the way the F16 cache would have stored it. */
+    if (kv_type == 3 || kv_type == 4) { /* TQ3/TQ4: block-at-a-time with WHT inverse */
+        kv_row_load_tq_block(kv_base, row_bytes_off, kv_type, head_dim, tid, n_threads, dst16);
+        return;
+    }
+    /* Quantized (Q8_0, Q4_0): dequantize into the tile. The kernels consume
+     * the tile as FP16, so round exactly the way the F16 cache would have
+     * stored it. */
     for (int d = tid; d < head_dim; d += n_threads)
         dst16[d] = gpu_fp32_to_fp16(kv_row_dequant(kv_base, row_bytes_off, kv_type, d));
 }

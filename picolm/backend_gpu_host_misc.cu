@@ -1,5 +1,6 @@
 // backend_gpu_host_misc.cu - KV cache, pipeline, attention, rmsnorm, rope, residual, misc
 #include "backend_gpu_kernels.cuh"
+#include "backend_gpu_kvquant.cuh"
 
 /* PICOLM_GPU_PROF hooks, defined at the bottom of this file. */
 extern "C" int  picolm_gpu_prof_slot(const char *name);
@@ -67,11 +68,11 @@ picolm_gpu_kv_set_type(int kv_type_k, int kv_type_v,
                         size_t kv_head_stride_k, size_t kv_head_stride_v,
                         int device) {
     if (device < 0 || device >= PICOLM_GPU_MAX_DEVICES) return 0;
-    /* Only F16, Q8_0 and Q4_0 have a device dequant path (kv_block_bytes() in
-     * backend_gpu_dequant.cuh). TQ3/TQ4 stay CPU-only: refuse rather than let
-     * the attention kernels read a format they cannot decode. */
-    if (kv_type_k < 0 || kv_type_k > 2) return 0;
-    if (kv_type_v < 0 || kv_type_v > 2) return 0;
+    /* F16, Q8_0, Q4_0, TQ3 and TQ4 all have device read (kv_block_bytes() /
+     * kv_row_load_f16() in backend_gpu_dequant.cuh) AND write
+     * (picolm_gpu_kv_quant_store_kernel) paths. */
+    if (kv_type_k < 0 || kv_type_k > 4) return 0;
+    if (kv_type_v < 0 || kv_type_v > 4) return 0;
     g_kv_type_k[device] = kv_type_k;
     g_kv_type_v[device] = kv_type_v;
     g_kv_head_stride_k[device] = kv_head_stride_k;
@@ -452,6 +453,17 @@ picolm_gpu_kv_quant_store_kernel(uint8_t *dst_row, const float *src,
 
     float x = src[(size_t)blk * 32 + lane];
 
+    /* TQ3/TQ4 have their own block layout and their own reduction (rms, not
+     * absmax) and their own transform, so they branch out before the absmax
+     * butterfly. Everything else about the shape is identical: one warp per
+     * block, one lane per value, and every output byte written exactly once. */
+    if (kv_type == 3 || kv_type == 4) {
+        int is_tq4 = (kv_type == 4);
+        uint8_t *b = dst_row + (size_t)blk * (is_tq4 ? 18 : 14);
+        tq_quant_block_warp(x, lane, is_tq4, b);
+        return;
+    }
+
     /* Butterfly absmax across the 32 lanes of this warp. Every lane ends with
      * the same value, so no lane needs to read another lane's scratch. */
     float amax = fabsf(x);
@@ -495,6 +507,68 @@ picolm_gpu_kv_quant_store_kernel(uint8_t *dst_row, const float *src,
         if (lane < 16)
             b[2 + lane] = (uint8_t)((v & 0x0F) | (((int)hi_v & 0x0F) << 4));
     }
+}
+
+/* PICOLM_TQ_SELFTEST: push one known 32-value block through the DEVICE
+ * quantizer and compare the packed bytes against quantize_row_tq3() running
+ * in this same process. This is the cheap way to prove the device TQ kernel
+ * agrees with the CPU one without a hand-invoked nvcc build (which does not
+ * work on this box -- see the handoff).
+ *
+ * The interesting half is the rms: a mismatch there means the warp reduction
+ * is wrong, a mismatch only in the packed bytes means the WHT/codebook/pack
+ * path is wrong. */
+__global__ void
+tq_selftest_kernel(const float *x, uint8_t *out) {
+    tq_quant_block_warp(x[threadIdx.x], (int)threadIdx.x, 0, out);
+}
+
+/* quant.c, declared here so this CUDA TU does not include quant.h. */
+extern "C" void quantize_row_tq3(const float *x, void *dst, int n);
+
+extern "C" int
+picolm_gpu_tq_selftest(int device) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    float hx[32];
+    for (int i = 0; i < 32; i++) hx[i] = sinf((float)i * 0.7f) * 1.5f + 0.3f;
+    float *dx = NULL; uint8_t *dout = NULL;
+    if (!gpu_ok(gpuMalloc(&dx, 32 * sizeof(float)), "selftest x")) return 0;
+    if (!gpu_ok(gpuMalloc(&dout, 14), "selftest out")) { gpuFree(dx); return 0; }
+    /* Stream-ordered: the kernel runs on ctx->stream, and a blocking
+     * gpuMemcpy only synchronises the DEFAULT stream. */
+    gpuMemcpyAsync(dx, hx, 32 * sizeof(float), gpuMemcpyHostToDevice, ctx->stream);
+    tq_selftest_kernel<<<1, 32, 0, ctx->stream>>>(dx, dout);
+    if (!gpu_ok(gpuGetLastError(), "selftest kernel")) { gpuFree(dx); gpuFree(dout); return 0; }
+    uint8_t hout[14];
+    gpuMemcpyAsync(hout, dout, 14, gpuMemcpyDeviceToHost, ctx->stream);
+    gpuDeviceSynchronize();
+    gpuFree(dx); gpuFree(dout);
+
+    /* 14 = sizeof(block_tq3): 2-byte fp16 rms + 12 packed bytes. Spelled out
+     * rather than sizeof() so this file does not have to include quant.h
+     * (a C header) into a CUDA translation unit. */
+    #define TQ_SELFTEST_BLOCK_BYTES 14
+    uint8_t cref[TQ_SELFTEST_BLOCK_BYTES];
+    quantize_row_tq3(hx, cref, 32);
+
+    int diff = 0, diff_packed = 0;
+    for (size_t i = 0; i < TQ_SELFTEST_BLOCK_BYTES; i++)
+        if (hout[i] != cref[i]) { diff++; if (i >= 2) diff_packed++; }
+    /* Bytes 0-1 are the fp16 rms. The device reduces sum(x^2) with a warp
+     * butterfly and the CPU sums serially, so the last bit of the fp32 sum --
+     * and therefore sometimes the last bit of the fp16 rms -- can differ.
+     * What must NOT differ is the packed codebook indices: those are exact
+     * integers, and a mismatch there means the WHT, the codebook or the
+     * packing is wrong. */
+    fprintf(stderr, "[TQ_SELFTEST] %s  (rms bytes differ: %s, packed bytes differ: %d)\n  device:",
+            (diff_packed == 0) ? "OK" : "FAIL",
+            (diff - diff_packed) ? "yes (fp32 summation order)" : "no", diff_packed);
+    for (size_t i = 0; i < TQ_SELFTEST_BLOCK_BYTES; i++) fprintf(stderr, " %02x", hout[i]);
+    fprintf(stderr, "\n  cpu   :");
+    for (size_t i = 0; i < TQ_SELFTEST_BLOCK_BYTES; i++) fprintf(stderr, " %02x", cref[i]);
+    fprintf(stderr, "\n");
+    return diff == 0;
 }
 
 /* Device-native KV store: src_dev is pipe_k/pipe_v (F32, already on
@@ -546,7 +620,17 @@ picolm_gpu_kv_store_dev_batched_strided(int is_k, int layer_ordinal, int start_p
      * exactly this, and the device cache was allocated from it. */
     size_t row_bytes;
     if (g_kv_types_set[device] && kv_type != 0) {
-        int block_bytes = (kv_type == 1) ? 34 : 18;
+        /* Block sizes: Q8_0 34, Q4_0 18, TQ3 14, TQ4 18. Keep in sync with
+         * kv_block_bytes() in backend_gpu_dequant.cuh and kv_head_stride() in
+         * model_core.c -- these three must agree or the cache is misread. */
+        int block_bytes;
+        switch (kv_type) {
+            case 1:  block_bytes = 34; break;   /* Q8_0 */
+            case 2:  block_bytes = 18; break;   /* Q4_0 */
+            case 3:  block_bytes = 14; break;   /* TQ3 */
+            case 4:  block_bytes = 18; break;   /* TQ4 */
+            default: block_bytes = 18; break;
+        }
         row_bytes = (size_t)(kv_dim / 32) * block_bytes;
     } else {
         row_bytes = (size_t)kv_dim * sizeof(uint16_t);
