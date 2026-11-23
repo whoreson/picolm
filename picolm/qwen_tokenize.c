@@ -373,6 +373,80 @@ static int pretok_next_spark25(const char *s, int n) {
     return adv; /* fallback: single codepoint */
 }
 
+/* GPT-2 pretokenizer (tokenizer.ggml.pre == "gpt-2" and "granite-docling"
+ * -- IBM Granite 4.x uses the identical pattern, per llama.cpp's
+ * LLAMA_VOCAB_PRE_TYPE_GRANITE_DOCLING):
+ *   's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)
+ *
+ * vs QWEN_PRETOK_DEFAULT: contractions are case-sensitive, digit RUNS are
+ * one pretoken, an optional single space attaches to the start of a
+ * letter/digit/punct run, and whitespace that cannot attach (mid-text
+ * newline, extra space) is emitted one character at a time -- except a
+ * whitespace run that reaches the end of the string, which is one pretoken
+ * (\s+(?!\S)). Verified against llama.cpp's byte-exact tokenization. */
+static int pretok_next_gpt2(const char *s, int n) {
+    int cp, adv;
+    /* 1: contractions (case-sensitive) */
+    if (s[0] == '\'') {
+        if (n >= 3 && ((s[1] == 'r' && s[2] == 'e') || (s[1] == 'v' && s[2] == 'e') ||
+                       (s[1] == 'l' && s[2] == 'l'))) return 3;
+        if (n >= 2 && (s[1] == 's' || s[1] == 't' || s[1] == 'm' || s[1] == 'd')) return 2;
+    }
+    adv = utf8_next(s, n, &cp);
+    /* 2/3/4: optional leading space + (letters | digits | punct run) */
+    if (cp == ' ' && adv < n) {
+        int c2, a2 = utf8_next(s + adv, n - adv, &c2);
+        if (is_L(c2)) {
+            int j = adv + a2;
+            while (j < n) { int c3, a3 = utf8_next(s + j, n - j, &c3); if (!is_L(c3)) break; j += a3; }
+            return j;
+        }
+        if (is_N(c2)) {
+            int j = adv + a2;
+            while (j < n) { int c3, a3 = utf8_next(s + j, n - j, &c3); if (!is_N(c3)) break; j += a3; }
+            return j;
+        }
+        if (!is_WS(c2)) {
+            int j = adv + a2;
+            while (j < n) { int c3, a3 = utf8_next(s + j, n - j, &c3);
+                             if (is_WS(c3) || is_L(c3) || is_N(c3)) break; j += a3; }
+            return j;
+        }
+        /* space followed by whitespace: \s+(?!\S) only when the run is
+         * trailing; otherwise a lone space (the next token re-examines the
+         * remaining run) */
+        {
+            int j = 0;
+            while (j < n) { int c3, a3 = utf8_next(s + j, n - j, &c3); if (!is_WS(c3)) break; j += a3; }
+            if (j == n) return j;
+        }
+        return adv;
+    }
+    if (is_L(cp)) {
+        int j = adv;
+        while (j < n) { int c3, a3 = utf8_next(s + j, n - j, &c3); if (!is_L(c3)) break; j += a3; }
+        return j;
+    }
+    if (is_N(cp)) {
+        int j = adv;
+        while (j < n) { int c3, a3 = utf8_next(s + j, n - j, &c3); if (!is_N(c3)) break; j += a3; }
+        return j;
+    }
+    if (is_WS(cp)) {
+        int j = 0;
+        while (j < n) { int c3, a3 = utf8_next(s + j, n - j, &c3); if (!is_WS(c3)) break; j += a3; }
+        if (j == n) return j;   /* trailing run: \s+(?!\S) */
+        return adv;             /* mid-text whitespace: single char */
+    }
+    /* punct run (no leading space) */
+    {
+        int j = adv;
+        while (j < n) { int c3, a3 = utf8_next(s + j, n - j, &c3);
+                         if (is_WS(c3) || is_L(c3) || is_N(c3)) break; j += a3; }
+        return j;
+    }
+}
+
 static int pretok_next_common(const char *s, int n, int glm4_digits) {
     int cp, adv;
 
@@ -702,7 +776,7 @@ int qwen_tokenize_should_use(const model_t *m) {
      * Safetensors Qwen models also use this tokenizer (from_safetensors path). */
     return m->config.is_qwen || m->config.is_gpt2 || m->config.is_tekken ||
            m->config.is_gptneox || m->config.is_glm4_tok || m->config.is_spark25 ||
-           m->from_safetensors;
+           m->config.is_granite || m->from_safetensors;
 }
 
 /* Initialize the Qwen tokenizer from model data */
@@ -712,7 +786,14 @@ int qwen_tokenize_init(qwen_enc_t *enc, const model_t *m) {
     enc->pretok_type = m->config.is_tekken ? QWEN_PRETOK_TEKKEN
                      : m->config.is_glm4_tok ? QWEN_PRETOK_GLM4
                      : m->config.is_spark25 ? QWEN_PRETOK_SPARK25
+                     : m->config.is_granite ? QWEN_PRETOK_GPT2
                      : QWEN_PRETOK_DEFAULT;
+    /* granite-docling (and all families): type-3+4 tokens are whole tokens
+     * in EVERY mode -- verified against llama.cpp b12300, whose /tokenize
+     * endpoint maps im_start/im_end and the think/tool tags to single IDs
+     * (100256/100257/100274/100275) even for raw text. (An earlier
+     * granite-only disable here was based on tokenizing the WRONG tag
+     * bytes -- pipe form instead of the vocab's actual tag bytes.) */
 
     /* Guard: Qwen tokenizer requires tok_tokens_data from GGUF */
     if (!m->tok_tokens_data || !m->tok_n_tokens) {
@@ -840,7 +921,9 @@ void qwen_tokenize_free(qwen_enc_t *enc) {
     free(enc->vocab_len); enc->vocab_len = NULL;
 }
 
-/* Encode text to token IDs. Returns number of tokens produced. */
+/* Encode text to token IDs. Returns number of tokens produced.
+ * Type-3/4 special tokens are matched as whole tokens at any position
+ * (longest match wins), mirroring llama.cpp's tokenizer. */
 int qwen_tokenize_encode(qwen_enc_t *enc, const char *text, int *out, int cap) {
     int n = (int)strlen(text);
     int pos = 0, m2 = 0;
@@ -868,7 +951,7 @@ int qwen_tokenize_encode(qwen_enc_t *enc, const char *text, int *out, int cap) {
                 }
             }
         }
-        found:;
+    found:;
 
         int q = pos;
         while (q < end && m2 < cap) {
@@ -878,6 +961,8 @@ int qwen_tokenize_encode(qwen_enc_t *enc, const char *text, int *out, int cap) {
                       ? pretok_next_glm4(text + q, end - q)
                       : (enc->pretok_type == QWEN_PRETOK_SPARK25)
                       ? pretok_next_spark25(text + q, end - q)
+                      : (enc->pretok_type == QWEN_PRETOK_GPT2)
+                      ? pretok_next_gpt2(text + q, end - q)
                       : pretok_next(text + q, end - q);
             if (pl <= 0) pl = 1;
             m2 += bpe_piece(enc, text + q, pl, out + m2, cap - m2);

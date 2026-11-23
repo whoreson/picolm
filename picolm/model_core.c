@@ -2336,6 +2336,10 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                                 m->gpu.output_norm_bias_dev =
                                     picolm_gpu_upload_f32(s->output_norm_b, c->n_embd, device);
                             }
+                            /* Model-specified attention-logit scale
+                             * (granite.attention.scale = 1/128 etc.).
+                             * 0 = default 1/sqrt(head_dim). */
+                            picolm_gpu_set_attn_scale(c->attn_score_scale);
                             /* Per-layer norm weights (only for GPU layers) */
                             for (int l = 0; l < ngl; l++) {
                                 m->gpu.attn_norm_dev[l] =
@@ -3590,6 +3594,10 @@ float *model_forward_range(model_t *m, int token, int pos, int l_lo, int l_hi,
             dequantize_row(embd_row, s->x, dim, w->type_token_embd);
         }
     }
+    /* Granite 4.x: scale the embedding output (default 1.0 = no-op) */
+    if (do_embed && c->embd_scale != 1.0f) {
+        for (int i = 0; i < dim; i++) s->x[i] *= c->embd_scale;
+    }
 
     /* DEBUG: dump input embedding */
     if (getenv("PICOLM_DBG_LAYER")) {
@@ -3947,7 +3955,10 @@ float *model_forward_range(model_t *m, int token, int pos, int l_lo, int l_hi,
         gctx.kv_hadamard_k = s->kv_hadamard_k;
         gctx.kv_hadamard_v = s->kv_hadamard_v;
         gctx.kv_hadamard_size = s->kv_hadamard_size;
-        gctx.attn_scale = 1.0f / sqrtf((float)head_dim);
+        /* Model-specified attention-logit scale (granite.attention.scale /
+         * mistral3.attention.temperature_scale); 0 = default 1/sqrt(head_dim) */
+        gctx.attn_scale = (c->attn_score_scale > 0.0f)
+            ? c->attn_score_scale : 1.0f / sqrtf((float)head_dim);
         gctx.n_swa = c->n_swa_layer[l];
 
 #ifdef PICOLM_GPU
@@ -4141,6 +4152,10 @@ ffn_done:
     /* Debug: dump CPU decode hidden state at pos=1 */
     matmul(s->logits, s->x, w->output, dim, c->vocab_size, w->type_output);
     tensor_set_repacked(NULL);
+    /* Granite 4.x: scale the final logits (default 1.0 = no-op) */
+    if (c->logit_scale != 1.0f) {
+        for (int i = 0; i < c->vocab_size; i++) s->logits[i] *= c->logit_scale;
+    }
 
     /* Debug: dump top-10 logits at first decode steps */
     if (getenv("PICOLM_DBG_LOGITS") && pos <= 6) {
@@ -5721,6 +5736,11 @@ float *model_forward_prefill_range(model_t *m, const int *tokens, int n_tokens, 
     int n_heads = c->n_heads, n_kv_heads = c->n_kv_heads, head_dim = c->head_dim;
     int kv_dim = n_kv_heads * head_dim;
     int q_dim = n_heads * head_dim, seq_len = c->max_seq_len;
+    /* Attention-logit scale: some models override 1/sqrt(head_dim)
+     * (granite.attention.scale = 1/128, mistral3.attention.temperature_scale).
+     * Config value 0.0f => use the default. */
+    const float attn_scale = (c->attn_score_scale > 0.0f)
+        ? c->attn_score_scale : 1.0f / sqrtf((float)head_dim);
     /* Qwen3.5 full attention layers have interleaved Q+gate */
     int q_full_dim = (c->has_ssm) ? (q_dim * 2) : q_dim;
     int max_dim = (q_full_dim > dim) ? q_full_dim : dim;
@@ -6282,7 +6302,7 @@ float *model_forward_prefill_range(model_t *m, const int *tokens, int n_tokens, 
                                           max_dim, (int)s->kv_type_k, (int)s->kv_type_v,
                                           s->kv_row_size_k, s->kv_row_size_v,
                                           s->kv_head_stride_k, s->kv_head_stride_v,
-                                          1.0f / sqrtf((float)head_dim),
+                                          attn_scale,
                                           c->n_swa_layer[l]);
                 }
             } else
@@ -6296,7 +6316,7 @@ float *model_forward_prefill_range(model_t *m, const int *tokens, int n_tokens, 
                                       max_dim, (int)s->kv_type_k, (int)s->kv_type_v,
                                       s->kv_row_size_k, s->kv_row_size_v,
                                       s->kv_head_stride_k, s->kv_head_stride_v,
-                                      1.0f / sqrtf((float)head_dim),
+                                      attn_scale,
                                       c->n_swa_layer[l]);
             }
         }

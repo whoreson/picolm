@@ -43,6 +43,8 @@
 #include <string.h>
 #include <stdio.h>
 
+
+
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -90,6 +92,7 @@ static inline hipError_t picolm_hipMemcpy2D(void *dst, size_t dpitch,
 #define gpuMemcpyDeviceToDevice hipMemcpyDeviceToDevice
 #define gpuMemcpyDefault hipMemcpyDefault
 #define gpuMemcpyAsync hipMemcpyAsync
+#define gpuMemcpyToSymbol hipMemcpyToSymbol
 #define gpuStream_t hipStream_t
 #define gpuStreamCreateWithFlags hipStreamCreateWithFlags
 #define gpuStreamDestroy hipStreamDestroy
@@ -163,7 +166,15 @@ typedef hipEvent_t gpuEvent_t;
 #define gpuDeviceAttributeMaxSharedMemoryPerMultiprocessor hipDeviceAttributeMaxSharedMemoryPerMultiprocessor
 #define gpuDeviceAttributeMaxBlocksPerMultiprocessor hipDeviceAttributeMaxBlocksPerMultiProcessor
 /* HIP: no hipMemAdvise equivalent; unified memory is automatic on HIP */
+#ifdef __CUDA_ARCH__
 #define GPU_WARP_SIZE __AMDGCN_WAVEFRONT_SIZE
+#else
+/* hipcc host pass: __AMDGCN_WAVEFRONT_SIZE is device-only (HIP defines
+ * __CUDA_ARCH__ in the device pass; ROCm 7.x also defines
+ * __HIP_DEVICE_COMPILE__/__AMDGCN__ in the host pass, so neither is a
+ * usable guard). gfx90x targets have 64-wide wavefronts. */
+#define GPU_WARP_SIZE 64
+#endif
 #else
 /* NVIDIA CUDA */
 #define gpuSuccess cudaSuccess
@@ -189,6 +200,7 @@ static inline cudaError_t picolm_cudaMemcpy2D(void *dst, size_t dpitch,
 #define gpuMemcpyDeviceToDevice cudaMemcpyDeviceToDevice
 #define gpuMemcpyDefault cudaMemcpyDefault
 #define gpuMemcpyAsync cudaMemcpyAsync
+#define gpuMemcpyToSymbol cudaMemcpyToSymbol
 #define gpuStream_t cudaStream_t
 #define gpuStreamCreateWithFlags cudaStreamCreateWithFlags
 #define gpuStreamDestroy cudaStreamDestroy
@@ -308,9 +320,14 @@ __device__ static inline void gpu_fp16_dot2(float &acc, const half2 v, const hal
 }
 #endif
 
-/* Host-visible predefine for the dispatch code. On HIP/AMD builds the dot2
- * instruction is available on all architectures that hipcc supports. */
-#if defined(__HIP_PLATFORM_AMD__)
+/* Host-visible predefine for the dispatch code. v_dot2_f32_f16 does NOT
+ * exist on gfx900/gfx900a (the assembler rejects it), so gate on the same
+ * arch list as the __device__ definition above. */
+#if defined(__HIP_PLATFORM_AMD__) && \
+    (defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__) || defined(__gfx940__) || \
+     defined(__gfx941__) || defined(__gfx942__) || defined(__gfx1030__) || defined(__gfx1031__) || \
+     defined(__gfx1032__) || defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
+     defined(__gfx1103__))
 #define GPU_FP16_DOT2_AVAILABLE
 #endif
 

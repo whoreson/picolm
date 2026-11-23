@@ -3,6 +3,15 @@
 // is included by multiple host .cu files.
 #include "backend_gpu_kernels.cuh"
 
+/* Model-specified attention-logit scale (e.g. granite.attention.scale = 1/128,
+ * mistral3.attention.temperature_scale). Set once at model load via
+ * picolm_gpu_set_attn_scale(). 0.0f = use the default 1/sqrt(head_dim).
+ *
+ * Device code is linked per-translation-unit (no relocatable device code),
+ * so this variable MUST be defined in the same TU as the kernels that read
+ * it, and picolm_gpu_set_attn_scale() (below) writes to this very copy. */
+__device__ float picolm_gpu_d_attn_scale = 0.0f;
+
 /* lines 7-184 from backend_gpu_kernels.cuh */
 __global__ void
 picolm_quant_matmul(float *y, const float *x, const void *weights,
@@ -5283,7 +5292,7 @@ picolm_gpu_attention_decode_kernel(
     }
     gpuSyncthreads();
 
-    float attn_scale = 1.0f / sqrtf((float)head_dim);
+    float attn_scale = (picolm_gpu_d_attn_scale > 0.0f) ? picolm_gpu_d_attn_scale : 1.0f / sqrtf((float)head_dim);
 
     /* Sliding window: restrict the scan to [max(0,pos-n_swa+1), pos] when
      * this layer is SWA (n_swa > 0). n_swa == 0 is the pre-SWA, full
@@ -5420,7 +5429,7 @@ picolm_gpu_attention_decode_split_kernel(
 
     if (t0 < t1) {
         size_t layer_base = (size_t)layer_ordinal * max_seq_len * kv_pos_stride_bytes;
-        float attn_scale = 1.0f / sqrtf((float)head_dim);
+        float attn_scale = (picolm_gpu_d_attn_scale > 0.0f) ? picolm_gpu_d_attn_scale : 1.0f / sqrtf((float)head_dim);
 
         for (int t = t0; t < t1; t++) {
             size_t row_off = layer_base + (size_t)t * kv_pos_stride_bytes + (size_t)kv_h * kv_head_stride_bytes;
@@ -5757,7 +5766,7 @@ picolm_gpu_attention_prefill_f32kv_kernel(
     int n_threads = gpuBlockDim_x;
 
     int kv_h = h / (n_heads / n_kv_heads);
-    float attn_scale = 1.0f / sqrtf((float)head_dim);
+    float attn_scale = (picolm_gpu_d_attn_scale > 0.0f) ? picolm_gpu_d_attn_scale : 1.0f / sqrtf((float)head_dim);
 
     int q_start = tile_q_idx * tile_q;
     int q_end = min(q_start + tile_q, n_tokens);
@@ -5907,7 +5916,7 @@ picolm_gpu_attention_prefill_kernel(
     int n_threads = gpuBlockDim_x;
 
     int kv_h = h / (n_heads / n_kv_heads);
-    float attn_scale = 1.0f / sqrtf((float)head_dim);
+    float attn_scale = (picolm_gpu_d_attn_scale > 0.0f) ? picolm_gpu_d_attn_scale : 1.0f / sqrtf((float)head_dim);
     /* Layer base offset in uint16_t */
     size_t layer_base = (size_t)layer_ordinal * max_seq_len * kv_pos_stride_bytes;
 
@@ -6302,7 +6311,7 @@ picolm_gpu_attention_prefill_warpgrp_kernel(
     int lane = tid % GRP;  /* lane within the subgroup, 0..GRP-1 */
 
     int kv_h = h / (n_heads / n_kv_heads);
-    float attn_scale = 1.0f / sqrtf((float)head_dim);
+    float attn_scale = (picolm_gpu_d_attn_scale > 0.0f) ? picolm_gpu_d_attn_scale : 1.0f / sqrtf((float)head_dim);
     size_t layer_base = (size_t)layer_ordinal * max_seq_len * kv_pos_stride_bytes;
 
     int q_start = tile_q_idx * tile_q;
@@ -6520,7 +6529,7 @@ picolm_gpu_attention_prefill_warpgrp_dot2_kernel(
     int lane = tid % GRP;
 
     int kv_h = h / (n_heads / n_kv_heads);
-    float attn_scale = 1.0f / sqrtf((float)head_dim);
+    float attn_scale = (picolm_gpu_d_attn_scale > 0.0f) ? picolm_gpu_d_attn_scale : 1.0f / sqrtf((float)head_dim);
     size_t layer_base = (size_t)layer_ordinal * max_seq_len * kv_pos_stride_bytes;
 
     int q_start = tile_q_idx * tile_q;
@@ -7553,7 +7562,7 @@ picolm_gpu_attention_prefill_fa2_kernel(
     int kv_mul = n_heads / n_kv_heads;
     int kv_h = q_h / kv_mul;
 
-    float attn_scale = 1.0f / sqrtf((float)head_dim);
+    float attn_scale = (picolm_gpu_d_attn_scale > 0.0f) ? picolm_gpu_d_attn_scale : 1.0f / sqrtf((float)head_dim);
     size_t layer_base = (size_t)layer_ordinal * max_seq_len * kv_pos_stride_bytes;
     int n_total_kv = start_pos + n_tokens;
     int n_k16 = head_dim / 16;
@@ -7716,4 +7725,14 @@ picolm_gpu_attention_prefill_fa2_kernel(
         for (int d = lt; d < head_dim; d += 32)
             xb[d] = aq[d] * inv;
     }
+}
+
+/* Model-specified attention scale (granite.attention.scale etc.).
+ * 0.0f => kernels fall back to 1/sqrt(head_dim). Defined in this TU so the
+ * device link at compile time resolves picolm_gpu_d_attn_scale for the
+ * attention kernels above (see the note at the top of this file). */
+extern "C" void
+picolm_gpu_set_attn_scale(float scale) {
+    gpuMemcpyToSymbol(picolm_gpu_d_attn_scale, &scale, sizeof(float), 0,
+                      gpuMemcpyHostToDevice);
 }

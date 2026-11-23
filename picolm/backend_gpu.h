@@ -523,6 +523,11 @@ int picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
                                       int n_heads, int n_kv_heads, int head_dim,
                                       int max_seq_len, int device, int n_swa);
 
+/* Set the model-specified attention-logit scale for all GPU attention
+ * kernels (e.g. granite.attention.scale). 0.0f restores the default
+ * 1/sqrt(head_dim). Call once after GPU initialization, before inference. */
+void picolm_gpu_set_attn_scale(float scale);
+
 /* Device-native prefill attention with FP32 K/V (no KV cache read).
  * K/V are FP32 buffers with layout [pos][kv_head][head_dim]. */
 int picolm_gpu_attention_prefill_f32kv(float *xb_out_dev, const float *q_dev,

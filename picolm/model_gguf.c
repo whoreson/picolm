@@ -1324,6 +1324,10 @@ int parse_gguf(model_t *m, int max_seq_len) {
     cfg->max_seq_len = 2048;
     cfg->weight_type = GGUF_TYPE_F16;
     cfg->n_layer_sparsity = 0;
+    /* Model-specified scaling factors (Granite 4.x): defaults = no scaling */
+    cfg->attn_score_scale = 0.0f;  /* 0 = use 1/sqrt(head_dim) */
+    cfg->embd_scale = 1.0f;
+    cfg->logit_scale = 1.0f;
     cfg->f_sparsity_std_mul = 0.0f;
     cfg->n_swa = 0;
     cfg->swa_period = 0;
@@ -1409,6 +1413,14 @@ int parse_gguf(model_t *m, int max_seq_len) {
                 if (arch.len == 8 && memcmp(arch.str, "spark2_5", 8) == 0) {
                     cfg->is_spark25 = 1;
                 }
+                /* Check for IBM Granite 4.x: "granite" */
+                if (arch.len == 7 && memcmp(arch.str, "granite", 7) == 0) {
+                    cfg->is_granite = 1;
+                }
+                /* Check for Mistral/Ministral 3: "mistral3" */
+                if (arch.len == 8 && memcmp(arch.str, "mistral3", 8) == 0) {
+                    cfg->is_mistral3 = 1;
+                }
             } else {
                 skip_meta_value(&r, vtype, &dummy);
             }
@@ -1418,7 +1430,7 @@ int parse_gguf(model_t *m, int max_seq_len) {
         if (str_eq(key, "glm5next.embedding_length") || str_eq(key, "llama.embedding_length") || str_eq(key, "general.embedding_length")
             || str_eq(key, "qwen2.embedding_length") || str_eq(key, "qwen3.embedding_length") || str_eq(key, "qwen35.embedding_length") || str_eq(key, "qwen35moe.embedding_length")
             || str_eq(key, "gemma3n.embedding_length") || str_eq(key, "gpt2.embedding_length") || str_eq(key, "stablelm.embedding_length")
-            || str_eq(key, "gptneox.embedding_length") || str_eq(key, "spark2_5.embedding_length")) {
+            || str_eq(key, "gptneox.embedding_length") || str_eq(key, "spark2_5.embedding_length") || str_eq(key, "mistral3.embedding_length") || str_eq(key, "granite.embedding_length")) {
             int dummy; cfg->n_embd = (int)skip_meta_value(&r, vtype, &dummy);
             /* RoPE convention per family.
              *
@@ -1484,17 +1496,17 @@ int parse_gguf(model_t *m, int max_seq_len) {
         } else if (str_eq(key, "glm5next.feed_forward_length") || str_eq(key, "llama.feed_forward_length") || str_eq(key, "general.feed_forward_length")
             || str_eq(key, "qwen2.feed_forward_length") || str_eq(key, "qwen3.feed_forward_length") || str_eq(key, "qwen35.feed_forward_length")
             || str_eq(key, "gemma3n.feed_forward_length") || str_eq(key, "gpt2.feed_forward_length") || str_eq(key, "stablelm.feed_forward_length")
-            || str_eq(key, "gptneox.feed_forward_length") || str_eq(key, "spark2_5.feed_forward_length")) {
+            || str_eq(key, "gptneox.feed_forward_length") || str_eq(key, "spark2_5.feed_forward_length") || str_eq(key, "mistral3.feed_forward_length") || str_eq(key, "granite.feed_forward_length")) {
             cfg->n_ffn = (int)read_ffn_length(&r, vtype);
         } else if (str_eq(key, "glm5next.attention.head_count") || str_eq(key, "llama.attention.head_count")
             || str_eq(key, "qwen2.attention.head_count") || str_eq(key, "qwen3.attention.head_count") || str_eq(key, "qwen35.attention.head_count") || str_eq(key, "qwen35moe.attention.head_count")
             || str_eq(key, "gemma3n.attention.head_count") || str_eq(key, "gpt2.attention.head_count") || str_eq(key, "stablelm.attention.head_count")
-            || str_eq(key, "gptneox.attention.head_count") || str_eq(key, "spark2_5.attention.head_count")) {
+            || str_eq(key, "gptneox.attention.head_count") || str_eq(key, "spark2_5.attention.head_count") || str_eq(key, "mistral3.attention.head_count") || str_eq(key, "granite.attention.head_count")) {
             int dummy; cfg->n_heads = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "llama.attention.head_count_kv")
             || str_eq(key, "qwen2.attention.head_count_kv") || str_eq(key, "qwen3.attention.head_count_kv") || str_eq(key, "qwen35.attention.head_count_kv") || str_eq(key, "qwen35moe.attention.head_count_kv")
             || str_eq(key, "gemma3n.attention.head_count_kv") || str_eq(key, "gpt2.attention.head_count_kv") || str_eq(key, "stablelm.attention.head_count_kv")
-            || str_eq(key, "gptneox.attention.head_count_kv") || str_eq(key, "spark2_5.attention.head_count_kv")) {
+            || str_eq(key, "gptneox.attention.head_count_kv") || str_eq(key, "spark2_5.attention.head_count_kv") || str_eq(key, "mistral3.attention.head_count_kv") || str_eq(key, "granite.attention.head_count_kv")) {
             int dummy; cfg->n_kv_heads = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "attention.key_length")
             || str_eq(key, "llama.attention.key_length")
@@ -1502,7 +1514,7 @@ int parse_gguf(model_t *m, int max_seq_len) {
             || str_eq(key, "qwen3.attention.key_length") || str_eq(key, "qwen35.attention.key_length")
             || str_eq(key, "qwen35moe.attention.key_length")
             || str_eq(key, "gemma3n.attention.key_length")
-            || str_eq(key, "spark2_5.attention.key_length")) {
+            || str_eq(key, "spark2_5.attention.key_length") || str_eq(key, "mistral3.attention.key_length") || str_eq(key, "granite.attention.key_length")) {
             /* Explicit head_dim (Qwen3/3.5/Gemma-3n/Mistral-Nemo may differ from n_embd/n_heads).
              * GLM-5: attention.key_length is the KDA qkv output dim (d_inner), NOT
              * head_dim. head_dim for MLA comes from attention.key_length_mla. We
@@ -1516,17 +1528,17 @@ int parse_gguf(model_t *m, int max_seq_len) {
         } else if (str_eq(key, "glm5next.block_count") || str_eq(key, "llama.block_count")
             || str_eq(key, "qwen2.block_count") || str_eq(key, "qwen3.block_count") || str_eq(key, "qwen35.block_count") || str_eq(key, "qwen35moe.block_count")
             || str_eq(key, "gemma3n.block_count") || str_eq(key, "gpt2.block_count") || str_eq(key, "stablelm.block_count")
-            || str_eq(key, "gptneox.block_count") || str_eq(key, "spark2_5.block_count")) {
+            || str_eq(key, "gptneox.block_count") || str_eq(key, "spark2_5.block_count") || str_eq(key, "mistral3.block_count") || str_eq(key, "granite.block_count")) {
             int dummy; cfg->n_layers = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "glm5next.context_length") || str_eq(key, "llama.context_length")
             || str_eq(key, "qwen2.context_length") || str_eq(key, "qwen3.context_length") || str_eq(key, "qwen35.context_length") || str_eq(key, "qwen35moe.context_length")
             || str_eq(key, "gemma3n.context_length") || str_eq(key, "gpt2.context_length") || str_eq(key, "stablelm.context_length")
-            || str_eq(key, "gptneox.context_length") || str_eq(key, "spark2_5.context_length")) {
+            || str_eq(key, "gptneox.context_length") || str_eq(key, "spark2_5.context_length") || str_eq(key, "mistral3.context_length") || str_eq(key, "granite.context_length")) {
             int dummy; cfg->max_seq_len = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "llama.rope.freq_base")
             || str_eq(key, "qwen2.rope.freq_base") || str_eq(key, "qwen3.rope.freq_base") || str_eq(key, "qwen35.rope.freq_base") || str_eq(key, "qwen35moe.rope.freq_base")
             || str_eq(key, "gemma3n.rope.freq_base") || str_eq(key, "gptneox.rope.freq_base")
-            || str_eq(key, "spark2_5.rope.freq_base")) {
+            || str_eq(key, "spark2_5.rope.freq_base") || str_eq(key, "mistral3.rope.freq_base") || str_eq(key, "granite.rope.freq_base")) {
             if (vtype == GGUF_META_FLOAT32) {
                 cfg->rope_freq_base = read_f32(&r);
             } else {
@@ -1536,7 +1548,7 @@ int parse_gguf(model_t *m, int max_seq_len) {
             || str_eq(key, "qwen35moe.rope.dimension_count")
             || str_eq(key, "llama.rope.dimension_count") || str_eq(key, "stablelm.rope.dimension_count")
             || str_eq(key, "gptneox.rope.dimension_count")
-            || str_eq(key, "spark2_5.rope.dimension_count")) {
+            || str_eq(key, "spark2_5.rope.dimension_count") || str_eq(key, "mistral3.rope.dimension_count") || str_eq(key, "granite.rope.dimension_count")) {
             int dummy; cfg->rope_dim = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "spark2_5.rope.dimension_count_swa")) {
             int dummy; cfg->rope_dim_swa = (int)skip_meta_value(&r, vtype, &dummy);
@@ -1580,12 +1592,12 @@ int parse_gguf(model_t *m, int max_seq_len) {
         } else if (str_eq(key, "llama.rope.scaling.type")
             || str_eq(key, "qwen2.rope.scaling.type") || str_eq(key, "qwen3.rope.scaling.type")
             || str_eq(key, "qwen35.rope.scaling.type") || str_eq(key, "qwen35moe.rope.scaling.type")
-            || str_eq(key, "gemma3n.rope.scaling.type")) {
+            || str_eq(key, "gemma3n.rope.scaling.type") || str_eq(key, "mistral3.rope.scaling.type") || str_eq(key, "granite.rope.scaling.type")) {
             cfg->rope_scaling_type = parse_rope_scaling_type(&r, vtype);
         } else if (str_eq(key, "llama.rope.scaling.factor")
             || str_eq(key, "qwen2.rope.scaling.factor") || str_eq(key, "qwen3.rope.scaling.factor")
             || str_eq(key, "qwen35.rope.scaling.factor") || str_eq(key, "qwen35moe.rope.scaling.factor")
-            || str_eq(key, "gemma3n.rope.scaling.factor")) {
+            || str_eq(key, "gemma3n.rope.scaling.factor") || str_eq(key, "mistral3.rope.scaling.factor") || str_eq(key, "granite.rope.scaling.factor")) {
             /* GGUF stores the INVERSE of freq_scale: factor=0.5 => freq_scale=2.0 */
             if (vtype == GGUF_META_FLOAT32) {
                 float factor = read_f32(&r);
@@ -1608,7 +1620,7 @@ int parse_gguf(model_t *m, int max_seq_len) {
             || str_eq(key, "qwen3.rope.scaling.original_context_length")
             || str_eq(key, "qwen35.rope.scaling.original_context_length")
             || str_eq(key, "qwen35moe.rope.scaling.original_context_length")
-            || str_eq(key, "gemma3n.rope.scaling.original_context_length")) {
+            || str_eq(key, "gemma3n.rope.scaling.original_context_length") || str_eq(key, "mistral3.rope.scaling.original_context_length") || str_eq(key, "granite.rope.scaling.original_context_length")) {
             int dummy; cfg->rope_ctx_orig = (uint32_t)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "llama.rope.scaling.attn_factor")
             || str_eq(key, "qwen2.rope.scaling.attn_factor") || str_eq(key, "qwen3.rope.scaling.attn_factor")) {
@@ -1618,35 +1630,35 @@ int parse_gguf(model_t *m, int max_seq_len) {
                 skip_meta_value_warn(&r, vtype, key.str);
             }
         } else if (str_eq(key, "llama.rope.scaling.yarn_ext_factor")
-            || str_eq(key, "qwen2.rope.scaling.yarn_ext_factor") || str_eq(key, "qwen3.rope.scaling.yarn_ext_factor")) {
+            || str_eq(key, "qwen2.rope.scaling.yarn_ext_factor") || str_eq(key, "qwen3.rope.scaling.yarn_ext_factor") || str_eq(key, "mistral3.rope.scaling.yarn_ext_factor") || str_eq(key, "granite.rope.scaling.yarn_ext_factor")) {
             if (vtype == GGUF_META_FLOAT32) {
                 cfg->rope_ext_factor = read_f32(&r);
             } else {
                 skip_meta_value_warn(&r, vtype, key.str);
             }
         } else if (str_eq(key, "llama.rope.scaling.yarn_attn_factor")
-            || str_eq(key, "qwen2.rope.scaling.yarn_attn_factor") || str_eq(key, "qwen3.rope.scaling.yarn_attn_factor")) {
+            || str_eq(key, "qwen2.rope.scaling.yarn_attn_factor") || str_eq(key, "qwen3.rope.scaling.yarn_attn_factor") || str_eq(key, "mistral3.rope.scaling.yarn_attn_factor") || str_eq(key, "granite.rope.scaling.yarn_attn_factor")) {
             if (vtype == GGUF_META_FLOAT32) {
                 cfg->rope_yarn_attn_factor = read_f32(&r);
             } else {
                 skip_meta_value_warn(&r, vtype, key.str);
             }
         } else if (str_eq(key, "llama.rope.scaling.yarn_beta_fast")
-            || str_eq(key, "qwen2.rope.scaling.yarn_beta_fast") || str_eq(key, "qwen3.rope.scaling.yarn_beta_fast")) {
+            || str_eq(key, "qwen2.rope.scaling.yarn_beta_fast") || str_eq(key, "qwen3.rope.scaling.yarn_beta_fast") || str_eq(key, "mistral3.rope.scaling.yarn_beta_fast") || str_eq(key, "granite.rope.scaling.yarn_beta_fast")) {
             if (vtype == GGUF_META_FLOAT32) {
                 cfg->rope_beta_fast = read_f32(&r);
             } else {
                 skip_meta_value_warn(&r, vtype, key.str);
             }
         } else if (str_eq(key, "llama.rope.scaling.yarn_beta_slow")
-            || str_eq(key, "qwen2.rope.scaling.yarn_beta_slow") || str_eq(key, "qwen3.rope.scaling.yarn_beta_slow")) {
+            || str_eq(key, "qwen2.rope.scaling.yarn_beta_slow") || str_eq(key, "qwen3.rope.scaling.yarn_beta_slow") || str_eq(key, "mistral3.rope.scaling.yarn_beta_slow") || str_eq(key, "granite.rope.scaling.yarn_beta_slow")) {
             if (vtype == GGUF_META_FLOAT32) {
                 cfg->rope_beta_slow = read_f32(&r);
             } else {
                 skip_meta_value_warn(&r, vtype, key.str);
             }
         } else if (str_eq(key, "llama.rope.scaling.yarn_log_multiplier")
-            || str_eq(key, "qwen3.rope.scaling.yarn_log_multiplier")) {
+            || str_eq(key, "qwen3.rope.scaling.yarn_log_multiplier") || str_eq(key, "mistral3.rope.scaling.yarn_log_multiplier") || str_eq(key, "granite.rope.scaling.yarn_log_multiplier")) {
             /* DeepSeek-V2-style mscale special case */
             if (vtype == GGUF_META_FLOAT32) {
                 cfg->rope_yarn_log_mul = read_f32(&r);
@@ -1673,7 +1685,7 @@ int parse_gguf(model_t *m, int max_seq_len) {
             || str_eq(key, "gpt2.attention.layer_norm_epsilon") || str_eq(key, "stablelm.attention.layer_norm_epsilon")
             || str_eq(key, "glm5next.attention.layer_norm_rms_epsilon")
             || str_eq(key, "gptneox.attention.layer_norm_epsilon")
-            || str_eq(key, "spark2_5.attention.layer_norm_rms_epsilon")) {
+            || str_eq(key, "spark2_5.attention.layer_norm_rms_epsilon") || str_eq(key, "mistral3.attention.layer_norm_rms_epsilon") || str_eq(key, "granite.attention.layer_norm_rms_epsilon")) {
             /* Read epsilon from GGUF (F32 type=6 or F64 type=11 in metadata) */
             if (vtype == GGUF_META_FLOAT32) { /* F32 */
                 cfg->rms_norm_eps = read_f32(&r);
@@ -1823,7 +1835,7 @@ int parse_gguf(model_t *m, int max_seq_len) {
         } else if (str_eq(key, "llama.vocab_size")
             || str_eq(key, "qwen2.vocab_size") || str_eq(key, "qwen3.vocab_size") || str_eq(key, "qwen35.vocab_size") || str_eq(key, "qwen35moe.vocab_size")
             || str_eq(key, "gemma3n.vocab_size") || str_eq(key, "gpt2.vocab_size") || str_eq(key, "gptneox.vocab_size")
-            || str_eq(key, "glm5next.vocab_size") || str_eq(key, "spark2_5.vocab_size")) {
+            || str_eq(key, "glm5next.vocab_size") || str_eq(key, "spark2_5.vocab_size") || str_eq(key, "mistral3.vocab_size") || str_eq(key, "granite.vocab_size")) {
             int dummy; cfg->vocab_size = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "tokenizer.ggml.bos_token_id")) {
             int dummy; m->tok_bos_id = (uint32_t)skip_meta_value(&r, vtype, &dummy);
@@ -2067,6 +2079,32 @@ int parse_gguf(model_t *m, int max_seq_len) {
             int dummy; m->split_no = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "split.tensors.count")) {
             int dummy; m->split_tensors_count = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (str_eq(key, "granite.attention.scale")
+            || str_eq(key, "mistral3.attention.temperature_scale")) {
+            /* Attention-logit scale: Granite 4.x stores 1/sqrt(head_dim)
+             * explicitly (attention.scale); Mistral 3 stores an attention
+             * temperature (temperature_scale, e.g. 0.1). 0.0f = default. */
+            if (vtype == GGUF_META_FLOAT32) {
+                cfg->attn_score_scale = read_f32(&r);
+            } else {
+                skip_meta_value_warn(&r, vtype, key.str);
+            }
+        } else if (str_eq(key, "granite.embedding_scale")
+            || str_eq(key, "granite.residual_scale")
+            || str_eq(key, "granite.logit_scale")) {
+            float v = 1.0f;
+            if (vtype == GGUF_META_FLOAT32) {
+                v = read_f32(&r);
+            } else {
+                skip_meta_value_warn(&r, vtype, key.str);
+            }
+            if (str_eq(key, "granite.embedding_scale")) {
+                cfg->embd_scale = v;
+            } else if (str_eq(key, "granite.logit_scale")) {
+                cfg->logit_scale = v;
+            } else if (v != 1.0f) {
+                fprintf(stderr, "WARN: granite.residual_scale=%g is not supported; ignoring\n", v);
+            }
         } else {
             int dummy; skip_meta_value(&r, vtype, &dummy);
         }

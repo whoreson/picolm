@@ -15,13 +15,18 @@ enum {
     QWEN_PRETOK_TEKKEN  = 1, /* Mistral Tekken pretokenizer (Mistral-Nemo-2407+) */
     QWEN_PRETOK_GLM4    = 2, /* GLM-4 / GLM-5.3-Flash: DEFAULT with \p{N}{1,3} digits */
     QWEN_PRETOK_SPARK25 = 3, /* Spark-X2.5 pretokenizer */
+    QWEN_PRETOK_GPT2    = 4, /* strict GPT-2 / granite-docling pretokenizer */
 };
 
 typedef struct {
     int *tok_tab;
     int *mrg_tab;
     qwen_merge_t *merges; int n_merges;
-    int *spec; int n_spec;
+    int *spec; int n_spec;      /* type-3+4 special tokens: whole tokens in
+                                  * every mode (verified against llama.cpp
+                                  * b12300: /tokenize maps im_start/im_end and
+                                  * the think/tool tags to single IDs even
+                                  * for raw text) */
     const char **vocab;
     int *vocab_len;
     int vocab_size;

@@ -2535,6 +2535,14 @@ static const char *QW_IM_START = "\x3C\x7C\x69\x6D\x5F\x73\x74\x61\x72\x74\x7C\x
 static const char *QW_IM_END   = "\x3C\x7C\x69\x6D\x5F\x65\x6E\x64\x7C\x3E";
 static const char *QW_THINK_O  = "\x3C\x74\x68\x69\x6E\x6B\x3E";    /* think-open  */
 static const char *QW_THINK_C  = "\x3C\x2F\x74\x68\x69\x6E\x6B\x3E"; /* think-close */
+/* Granite 4.x (docling tokenizer) special tags, byte-exact vs the GGUF
+ * vocab (token_type 3/4 entries of granite-4.2-8b-Q4_K_M.gguf): the
+ * control tags are plain angle-bracket tags WITHOUT pipes; only the
+ * im_start/im_end role tags (QW_IM_START/END) carry pipes. */
+static const char *GR_THINK_O  = "\x3C\x74\x68\x69\x6E\x6B\x3E";        /* think-open    (100274) */
+static const char *GR_THINK_C  = "\x3C\x2F\x74\x68\x69\x6E\x6B\x3E";     /* think-close   (100275) */
+static const char *GR_TOOL_O   = "\x3C\x74\x6F\x6F\x6C\x5F\x72\x65\x73\x70\x6F\x6E\x73\x65\x3E"; /* tool_response open (100272) */
+static const char *GR_TOOL_C   = "\x3C\x2F\x74\x6F\x6F\x6C\x5F\x72\x65\x73\x70\x6F\x6E\x73\x65\x3E"; /* tool_response close (100273) */
 
 /* Build a Qwen chatml prompt from chat messages. Matches the CLI's -pf
  * template, which is verified correct for Qwen instruct models: a system
@@ -2598,13 +2606,248 @@ static char *qwen_chatml_build(cJSON *messages, const char *system_template) {
     return buf;
 }
 
+/* Byte-string search helpers for the granite template. */
+static const char *gr_memfind(const char *hay, size_t len, const char *needle) {
+    size_t nl = strlen(needle);
+    if (nl == 0 || len < nl) return NULL;
+    for (size_t p = 0; p + nl <= len; p++)
+        if (memcmp(hay + p, needle, nl) == 0) return hay + p;
+    return NULL;
+}
+static const char *gr_memrfind(const char *hay, size_t len, const char *needle) {
+    size_t nl = strlen(needle);
+    if (nl == 0 || len < nl) return NULL;
+    for (size_t p = len - nl; ; p--) {
+        if (memcmp(hay + p, needle, nl) == 0) return hay + p;
+        if (p == 0) break;
+    }
+    return NULL;
+}
+/* Append s to buf with leading/trailing whitespace stripped (jinja trim). */
+static void gr_append_trimmed(char *buf, const char *s) {
+    while (*s && (unsigned char)*s <= ' ') s++;
+    size_t len = strlen(s);
+    while (len > 0 && (unsigned char)s[len - 1] <= ' ') len--;
+    char *dst = buf + strlen(buf);
+    memcpy(dst, s, len);
+    dst[len] = '\0';
+}
+
+/* Granite 4.x chatml: same im-start/im-end tag family as Qwen (reuses the
+ * QW_* constants). Mirrors the GGUF tokenizer.chat_template (granite-docling
+ * jinja template): role blocks, assistant turns get a think-open prepended
+ * when their content has no think tags, turns before the last user message
+ * have their reasoning truncated to an empty think block
+ * (truncate_history_thinking defaults true), tool messages share one user
+ * block wrapped in tool_response tags, and the generation prompt opens a
+ * think block (enable_thinking defaults true). No BOS (template has none). */
+static char *granite_chatml_build(cJSON *messages, const char *system_template) {
+    (void)system_template; /* granite template has no default system */
+    int n = cJSON_GetArraySize(messages);
+    const char *last_role = NULL;
+    int last_user_idx = -1;
+    size_t total = 0;
+    for (int i = 0; i < n; i++) {
+        cJSON *msg = cJSON_GetArrayItem(messages, i);
+        cJSON *role = cJSON_GetObjectItem(msg, "role");
+        cJSON *content = cJSON_GetObjectItem(msg, "content");
+        if (!role || !content) continue;
+        const char *rs = cJSON_GetStringValue(role);
+        const char *cs = cJSON_GetStringValue(content);
+        if (!rs || !cs) continue;
+        last_role = rs;
+        if (strcmp(rs, "user") == 0) last_user_idx = i;
+        total += strlen(rs) + strlen(cs) + 64;
+    }
+    char *buf = (char *)malloc(total + 256 + 1);
+    if (!buf) return NULL;
+    buf[0] = '\0';
+
+    int i = 0;
+    while (i < n) {
+        cJSON *msg = cJSON_GetArrayItem(messages, i);
+        cJSON *role = cJSON_GetObjectItem(msg, "role");
+        cJSON *content = cJSON_GetObjectItem(msg, "content");
+        const char *rs = (role && content) ? cJSON_GetStringValue(role) : NULL;
+        const char *cs = (role && content) ? cJSON_GetStringValue(content) : NULL;
+        if (!rs || !cs) { i++; continue; }
+        if (strcmp(rs, "system") == 0) {
+            strcat(buf, QW_IM_START); strcat(buf, "system\n");
+            strcat(buf, cs);
+            strcat(buf, QW_IM_END); strcat(buf, "\n");
+            i++;
+        } else if (strcmp(rs, "user") == 0) {
+            strcat(buf, QW_IM_START); strcat(buf, "user\n");
+            strcat(buf, cs);
+            strcat(buf, QW_IM_END); strcat(buf, "\n");
+            i++;
+        } else if (strcmp(rs, "assistant") == 0) {
+            strcat(buf, QW_IM_START); strcat(buf, "assistant\n");
+            size_t clen = strlen(cs);
+            size_t ol = strlen(GR_THINK_O), cln = strlen(GR_THINK_C);
+            const char *po = gr_memfind(cs, clen, GR_THINK_O);
+            const char *pc = gr_memfind(cs, clen, GR_THINK_C);
+            /* template step 1: plain content gets an EMPTY think block
+             * (open+close) prepended */
+            const char *body = cs;
+            char *pre = NULL;
+            if (!po && !pc) {
+                pre = (char *)malloc(ol + cln + clen + 1);
+                if (pre) {
+                    memcpy(pre, GR_THINK_O, ol);
+                    memcpy(pre + ol, GR_THINK_C, cln);
+                    memcpy(pre + ol + cln, cs, clen);
+                    pre[ol + cln + clen] = '\0';
+                    body = pre;
+                }
+            }
+            size_t blen = strlen(body);
+            const char *out_s = body;
+            char *tmp = NULL;
+            if (i < last_user_idx) {
+                /* template step 2 (truncate_history_thinking, default on):
+                 * turns before the last user message keep only the content
+                 * after the last think-close, behind a fresh empty think
+                 * block */
+                const char *pc2 = gr_memrfind(body, blen, GR_THINK_C);
+                const char *po2 = gr_memfind(body, blen, GR_THINK_O);
+                if (pc2 && po2) {
+                    /* template: c = "\x3Cthink\x3E\x3C/think\x3E" ~
+                     * c.split("\x3C/think\x3E")[-1]  (empty think block +
+                     * content after the last close) */
+                    size_t coff = (size_t)(pc2 - body) + cln; /* after close */
+                    size_t off = blen - coff;
+                    tmp = (char *)malloc(ol + cln + off + 1);
+                    if (tmp) {
+                        memcpy(tmp, GR_THINK_O, ol);
+                        memcpy(tmp + ol, GR_THINK_C, cln);
+                        memcpy(tmp + ol + cln, body + coff, off);
+                        tmp[ol + cln + off] = '\0';
+                        out_s = tmp;
+                    }
+                }
+            }
+            gr_append_trimmed(buf, out_s);
+            free(tmp);
+            free(pre);
+            strcat(buf, QW_IM_END); strcat(buf, "\n");
+            i++;
+        } else if (strcmp(rs, "tool") == 0) {
+            /* consecutive tool messages share one user block, wrapped in
+             * tool_response tags (the template's tool branch) */
+            strcat(buf, QW_IM_START); strcat(buf, "user\n");
+            int j = i;
+            while (j < n) {
+                cJSON *m2 = cJSON_GetArrayItem(messages, j);
+                cJSON *r2 = cJSON_GetObjectItem(m2, "role");
+                cJSON *c2 = cJSON_GetObjectItem(m2, "content");
+                const char *rs2 = (r2 && c2) ? cJSON_GetStringValue(r2) : NULL;
+                const char *cs2 = (r2 && c2) ? cJSON_GetStringValue(c2) : NULL;
+                if (!rs2 || !cs2 || strcmp(rs2, "tool") != 0) break;
+                strcat(buf, GR_TOOL_O); strcat(buf, "\n");
+                strcat(buf, cs2);
+                strcat(buf, "\n"); strcat(buf, GR_TOOL_C); strcat(buf, "\n");
+                j++;
+            }
+            strcat(buf, QW_IM_END); strcat(buf, "\n");
+            i = j;
+        } else {
+            strcat(buf, QW_IM_START); strcat(buf, rs); strcat(buf, "\n");
+            strcat(buf, cs);
+            strcat(buf, QW_IM_END); strcat(buf, "\n");
+            i++;
+        }
+    }
+
+    /* generation prompt (template default: enable_thinking=True):
+     * im_start + "assistant\n" + think-open + newline -- the model thinks
+     * first, then answers after think-close. */
+    if (!(last_role && strcmp(last_role, "assistant") == 0)) {
+        strcat(buf, QW_IM_START); strcat(buf, "assistant\n");
+        strcat(buf, GR_THINK_O); strcat(buf, "\n");
+    }
+    return buf;
+}
+
+/* Mistral 3 / Ministral 3 text chat format (from the model's
+ * tokenizer.chat_template, text-only path): BOS, an optional
+ * [SYSTEM_PROMPT] (a default thinking-style system message is used when no
+ * system message is given), [INST]..[/INST] user turns, raw assistant
+ * turns terminated by the EOS token, [TOOL_RESULTS] for tool messages.
+ * No generation-prompt suffix: generation follows the last message. */
+static const char *MISTRAL3_DEFAULT_SYS =
+    "# HOW YOU SHOULD THINK AND ANSWER\n"
+    "\n"
+    "First draft your thinking process (inner monologue) until you arrive at a response. "
+    "Format your response using Markdown, and use LaTeX for any mathematical equations. "
+    "Write both your thoughts and the response in the same language as the input.\n"
+    "\n"
+    "Your thinking process must follow the template below:[THINK]Your thoughts or/and draft, "
+    "like working through an exercise on scratch paper. Be as casual and as long as you want "
+    "until you are confident to generate the response to the user.[/THINK]Here, provide a "
+    "self-contained response.";
+
+static char *mistral3_chat_build(cJSON *messages, const char *system_template) {
+    int n = cJSON_GetArraySize(messages);
+    const char *sys_content = system_template;
+    size_t total = strlen(MISTRAL3_DEFAULT_SYS) + 64;
+    for (int i = 0; i < n; i++) {
+        cJSON *msg = cJSON_GetArrayItem(messages, i);
+        cJSON *role = cJSON_GetObjectItem(msg, "role");
+        cJSON *content = cJSON_GetObjectItem(msg, "content");
+        if (!role || !content) continue;
+        const char *rs = cJSON_GetStringValue(role);
+        const char *cs = cJSON_GetStringValue(content);
+        if (!rs || !cs) continue;
+        if (strcmp(rs, "system") == 0 && !sys_content) sys_content = cs;
+        total += strlen(rs) + strlen(cs) + 48;
+    }
+    if (!sys_content) sys_content = MISTRAL3_DEFAULT_SYS;
+
+    char *buf = (char *)malloc(total + 1);
+    if (!buf) return NULL;
+    buf[0] = '\0';
+
+    strcat(buf, "<s>");
+    strcat(buf, "[SYSTEM_PROMPT]");
+    strcat(buf, sys_content);
+    strcat(buf, "[/SYSTEM_PROMPT]");
+
+    for (int i = 0; i < n; i++) {
+        cJSON *msg = cJSON_GetArrayItem(messages, i);
+        cJSON *role = cJSON_GetObjectItem(msg, "role");
+        cJSON *content = cJSON_GetObjectItem(msg, "content");
+        if (!role || !content) continue;
+        const char *rs = cJSON_GetStringValue(role);
+        const char *cs = cJSON_GetStringValue(content);
+        if (!rs || !cs) continue;
+        if (strcmp(rs, "system") == 0) continue; /* already emitted */
+        if (strcmp(rs, "user") == 0) {
+            strcat(buf, "[INST]"); strcat(buf, cs); strcat(buf, "[/INST]");
+        } else if (strcmp(rs, "assistant") == 0) {
+            strcat(buf, cs); strcat(buf, "</s>");
+        } else if (strcmp(rs, "tool") == 0) {
+            strcat(buf, "[TOOL_RESULTS]"); strcat(buf, cs); strcat(buf, "[/TOOL_RESULTS]");
+        } else {
+            strcat(buf, "[SYSTEM_PROMPT]"); strcat(buf, cs); strcat(buf, "[/SYSTEM_PROMPT]");
+        }
+    }
+    return buf;
+}
+
 /* Convert chat messages to a prompt string.
  * Qwen models get the chatml template (verified correct for instruct Qwen);
- * other models get the simple "### {role}\n{text}\n\n" template.
+ * Granite 4.x gets its im-start/im-end chatml; Mistral/Ministral 3 gets the
+ * [INST] format; other models get the simple "### {role}\n{text}\n\n" template.
  * Returns a malloc'd string. */
-static char *chat_to_prompt(cJSON *messages, const char *system_template, int is_qwen) {
+static char *chat_to_prompt(cJSON *messages, const char *system_template,
+                            int is_qwen, int is_granite, int is_mistral3) {
     if (is_qwen)
         return qwen_chatml_build(messages, system_template);
+    if (is_granite)
+        return granite_chatml_build(messages, system_template);
+    if (is_mistral3)
+        return mistral3_chat_build(messages, system_template);
     size_t total_len = 0;
     int n_msgs = cJSON_GetArraySize(messages);
 
@@ -2786,7 +3029,9 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         cJSON *sti = cJSON_GetObjectItem(req, "system_template");
         if (sti) sys_template = cJSON_GetStringValue(sti);
 
-        chat_prompt = chat_to_prompt(messages, sys_template, model->config.is_qwen);
+        chat_prompt = chat_to_prompt(messages, sys_template,
+                                     model->config.is_qwen, model->config.is_granite,
+                                     model->config.is_mistral3);
         fprintf(stderr, "[server] %.1fms: chat template built (%d chars)\n", get_time_ms() - t0, (int)strlen(chat_prompt));
         if (!chat_prompt) {
             http_send(sock, 400, "application/json", "{\"error\":{\"message\":\"Failed to build prompt\"}}");
@@ -2830,6 +3075,13 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
     stop_matcher_t sm;
     cJSON *stop_item = cJSON_GetObjectItem(req, "stop");
     stop_matcher_init(&sm, stop_item);
+    /* Granite 4.x: the docling pretokenizer emits role tags as fragment
+     * tokens, so the eos token ID never appears in the output stream --
+     * stop on the decoded tag text by default. */
+    if (sm.n_words == 0 && model->config.is_granite) {
+        sm.words[sm.n_words++] = strdup(QW_IM_END);
+        if (strlen(QW_IM_END) > sm.max_word_len) sm.max_word_len = (int)strlen(QW_IM_END);
+    }
 
     /* llama.cpp: return_progress - report prefill progress via SSE */
     int return_progress = 0;
@@ -2847,7 +3099,11 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
     int n_prompt;
     double t_tok = get_time_ms();
     if (srv.use_qwen_tok) {
-        if (srv.model.tok_add_bos && srv.qwen_enc.bos_id != 11) {
+        /* granite: no BOS on any path (llama.cpp b12300 emits the jinja /
+         * raw text as-is -- verified: /completion tokens_evaluated equals
+         * the exact /tokenize count, and the jinja template has no BOS). */
+        if (srv.model.tok_add_bos && srv.qwen_enc.bos_id != 11 &&
+            !model->config.is_granite) {
             n_prompt = qwen_tokenize_encode(&srv.qwen_enc, prompt, ptokens + 1, max_pt - 1);
             ptokens[0] = srv.qwen_enc.bos_id;
             n_prompt++;
@@ -3547,6 +3803,14 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
     model_t *model = &srv.model;
     tokenizer_t *tokenizer = &srv.tokenizer;
 
+    /* Granite 4.x: default stop on the decoded |im_end| tag (the docling
+     * pretokenizer emits role tags as fragments, so the eos ID never
+     * appears in the stream) */
+    if (sm.n_words == 0 && model->config.is_granite) {
+        sm.words[sm.n_words++] = strdup(QW_IM_END);
+        if (strlen(QW_IM_END) > sm.max_word_len) sm.max_word_len = (int)strlen(QW_IM_END);
+    }
+
     /* Encode prompt */
     int *ptokens = NULL;
     int n_prompt = 0;
@@ -3559,7 +3823,10 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         int max_pt = (int)strlen(prompt) + 3 + 1;
         ptokens = (int *)malloc((size_t)max_pt * sizeof(int));
         if (srv.use_qwen_tok) {
-            if (srv.model.tok_add_bos && srv.qwen_enc.bos_id != 11) {
+            /* raw llama-style completion: no BOS for granite (see
+             * handle_completion), type-4 tags BPE-split as in llama.cpp */
+            if (srv.model.tok_add_bos && srv.qwen_enc.bos_id != 11 &&
+                !srv.model.config.is_granite) {
                 n_prompt = qwen_tokenize_encode(&srv.qwen_enc, prompt, ptokens + 1, max_pt - 1);
                 ptokens[0] = srv.qwen_enc.bos_id;
                 n_prompt++;
