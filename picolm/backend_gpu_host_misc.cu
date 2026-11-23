@@ -1761,6 +1761,80 @@ picolm_gpu_rope_batched_kernel(float *x, int n_heads, int head_dim,
     }
 }
 
+/* Walsh-Hadamard rotation for the KV cache (-khad / -vhad), device side.
+ *
+ * This is the GPU counterpart of picolm_hadamard_transform() in quant.c and
+ * MUST stay bit-compatible with it, because a cache written by one path is
+ * read by kernels that only invert the transform, and slot files written on
+ * CPU are restored on GPU and vice versa. Same three steps as the CPU:
+ *   1. multiply by the golden-ratio sign pattern -- ONLY when nrot == 32.
+ *      At other nrot the CPU passes signs == NULL (see
+ *      picolm_hadamard_transform); getting this wrong at nrot 64/128/256
+ *      rotates to a different basis than the CPU and scrambles the cache.
+ *   2. log2(nrot) butterfly stages, in-place, stride 1,2,4,...
+ *   3. one scale of (1/sqrt(2))^log2(nrot) applied at the END, not per stage
+ *      (picolm_fast_ht accumulates `scale *= 0.707106781f` and multiplies
+ *      once). Multiplying per stage instead rounds differently.
+ *
+ * One block per head; a head is head_dim floats, each nrot-block is handled
+ * by nrot of nrot threads... in practice head_dim <= 256 so one warp-pair
+ * per nrot-block suffices: threads cooperate through shared memory because
+ * the butterfly crosses threads.
+ *
+ * Self-inverse up to the scale, like the CPU version, so the same kernel is
+ * used for the forward rotation and for undoing it on the V output. */
+#define GPU_WHT_MAX 256
+
+/* Sign pattern for nrot == 32; mirrors picolm_wht_signs_32 in quant.c. */
+__device__ static const float gpu_wht_signs_32[32] = {
+    1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f,
+   -1.0f,-1.0f, 1.0f, -1.0f, 1.0f, 1.0f,-1.0f, 1.0f,
+   -1.0f,-1.0f, 1.0f, -1.0f, 1.0f,-1.0f,-1.0f, 1.0f,
+   -1.0f, 1.0f, 1.0f,-1.0f, 1.0f,-1.0f,-1.0f, 1.0f
+};
+
+/* One block handles ONE nrot-block: threads 0..nrot-1 load it, the butterfly
+ * runs through shared memory, then the result is written back. */
+__global__ void
+picolm_gpu_wht_kernel(float *x, int n_heads, int head_dim, int nrot) {
+    __shared__ float buf[GPU_WHT_MAX];
+    int head = (int)gpuBlockIdx_x;
+    int blk  = (int)gpuBlockIdx_y;
+    if (head >= n_heads) return;
+    if (nrot > GPU_WHT_MAX) return;          /* host gate prevents this */
+    float *base = x + (size_t)head * head_dim + (size_t)blk * nrot;
+
+    for (int i = (int)gpuThreadIdx_x; i < nrot; i += (int)gpuBlockDim_x) {
+        float v = base[i];
+        if (nrot == 32) v *= gpu_wht_signs_32[i];
+        buf[i] = v;
+    }
+    gpuSyncthreads();
+
+    /* Same butterfly shape as picolm_fast_ht: for each stage `step`, pair
+     * element j with j+step inside every 2*step block. The CPU walks
+     * i += 2*step and j = i..i+step; a = (i/step)*step + ... is the same
+     * pairing expressed as a flat index, and doing it out-of-place through
+     * buf keeps every pair independent within a stage (so the per-stage
+     * barrier is the only synchronisation needed). */
+    for (int step = 1; step < nrot; step <<= 1) {
+        for (int i = (int)gpuThreadIdx_x; i < nrot / 2; i += (int)gpuBlockDim_x) {
+            int a = (i / step) * 2 * step + (i % step);
+            int b = a + step;
+            float av = buf[a], bv = buf[b];
+            buf[a] = av + bv;
+            buf[b] = av - bv;
+        }
+        gpuSyncthreads();
+    }
+
+    /* One scale at the end, like the CPU's accumulated `scale` -- applying
+     * 1/sqrt(2) per stage rounds differently. */
+    const float norm = 1.0f / sqrtf((float)nrot);
+    for (int i = (int)gpuThreadIdx_x; i < nrot; i += (int)gpuBlockDim_x)
+        base[i] = buf[i] * norm;
+}
+
 /* RoPE kernel: applies pairwise rotary position embedding */
 __global__ void
 picolm_gpu_rope_kernel(float *x, int n_heads, int head_dim,
@@ -2077,6 +2151,59 @@ picolm_gpu_rope_apply(float *x, int n_heads, int head_dim,
     picolm_gpu_rope_kernel<<<n_blocks, n_threads, 0, ctx->stream>>>(
         x, n_heads, head_dim, cos_tbl, sin_tbl, half_dim, rope_type);
     if (!gpu_ok(gpuGetLastError(), "rope kernel")) return 0;
+    return 1;
+}
+
+/* Walsh-Hadamard rotation of a device-resident [n_heads][head_dim] buffer,
+ * in place. The GPU counterpart of picolm_hadamard_transform(): used for K/V
+ * before the quantised store and for Q before attention, and (same function,
+ * since the transform is self-inverse up to scale) for undoing the V rotation
+ * on the attention output.
+ *
+ * Batched variant: x is [S][n_heads][head_dim] contiguous with row stride
+ * x_stride floats (pass 0 when rows are packed at n_heads*head_dim).
+ *
+ * Returns 1 on success, 0 if the shape is unsupported -- in which case the
+ * caller must fall back to the CPU path rather than proceed with an
+ * unrotated cache. */
+static int gpu_wht_ok(int head_dim, int nrot) {
+    if (nrot <= 0 || head_dim <= 0) return 0;
+    if (nrot > GPU_WHT_MAX) return 0;
+    if ((nrot & (nrot - 1)) != 0) return 0;      /* power of two */
+    if (head_dim % nrot != 0) return 0;
+    return 1;
+}
+
+extern "C" int
+picolm_gpu_hadamard(float *x, int n_heads, int head_dim, int nrot, int device) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    if (!gpu_wht_ok(head_dim, nrot)) return 0;
+    int nblk = head_dim / nrot;
+    int n_threads = nrot < 32 ? nrot : 32;
+    if (n_threads < 1) n_threads = 1;
+    dim3 grid((unsigned)n_heads, (unsigned)nblk, 1);
+    picolm_gpu_wht_kernel<<<grid, n_threads, 0, ctx->stream>>>(x, n_heads, head_dim, nrot);
+    if (!gpu_ok(gpuGetLastError(), "hadamard kernel")) return 0;
+    return 1;
+}
+
+extern "C" int
+picolm_gpu_hadamard_batched(float *x, int S, int n_heads, int head_dim, int nrot,
+                             int x_stride, int device) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    if (!gpu_wht_ok(head_dim, nrot) || S < 0) return 0;
+    int stride = x_stride > 0 ? x_stride : n_heads * head_dim;
+    int nblk = head_dim / nrot;
+    int n_threads = nrot < 32 ? nrot : 32;
+    if (n_threads < 1) n_threads = 1;
+    for (int s = 0; s < S; s++) {
+        dim3 grid((unsigned)n_heads, (unsigned)nblk, 1);
+        picolm_gpu_wht_kernel<<<grid, n_threads, 0, ctx->stream>>>(
+            x + (size_t)s * stride, n_heads, head_dim, nrot);
+    }
+    if (!gpu_ok(gpuGetLastError(), "hadamard batched kernel")) return 0;
     return 1;
 }
 

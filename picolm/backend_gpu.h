@@ -658,6 +658,20 @@ int picolm_gpu_rope_apply(float *x, int n_heads, int head_dim,
                            const float *cos_tbl, const float *sin_tbl,
                            int half_dim, int rope_type, int device);
 
+/* Walsh-Hadamard rotation of a device-resident [n_heads][head_dim] buffer,
+ * in place -- the GPU counterpart of picolm_hadamard_transform() (-khad /
+ * -vhad). nrot must be a power of two dividing head_dim (the flag's block
+ * size, s->kv_hadamard_size). Self-inverse up to scale, so the same call
+ * undoes the V rotation on the attention output.
+ * Returns 1 on success, 0 for an unsupported shape -- the caller must then
+ * take the CPU path, NOT continue with an unrotated cache. */
+int picolm_gpu_hadamard(float *x, int n_heads, int head_dim, int nrot, int device);
+
+/* Batched variant: x is [S][n_heads][head_dim] with row stride x_stride
+ * floats (0 = packed at n_heads*head_dim). */
+int picolm_gpu_hadamard_batched(float *x, int S, int n_heads, int head_dim, int nrot,
+                                 int x_stride, int device);
+
 /* Batched RoPE: x is [S][n_heads][head_dim] contiguous, positions
  * start_pos..start_pos+S-1. cos_tbl_base/sin_tbl_base are the UNOFFSET
  * [max_seq_len][half_dim] base pointers. One launch for the whole chunk. */

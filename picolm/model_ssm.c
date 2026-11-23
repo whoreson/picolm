@@ -5255,6 +5255,18 @@ void model_ssm_state_reset_gpu(model_t *m) {
  * Falls back to model_forward until fully implemented.
  * The elementwise kernels (gpu_rmsnorm, gpu_rope_apply,
  * gpu_residual_add) are implemented in backend_gpu.cu. */
+/* True when the GPU can perform the -khad/-vhad rotation for this model shape.
+ * Mirrors picolm_hadamard_transform()'s own precondition (head_dim % nrot == 0,
+ * nrot a power of two) plus the device kernel's 256-element shared buffer. */
+static int gpu_kv_hadamard_supported(const run_state_t *s, int head_dim) {
+    int nrot = s->kv_hadamard_size;
+    if (nrot <= 0 || head_dim <= 0) return 0;
+    if (nrot > 256) return 0;
+    if ((nrot & (nrot - 1)) != 0) return 0;
+    if (head_dim % nrot != 0) return 0;
+    return 1;
+}
+
 float *model_forward_gpu(model_t *m, int token, int pos) {
     double _dec_t0 = ssm_now_ms();
     /* Phase 2: GPU-pipelined forward pass.
@@ -5306,6 +5318,28 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
         w->type_token_embd == GGUF_TYPE_Q4_0_4_8) {
         /* Interleaved token embedding formats need the full model_forward
          * dequant path. Fall back to CPU. */
+        return model_forward(m, token, pos);
+    }
+
+    /* -khad / -vhad: the rotation has to run on the device because the KV
+     * store below is device-native (pipe_k/pipe_v never reach the host, see
+     * the note above the store). Until this was added the flags were accepted,
+     * announced at load ("KV Hadamard rotation enabled: K=1 ...") and then
+     * silently dropped here: GPU and CPU logits with -khad were BIT-IDENTICAL,
+     * i.e. no rotation happened at all.
+     *
+     * Checked BEFORE anything is written to the device cache: an unsupported
+     * shape must take the CPU path from the start, because bailing out later
+     * leaves the pipeline half applied (this layer's K/V already stored). */
+    if ((s->kv_hadamard_k || s->kv_hadamard_v) &&
+        !gpu_kv_hadamard_supported(s, head_dim)) {
+        static int warned = 0;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr, "INFO: -khad/-vhad need head_dim divisible by the "
+                            "rotation block (nrot=%d, head_dim=%d) on GPU; using the CPU path\n",
+                    s->kv_hadamard_size, head_dim);
+        }
         return model_forward(m, token, pos);
     }
     {
@@ -5520,6 +5554,24 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
              * device->host flush of the whole KV cache first -- not
              * per-token reconstruction. Not needed today; flagged here so
              * it isn't a silent trap later. */
+            /* -khad / -vhad: rotate K and V on the device before they are
+             * quantised into the cache, exactly as model_core.c does on the
+             * host before its own quantize_row_* calls. Both K and V are
+             * rotated here and NOT undone on read: the readers dequantise and
+             * do plain dot products, and the dot product is invariant under
+             * the transform, so K enters attention already rotated and Q is
+             * rotated to match below. V needs its output rotated back, which
+             * happens after the attention call. */
+            if (s->kv_hadamard_k) {
+                if (!picolm_gpu_hadamard(pipe_k, n_kv_heads, head_dim,
+                                         s->kv_hadamard_size, gpu_dev))
+                    return model_forward(m, token, pos);   /* CPU path, nothing stored yet */
+            }
+            if (s->kv_hadamard_v) {
+                if (!picolm_gpu_hadamard(pipe_v, n_kv_heads, head_dim,
+                                         s->kv_hadamard_size, gpu_dev))
+                    return model_forward(m, token, pos);
+            }
             picolm_gpu_kv_store_dev(1, this_attn_ordinal, pos, pipe_k,
                                      n_kv_heads, head_dim, seq_len, gpu_dev);
             picolm_gpu_kv_store_dev(0, this_attn_ordinal, pos, pipe_v,
@@ -5533,6 +5585,23 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
              * SSM/hybrid layers below have no KV cache entry at all, they
              * index ssm_state_dev/ssm_conv_state_dev by the raw layer index
              * `l` instead. */
+            /* -khad: rotate Q to match the rotated K cache. The dot product
+             * is invariant under the transform, so Q and K only have to agree
+             * -- K is already rotated (above), so Q must be too. This is the
+             * GPU counterpart of the picolm_hadamard_transform(s->q...) call
+             * in model_forward_range().
+             *
+             * Placed after the KV store rather than with the K rotation: if
+             * this fails we bail to the CPU with the cache already written for
+             * this layer, which the CPU path cannot repair, so an unsupported
+             * shape is rejected earlier (gpu_kv_hadamard_supported) and this
+             * only trips on a genuine launch failure. */
+            if (s->kv_hadamard_k) {
+                if (!picolm_gpu_hadamard(pipe_q, n_heads, head_dim,
+                                         s->kv_hadamard_size, gpu_dev))
+                    return model_forward(m, token, pos);
+            }
+
             /* H. Attention decode: pipe_attn_out = attn(pipe_q)
              * GPU decode attention is disabled on Vulkan (returns 0).
              * Fall back to CPU-only decode by returning NULL. */
@@ -5600,6 +5669,22 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
                 picolm_gpu_memcpy(dmp, pipe_attn_out, 32, -1, gpu_dev);
                 fprintf(stderr, "[LNDBG] GPU decode l=%d ATTN_out[0:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
                         l, dmp[0],dmp[1],dmp[2],dmp[3],dmp[4],dmp[5],dmp[6],dmp[7]);
+            }
+
+            /* -vhad: undo the Hadamard rotation on the attention output.
+             *
+             * V was stored rotated, and the readers accumulate it in the
+             * rotated domain (scale_add/fma_scale on a dequantised block keep
+             * whatever basis the cache holds). The weighted sum is therefore
+             * a rotated V, so it has to be rotated back before the output
+             * projection -- exactly where model_core.c does it, BEFORE the
+             * gate sigmoid, so the order matches the CPU path bit for bit.
+             * The transform is self-inverse up to scale, so this is the same
+             * forward kernel. */
+            if (s->kv_hadamard_v) {
+                if (!picolm_gpu_hadamard(pipe_attn_out, n_heads, head_dim,
+                                         s->kv_hadamard_size, gpu_dev))
+                    return model_forward(m, token, pos);
             }
 
             /* I1. For SSM models: apply gate sigmoid to attention output.
@@ -6326,6 +6411,21 @@ after_qkv:
 
         /* KV cache store */
         /* attn_ord already tracks the ordinal from the loop counter above */
+        /* -khad / -vhad: rotate each row's K and V on the device before the
+         * quantised store, matching the host side. Rows are packed at
+         * n_heads*head_dim (x_stride 0), one launch per row inside the
+         * helper. If the rotation cannot run, abandon the whole ubatch and
+         * let model_forward_prefill_gpu() redo it on the CPU -- continuing
+         * would cache unrotated rows while Q gets rotated below. */
+        if (s->kv_hadamard_k &&
+            !picolm_gpu_hadamard_batched(bk, n_ubatch, n_kv_heads, head_dim,
+                                          s->kv_hadamard_size, 0, gpu_dev))
+            return 0;
+        if (s->kv_hadamard_v &&
+            !picolm_gpu_hadamard_batched(bv, n_ubatch, n_kv_heads, head_dim,
+                                          s->kv_hadamard_size, 0, gpu_dev))
+            return 0;
+
         /* bk/bv are contiguous kv_dim rows from matmul (y_stride_kv = kv_dim),
          * NOT strided at xb_stride. Use non-strided variant on all platforms. */        picolm_gpu_kv_store_dev_batched(1, attn_ord, start_pos, n_ubatch,
                                          bk, n_kv_heads, head_dim, seq_len, gpu_dev);
@@ -6359,6 +6459,13 @@ after_qkv:
         /* For GPT-2 fused QKV, Q was compacted into bffn_norm; for separate
          * QKV, Q is in bq. */
         float *q_buf = (gl->attn_qkv && !gl->attn_q) ? bffn_norm : bq;
+        /* -khad: rotate Q to match the rotated K cache (the dot product is
+         * invariant under the transform, so both sides just have to agree).
+         * q_buf, not bq: for fused-QKV models Q lives in bffn_norm. */
+        if (s->kv_hadamard_k &&
+            !picolm_gpu_hadamard_batched(q_buf, n_ubatch, n_heads, head_dim,
+                                          s->kv_hadamard_size, 0, gpu_dev))
+            return 0;
         if (c->has_ssm && getenv("PICOLM_F32KV")) {
 #ifndef PICOLM_HIP
             picolm_gpu_attention_prefill_f32kv(battn_out, bq, bk, bv,
@@ -6398,6 +6505,14 @@ after_qkv:
                                               n_heads, n_kv_heads, head_dim,
                                               seq_len, gpu_dev, c->n_swa_layer[l]);
         }
+        /* -vhad: rotate the attention output back out of the Hadamard basis
+         * before the gate sigmoid and the output projection, in the same
+         * place (and the same order relative to the gate) as the CPU path. */
+        if (s->kv_hadamard_v &&
+            !picolm_gpu_hadamard_batched(battn_out, n_ubatch, n_heads, head_dim,
+                                          s->kv_hadamard_size, attn_out_stride, gpu_dev))
+            return 0;
+
         /* Debug: dump attention output for layer 0 */
         if (l == 0 && getenv("ATTNDBG")) {
             float _ao[4]; picolm_gpu_sync(gpu_dev);
