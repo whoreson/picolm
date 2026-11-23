@@ -814,9 +814,12 @@ static void checkpoint_print_list(const char *label) {
  * the lowest variance of gaps between remaining checkpoints.
  * Prints detailed information about each candidate and the removal.
  * Protected checkpoints (is_protected=1) are never evicted. */
-static void checkpoint_evict_one(void) {
+/* Returns 1 if a checkpoint was removed, 0 if it declined. Callers must
+ * treat 0 as "no progress possible" rather than retrying -- see the bounded
+ * eviction loop in checkpoint_save(). */
+static int checkpoint_evict_one(void) {
     int n = checkpoint_count();
-    if (n <= 2) return; /* Never remove if 2 or fewer */
+    if (n <= 2) return 0; /* Never remove if 2 or fewer */
 
     /* Collect checkpoint positions and protection flags */
     int *tokens = alloca((size_t)n * sizeof(int));
@@ -873,7 +876,7 @@ static void checkpoint_evict_one(void) {
         }
     }
 
-    if (best_idx < 0) return;
+    if (best_idx < 0) return 0;   /* every interior candidate is protected */
 
     fprintf(stderr, "  [ssm checkpoint] erasing checkpoint at index %d (n_tokens=%d), "
             "variance after removal = %.1f\n",
@@ -891,6 +894,7 @@ static void checkpoint_evict_one(void) {
 
     free(cur->data);
     free(cur);
+    return 1;
 }
 
 /* Reconstruct KV row stride from kv_cache_type enum value */
@@ -908,9 +912,25 @@ static void checkpoint_save(int n_tokens) {
     if (srv.checkpoint_snapshot_size == 0) return;
     if (checkpoint_exists(n_tokens)) return; /* skip duplicates */
 
-    /* Evict if at capacity */
-    while (checkpoint_count() >= srv.max_checkpoints) {
-        checkpoint_evict_one();
+    /* Evict if at capacity.
+     *
+     * This loop MUST be bounded. checkpoint_evict_one() is allowed to decline
+     * (fewer than 3 checkpoints, or every interior candidate protected -- the
+     * tail is marked is_protected the moment prefill ends, and a restore +
+     * re-prefill then finds the whole list protected). An unguarded
+     * `while (count >= max)` then spins forever with no GPU work in flight:
+     * the process is 100% CPU and 0% GPU, which is exactly the hang seen at
+     * ~7.5-8k context with --checkpoint-max 16. Bound it by the initial count:
+     * each successful eviction removes one, so that many attempts is enough,
+     * and if we run out of candidates we accept going over the limit for one
+     * insert rather than hanging. */
+    {
+        int evictable = checkpoint_count() - 1;   /* never spin on the same list forever */
+        while (checkpoint_count() >= srv.max_checkpoints && evictable-- > 0) {
+            int before = checkpoint_count();
+            checkpoint_evict_one();
+            if (checkpoint_count() >= before) break;   /* declined: stop, do not spin */
+        }
     }
 
     double t_create_start = get_time_ms();
@@ -3383,8 +3403,22 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             gen_written++;                      /* see KV_WRITTEN above */
         }
 
-        /* Deactivate rolling checkpoint after generation ends */
-        srv.rolling_checkpoint_active = 0;
+        /* Rolling checkpoint stays VALID across the request boundary.
+         *
+         * It used to be cleared here, and that made the feature useless in
+         * exactly the case it exists for: the next request's
+         * checkpoint_restore() consults the rolling snapshot only while
+         * rolling_checkpoint_active is set, so clearing it at generation end
+         * meant the restore fell back to the newest *linked-list* checkpoint.
+         * Observed on GLM-5 at 172k: the rolling snapshot was at 172575, the
+         * KV matched 172581, and the restore still resumed from 172392 -- 183
+         * tokens of prefill thrown away, ~65 s of work at that depth.
+         *
+         * The snapshot is a full copy of the recurrent state at a fixed
+         * position, so it remains usable until something rewinds past it or
+         * overwrites that position. Those are the only places that may clear
+         * it: checkpoint_rolling_invalidate() on stepback/restore-to-earlier,
+         * and the model reload paths. */
 
         double t_end = get_time_ms();
         double t_prefill_ms = t_prefill_end > 0 ? t_prefill_end - t_start : t_end - t_start;
@@ -3590,8 +3624,8 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
                 logits_ns = server_model_forward(model, token, pos);
                 gen_written_cs++;               /* see KV_WRITTEN */
             }
-            /* Deactivate rolling checkpoint after generation ends */
-            srv.rolling_checkpoint_active = 0;
+            /* Rolling checkpoint deliberately NOT cleared here; see the note
+             * at the first generation loop in handle_completion(). */
             total_generation_tokens += gen_count;
             /* The KV cache holds the LAST choice's state, and ptokens[] above is
              * overwritten per choice, so the cache length must come from this
@@ -4126,8 +4160,8 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             gen_written++;                      /* see KV_WRITTEN */
         }
 
-        /* Deactivate rolling checkpoint after generation ends */
-        srv.rolling_checkpoint_active = 0;
+        /* Rolling checkpoint deliberately NOT cleared here; see the note
+         * at the first generation loop in handle_completion(). */
 
         double t_end = get_time_ms();
         double t_prefill_ms = t_prefill_end > 0 ? t_prefill_end - t_start : t_end - t_start;
@@ -4322,8 +4356,8 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
                 dump_top_logits("LOGITS", logits_ns2, model->config.vocab_size, pos, 5);
         }
 
-        /* Deactivate rolling checkpoint after generation ends */
-        srv.rolling_checkpoint_active = 0;
+        /* Rolling checkpoint deliberately NOT cleared here; see the note
+         * at the first generation loop in handle_completion(). */
 
         double t_end = get_time_ms();
         double t_prefill_ms_ns = t_prefill_end_ns > 0 ? t_prefill_end_ns - t_start : t_end - t_start;
