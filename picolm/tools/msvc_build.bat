@@ -438,7 +438,7 @@ set "MSVC_COBJS="
 for %%f in (!MSVC_CSRCS!) do set "MSVC_COBJS=!MSVC_COBJS! %%~nf.obj"
 
 echo [link] picolm.exe
-link /nologo /OUT:picolm.exe !MSVC_COBJS! !MSVC_CUOBJS! !MSVC_LIBS!
+link /nologo /MAP:picolm.map /OUT:picolm.exe !MSVC_COBJS! !MSVC_CUOBJS! !MSVC_LIBS!
 if errorlevel 1 (echo ERROR: link.exe failed & popd 2>nul & exit /b 1)
 
 if defined MSVC_CUOBJS del /q !MSVC_CUOBJS! 2>nul
