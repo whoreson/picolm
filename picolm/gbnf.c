@@ -23,7 +23,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 #define GBNF_NEG_INF (-1e30f)
 #define GBNF_MAX_REPETITIONS 1000
@@ -41,11 +40,12 @@ static int prof_on(void) {
     return on;
 }
 
-static double now_ms(void) {
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (double)t.tv_sec * 1000.0 + (double)t.tv_nsec / 1e6;
-}
+/* Profiling only. Uses the project's portable get_time_ms() (Win32
+ * QueryPerformanceCounter / DOS clock() / POSIX gettimeofday) instead of
+ * clock_gettime(CLOCK_MONOTONIC), which MSVC has no declaration for and which
+ * does not exist at all on DOS or on older Unix. */
+extern double get_time_ms(void);
+static double now_ms(void) { return get_time_ms(); }
 
 /* Length and value bits of a UTF-8 lead byte. *len is always >= 1 so callers
  * make progress even on garbage. */
