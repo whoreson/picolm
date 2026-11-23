@@ -879,8 +879,33 @@ void gbnf_set_vocab(gbnf_t *g, char **vocab, int vocab_size, int eos_id) {
 }
 
 void gbnf_apply(const gbnf_t *g, float *logits, int vocab_size) {
-    if (!g || !g->token_bytes || g->stacks.n == 0) return;
+    if (!g || !g->token_bytes) return;
     if (!g->accept_cache || !g->cache_valid) return;
+
+    /* A DEAD state (no live stack) must fail CLOSED.
+     *
+     * This used to be part of the early return above: `|| g->stacks.n == 0`.
+     * That made a dead grammar behave exactly like no grammar at all -- every
+     * token stayed allowed and generation continued completely unconstrained.
+     * The state is reachable with ordinary models: a byte-level BPE vocab
+     * contains tokens that are UTF-8 fragments (GLM-5's id 21056 is
+     * "\x20\xE2\x89"), the matcher deliberately admits a token that ends
+     * mid-character, and if the next token then completes a character the
+     * grammar forbids, every stack dies. From that point the old code masked
+     * nothing -- so a grammar that had correctly rejected U+2248 let the model
+     * emit anything at all.
+     *
+     * Masking everything (EOS included) is correct here: there is no legal
+     * continuation, so the only sane outcomes are "stop" or "this state is a
+     * bug". The caller sees gbnf_is_complete() == 1 and ends generation. */
+    if (g->stacks.n == 0) {
+        int vs_dead = (vocab_size < g->vocab_size) ? vocab_size : g->vocab_size;
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+#endif
+        for (int i = 0; i < vs_dead; i++) logits[i] = GBNF_NEG_INF;
+        return;
+    }
 
     int vs = (vocab_size < g->vocab_size) ? vocab_size : g->vocab_size;
 
@@ -933,7 +958,12 @@ void gbnf_accept_token(gbnf_t *g, int token) {
 }
 
 int gbnf_is_complete(const gbnf_t *g) {
-    if (!g || !g->started || g->stacks.n == 0) return 0;
+    /* A dead state is "finished" in the only sense the caller cares about:
+     * nothing can be emitted. Returning 0 here (the old behaviour) meant
+     * gbnf_apply masked every token and generation then sampled from an
+     * all-negative-infinity array. The caller must stop instead. */
+    if (!g || !g->started) return 0;
+    if (g->stacks.n == 0) return 1;
     /* Complete means "no way to produce another character", i.e. EVERY live
      * stack is exhausted. An empty stack alone does not mean that: for
      * root ::= a (b)*, after "a" one stack is empty while others can still

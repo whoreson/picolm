@@ -3121,6 +3121,16 @@ int main(int argc, char **argv) {
 
                 if (gbnf_active) gbnf_apply(&gbnf, logits, model.config.vocab_size);
                 else            grammar_apply(&grammar, logits, model.config.vocab_size);
+        /* A grammar that has run out of legal continuations must STOP, not
+         * sample. gbnf_apply() masks every token in that state, and feeding an
+         * all -INFINITY array to softmax() gives max=-inf, so
+         * expf(x - max) is expf(NaN) for every entry and the whole
+         * distribution becomes NaN. Checking here means the caller never
+         * samples from it. */
+        if (gbnf_active && gbnf_is_complete(&gbnf)) {
+            fprintf(stderr, "GBNF: no legal continuation (grammar state exhausted); stopping\n");
+            break;
+        }
         if (getenv("PICOLM_LOGITS_DUMP")) {
             dump_top_logits(logits, model.config.vocab_size, pos, 5);
             /* Also show what the top candidates decode to: a sane model should
