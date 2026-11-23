@@ -1444,8 +1444,9 @@ static float *prefill_with_checkpoints(SOCKET sock, model_t *model,
              * --checkpoint-every-nt, not 512. viz keeps ticking on the GPU's
              * internal 512 ubatches, so the two only look synchronised when
              * interval == ubatch. Cosmetic only -- see the long comment above. */
-            int mod = cur_pos % srv.checkpoint_interval;
-            int interval_dist = (mod == 0) ? srv.checkpoint_interval : (srv.checkpoint_interval - mod);
+            const int ck_int = srv.checkpoint_interval > 0 ? srv.checkpoint_interval : 1;
+            int mod = cur_pos % ck_int;
+            int interval_dist = (mod == 0) ? ck_int : (ck_int - mod);
             int tail_dist = tail_pos - cur_pos;
 
             chunk_size = interval_dist;
@@ -1521,6 +1522,24 @@ static int server_init(const char *model_path, int num_threads, int do_prefault,
 #endif
     /* Set checkpoint parameters */
     srv.max_checkpoints = checkpoint_max;
+    /* Both intervals are used as MODULUS operands: checkpoint_interval in the
+     * prefill chunker, checkpoint_interval_gen at the four generation-checkpoint
+     * sites. A zero operand is a hard crash -- STATUS_INTEGER_DIVIDE_BY_ZERO
+     * (0xc0000094), which killed the process at a fixed address inside
+     * handle_llama_completion with no other symptom.
+     *
+     * They need DIFFERENT handling, which is what the first attempt got wrong:
+     *
+     *   checkpoint_interval     0 is meaningless (a prefill chunk per token),
+     *                           so clamp it up to 1.
+     *   checkpoint_interval_gen 0 is MEANINGFUL: --checkpoint-every-nt-gen 0
+     *                           is how a user disables generation checkpoints,
+     *                           leaving prefill checkpoints at
+     *                           checkpoint_interval. Clamping it to 1 turned
+     *                           "off" into one 150 MB snapshot plus a full SSM
+     *                           state copy per generated token. It stays 0, and
+     *                           each modulo site tests `> 0` first. */
+    if (checkpoint_interval <= 0) checkpoint_interval = 1;
     srv.checkpoint_interval = checkpoint_interval;
     srv.checkpoint_interval_gen = checkpoint_interval_gen;
     srv.checkpoint_tail_offset = checkpoint_tail_offset;
@@ -1661,10 +1680,19 @@ static int server_init(const char *model_path, int num_threads, int do_prefault,
         srv.checkpoint_scratch = (uint8_t *)malloc(srv.checkpoint_snapshot_size);
         /* Rolling checkpoint buffer: always allocated when checkpointing is enabled */
         srv.rolling_checkpoint_data = (uint8_t *)malloc(srv.checkpoint_snapshot_size);
-        fprintf(stderr, "[server] SSM checkpointing enabled: max=%d, interval=%d, gen_interval=%d, tail=%d, rolling_interval=%dms, snapshot_size=%.1fMB\n",
-                srv.max_checkpoints, srv.checkpoint_interval, srv.checkpoint_interval_gen,
-                srv.checkpoint_tail_offset, srv.checkpoint_rolling_interval,
-                (double)srv.checkpoint_snapshot_size / (1024.0 * 1024.0));
+        {
+            /* Print gen_interval as "off" when disabled: 0 is a valid setting,
+             * and reading it as a number invited the clamp bug above. */
+            char gen_desc[32];
+            if (srv.checkpoint_interval_gen > 0)
+                snprintf(gen_desc, sizeof(gen_desc), "%d", srv.checkpoint_interval_gen);
+            else
+                snprintf(gen_desc, sizeof(gen_desc), "off");
+            fprintf(stderr, "[server] SSM checkpointing enabled: max=%d, interval=%d, gen_interval=%s, tail=%d, rolling_interval=%dms, snapshot_size=%.1fMB\n",
+                    srv.max_checkpoints, srv.checkpoint_interval, gen_desc,
+                    srv.checkpoint_tail_offset, srv.checkpoint_rolling_interval,
+                    (double)srv.checkpoint_snapshot_size / (1024.0 * 1024.0));
+        }
     } else if (srv.checkpoint_snapshot_size > 0) {
         fprintf(stderr, "[server] Model has SSM layers but checkpointing is disabled (checkpoint-max=0)\n");
     }
@@ -3443,7 +3471,8 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
              * state. Labelling it n_prompt+gen_count made a later restore resume
              * one token too late and silently skip a token. Same at the 3 other
              * gen-checkpoint sites. */
-            if (srv.max_checkpoints > 0 && model_has_recurrent_state(model) && gen_count % srv.checkpoint_interval_gen == 0) {
+            if (srv.max_checkpoints > 0 && model_has_recurrent_state(model) &&
+                srv.checkpoint_interval_gen > 0 && gen_count % srv.checkpoint_interval_gen == 0) {
                 checkpoint_save(n_prompt + gen_count - 1); /* see GEN_CKPT_POS note */
             }
             /* Rolling checkpoint: time-based, independent of token interval */
@@ -3652,7 +3681,8 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
                 gen_count++;
 
                 /* Generation checkpoint */
-                if (srv.max_checkpoints > 0 && model_has_recurrent_state(model) && gen_count % srv.checkpoint_interval_gen == 0) {
+                if (srv.max_checkpoints > 0 && model_has_recurrent_state(model) &&
+                    srv.checkpoint_interval_gen > 0 && gen_count % srv.checkpoint_interval_gen == 0) {
                     checkpoint_save(n_prompt + gen_count - 1); /* see GEN_CKPT_POS note */
                 }
                 /* Rolling checkpoint: time-based, independent of token interval */
@@ -4197,7 +4227,8 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             gen_count++;
 
             /* Generation checkpoint */
-            if (srv.max_checkpoints > 0 && model_has_recurrent_state(model) && gen_count % srv.checkpoint_interval_gen == 0) {
+            if (srv.max_checkpoints > 0 && model_has_recurrent_state(model) &&
+                srv.checkpoint_interval_gen > 0 && gen_count % srv.checkpoint_interval_gen == 0) {
                 checkpoint_save(n_prompt + gen_count - 1); /* see GEN_CKPT_POS note */
             }
             /* Rolling checkpoint: time-based, independent of token interval */
@@ -4377,7 +4408,8 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             gen_count++;
 
             /* Generation checkpoint */
-            if (srv.max_checkpoints > 0 && model_has_recurrent_state(model) && gen_count % srv.checkpoint_interval_gen == 0) {
+            if (srv.max_checkpoints > 0 && model_has_recurrent_state(model) &&
+                srv.checkpoint_interval_gen > 0 && gen_count % srv.checkpoint_interval_gen == 0) {
                 checkpoint_save(n_prompt + gen_count - 1); /* see GEN_CKPT_POS note */
             }
             /* Rolling checkpoint: time-based, independent of token interval */
