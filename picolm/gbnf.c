@@ -654,14 +654,21 @@ static void accept_chr(const gbnf_rule *rules, const gbnf_element *const *stack,
  * With commit==0 only reachability matters. With commit==1 the successful
  * stacks are written to `commit_stacks` (the caller then adopts them) and the
  * final partial state to `partial`.
- */
+ *
+ * `scratch` must point at two usable gbnf_stacks; the walk ping-pongs between
+ * them. Caller-owned rather than a static: _Thread_local is C11 and is not
+ * available in MSVC's C mode or in anything older than gcc 4.9, and
+ * 2 x sizeof(gbnf_stacks) = 64 KB is far too much to keep in static storage
+ * per thread anyway. Each caller gets its own pair, which also removes the
+ * shared-mutable-state hazard if two gbnf_t are ever advanced from different
+ * threads. */
 static int walk_bytes(const gbnf_rule *rules,
                       const gbnf_element *const *stack, int n,
                       const uint8_t *bytes, int n_bytes,
                       gbnf_utf8 *partial,
-                      gbnf_stacks *commit_stacks) {
-    static _Thread_local gbnf_stacks buf_a, buf_b;
-    gbnf_stacks *cur = &buf_a, *nxt = &buf_b;
+                      gbnf_stacks *commit_stacks,
+                      gbnf_stacks scratch[2]) {
+    gbnf_stacks *cur = &scratch[0], *nxt = &scratch[1];
     stacks_clear(cur);
     stacks_add(cur, stack, n);
 
@@ -762,10 +769,11 @@ static int token_accepted_now(const gbnf_t *g, int i) {
     if (b0 < 0x80) { if (!g->first_ok[b0]) return 0; }
     else if (!g->first_partial[b0]) return 0;
 
+    gbnf_stacks scratch[2];
     for (int s = 0; s < g->stacks.n; s++) {
         gbnf_utf8 partial = g->partial_utf8;
         if (walk_bytes(g->rules, g->stacks.v[s].ptrs, g->stacks.v[s].n,
-                       bytes, n, &partial, NULL))
+                       bytes, n, &partial, NULL, scratch))
             return 1;
     }
     return 0;
@@ -936,6 +944,7 @@ void gbnf_accept_token(gbnf_t *g, int token) {
 
     /* Commit: walk each live stack and adopt the union of the survivors. */
     gbnf_stacks acc;
+    gbnf_stacks scratch[2];
     stacks_clear(&acc);
     gbnf_utf8 result_partial = g->partial_utf8;
 
@@ -944,7 +953,7 @@ void gbnf_accept_token(gbnf_t *g, int token) {
         gbnf_stacks out;
         stacks_clear(&out);
         if (walk_bytes(g->rules, g->stacks.v[s].ptrs, g->stacks.v[s].n,
-                       bytes, n, &partial, &out)) {
+                       bytes, n, &partial, &out, scratch)) {
             for (int k = 0; k < out.n; k++)
                 stacks_add(&acc, out.v[k].ptrs, out.v[k].n);
             result_partial = partial;   /* all survivors agree on this */
