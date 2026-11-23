@@ -1115,6 +1115,13 @@ static int checkpoint_restore(int n_tokens, int *actual_n_tokens) {
     int rewind_pos = from_rolling ? srv.rolling_checkpoint_n_tokens : best->n_tokens;
     checkpoint_prune_after(rewind_pos);
 
+    /* Invalidate the rolling checkpoint if we're NOT restoring from it:
+     * its data represents a position beyond the rewind point and is now stale.
+     * The next decode loop will reactivate it from scratch. */
+    if (!from_rolling) {
+        srv.rolling_checkpoint_active = 0;
+    }
+
     /* Restore SSM state from checkpoint */
     size_t read;
     if (from_rolling) {
