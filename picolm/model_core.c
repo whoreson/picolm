@@ -2102,6 +2102,21 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                      * Spark support; the weights are still uploaded so that work
                      * can start from a warm cache. */
                     if (c->is_spark25) { eligible = 0; el_reason = 9; }
+                    /* GLM-5 / GLM-5.3-Flash (glm5next) has its own CPU forward
+                     * (model_glm5.c): hyper-connection streams, KDA and MLA
+                     * layers. model_forward_gpu() knows none of that, so with
+                     * PICOLM_GPU=1 it ran the llama pipeline over a glm5 model
+                     * and emitted garbage (tiny-model check: 1 token vs the CPU
+                     * path's 13). Veto it like Spark. */
+                    if (c->is_glm5) { eligible = 0; el_reason = 12; }
+                    /* MoE: model_forward_gpu() has no routed-expert step. Its
+                     * attention layers' FFN block finds ffn_gate/ffn_up NULL
+                     * (the weights are ffn_*_exps) and runs with no weights,
+                     * silently; the SSM layers bail to the CPU hybrid. On
+                     * Qwen3.6-35B-A3B Q4_K_M that printed only blanks where the
+                     * CPU path answers. Veto it like Spark until the pipeline
+                     * has an MoE step. */
+                    if (c->has_moe && !c->is_glm5) { eligible = 0; el_reason = 13; }
                     /* PICOLM_NGL with a partial layer count is NOT supported by
                      * the GPU pipeline. n_gpu_layers only limits how many layers
                      * get uploaded; model_forward_gpu()/_prefill_gpu_ubatch()
@@ -2457,11 +2472,13 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                         const char *reason = "unknown";
                         if (el_reason == 1) reason = "unsupported rope_type";
                         else if (el_reason == 2) reason = "KV cache not F16 (GPU attention requires F16 std430)";
+                        else if (el_reason == 12) reason = "GLM-5 (glm5next) is not implemented by the GPU decode pipeline";
                         else if (el_reason == 9) reason = "Spark-X2.5 not implemented by the GPU decode pipeline "
                                                         "(no head-wise attn gate / per-layer SWA rope dim)";
                         else if (el_reason == 11) reason = "PICOLM_NGL is a partial layer count and the GPU "
                                                          "pipeline has no hybrid CPU/GPU layer split "
                                                          "(unset PICOLM_NGL to use the GPU)";
+                        else if (el_reason == 13) reason = "MoE: the GPU decode pipeline has no routed-expert step";
                         else if (el_reason >= 3) reason = "SSM config incompatible with GPU pipeline";
                         else if (!c->has_ssm) reason = "non-SSM model ineligible";
                         fprintf(stderr, "INFO: GPU KV cache disabled (%s; SSM=%d rope=%d kv_k=%d kv_v=%d)\n",
