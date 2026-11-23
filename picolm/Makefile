@@ -67,6 +67,7 @@ help:
 	@echo "  Common variables: SIMD=, PREFIX=, MODEL_DIR=, CC=, WARN=1"
 
 CC      ?= gcc
+CXX     ?= g++
 
 # ---- Compiler detection ----
 # -Wduplicated-cond, -Wduplicated-branches and -Wformat-truncation are
@@ -138,7 +139,7 @@ GPU_OBJS =
 
 # GPU host .cu sources (split into modular files)
 GPU_SRCS = backend_gpu_kernels.cu backend_gpu_host_core.cu backend_gpu_host_ssm.cu backend_gpu_host_misc.cu
-GPU_CUH  = backend_gpu_common.cuh backend_gpu_dequant.cuh backend_gpu_kernels.cuh
+GPU_CUH  = backend_gpu_common.cuh backend_gpu_dequant.cuh backend_gpu_kernels.cuh backend_gpu_attn_fa3.cuh
 
 PREFIX  ?= /usr/local
 MODEL_DIR ?= /opt/picolm/models
@@ -537,6 +538,18 @@ test-attn-hmma-gpu: tests/test_attn_hmma_gpu.cu backend_gpu_kernels-cuda.o
 	$(NVCC) $(CUDAFLAGS) $(CUDA_GENCODE) -DPICOLM_GPU=1 -o test_attn_hmma_gpu $^ -I.
 
 # GPU check: FA3 (register-resident O, head_dim 256) agrees with the scalar warpgrp kernel.
+# CPU emulation of the FA3 kernel: compiles the REAL backend_gpu_attn_fa3.cuh with the PTX
+# primitives (ldmatrix, mma.m16n8k16, cp.async, shuffles, barriers) emulated, runs it on one
+# OS thread per CUDA thread and checks it against a double-precision reference. No GPU needed.
+# A divergent barrier hangs (use `timeout`); `./fa3_emu quick` runs a fast subset.
+.PHONY: test-attn-fa3-emu
+# Development target, not part of any normal build: it needs C++11 + threads and
+# is only meaningful on a host with a real pthread/threading library. It is NOT
+# a PicoLM build dependency, so platforms in the DJGPP/old-gcc band never see it
+# (the shipped header below is only ever compiled by nvcc or this test).
+test-attn-fa3-emu: tests/fa3_emu.cpp backend_gpu_attn_fa3.cuh
+	$(CXX) -std=c++11 -O2 -pthread -DPICOLM_FA3_EMU -Wno-unknown-pragmas -I. -o fa3_emu tests/fa3_emu.cpp
+
 test-attn-fa3-gpu: tests/test_attn_fa3_gpu.cu backend_gpu_kernels-cuda.o
 	$(NVCC) $(CUDAFLAGS) $(CUDA_GENCODE) -DPICOLM_GPU=1 -o test_attn_fa3_gpu $^ -I.
 

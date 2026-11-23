@@ -81,3 +81,4 @@ test_glm5_pf_par
 test_glm5_dense_batch
 test_glm5_kda_split
 test_glm5_pfprof
+fa3_emu

@@ -1097,18 +1097,6 @@ get_device_shared_mem_per_block(int device) {
 }
 
 static int
-ensure_attn_fa3_shared_mem(size_t bytes) {
-    static size_t configured = 49152;
-    if (bytes <= configured) return 1;
-    if (!gpu_ok(gpuFuncSetAttribute((const void *)picolm_gpu_attention_prefill_fa3_kernel,
-                                     gpuFuncAttributeMaxDynamicSharedMemorySize, (int)bytes),
-                "attn fa3 shared mem opt-in"))
-        return 0;
-    configured = bytes;
-    return 1;
-}
-
-static int
 ensure_attn_fa2_shared_mem(size_t bytes) {
     static size_t configured = 49152;
     if (bytes <= configured) return 1;
@@ -1379,55 +1367,31 @@ attn_prefill_dev_impl(float *xb_out_dev, const float *q_dev,
                    &kv_pos_stride_bytes, &kv_head_stride_bytes, &kv_type);
     kv_strides_for(device, 0, n_kv_heads, head_dim,
                    &kv_pos_stride_v_bytes, &kv_head_stride_v_bytes, &kv_type_v);
+    /* FA3 (above) honours V's own strides and type. The FA2 / warpgrp / hmma
+     * kernels below still assume K and V share one block format and K's pos
+     * stride, so K/V-mixed caches are only correct through FA3. */
     (void)kv_pos_stride_v_bytes;
-    (void)kv_type_v;   /* K and V share the block format in every kernel below */
+    (void)kv_type_v;
 
-    /* FA3 first: register-resident O, so it fits head_dim=256 where FA2 cannot.
-     * Any kv_type (it dequantises in the tile load via kv_row_dequant). */
+    /* FA3 first: tensor-core QK^T AND P@V with O in registers, so it covers
+     * head_dim=256 (Qwen3.5/3.6) where FA2 cannot fit and the fallback is the
+     * scalar warpgrp kernel. Handles F16/Q8_0/Q4_0 KV with K and V independent
+     * (it takes V's own strides and type). The launcher returns 0 for anything
+     * it does not support, in which case we fall through to FA2 / warpgrp.
+     *
+     * Opt in with PICOLM_FA3_ATTN=1 until tests/test_attn_fa3_gpu has been run
+     * on the target GPU, then make it the default by inverting this check. */
     {
-        /* FA3 is NOT enabled by default: it produces NaN logits.
-         *
-         * The kernel is written and it fits head_dim=256 in shared memory
-         * (the whole point -- FA2 needs 136.5 KB against a 96 KB cap, which is
-         * why Qwen3.5/3.6 prefill attention falls back to the scalar warpgrp
-         * kernel and costs 26.6% of prefill at 4096 tokens, growing as O(n^2)).
-         * But the Q@K tensor-core path is wrong: scores come out ~1e11 instead
-         * of ~1e2, so the softmax collapses to the first key (sum=1.0) and the
-         * output is garbage.
-         *
-         * Fixed along the way: a divergent gpuSyncthreads() when q0 >= n_tokens
-         * for some warps only (the warp now stays alive and skips its maths).
-         *
-         * Still broken: the m16n8k16 operand mapping. The A/B fragment
-         * assembly was copied from the FA2 kernel, which is verified, so the
-         * difference is somewhere in the shared-memory layout this kernel uses
-         * (per-warp Q tile of 16 rows) rather than in the instruction itself.
-         * Opt in with PICOLM_FA3_ATTN=1 to work on it. */
         static int no_fa3 = -1;
         if (no_fa3 < 0) no_fa3 = getenv("PICOLM_FA3_ATTN") ? 0 : 1;
-        int fa3_tk = ctx->has_imma ? 32 : 0;
-        if (!no_fa3 && fa3_tk && n_tokens >= 32 && !getenv("PICOLM_FORCE_SCALAR_ATTN")
-            && (head_dim % 32) == 0) {
-            size_t f3 = (size_t)2 * fa3_tk * head_dim * sizeof(uint16_t)
-                      + (size_t)FA3_WARPS * FA3_ROWS * head_dim * sizeof(uint16_t)
-                      + (size_t)FA3_WARPS * FA3_ROWS * fa3_tk * sizeof(float)
-                      + (size_t)FA3_WARPS * FA3_ROWS * fa3_tk * sizeof(uint16_t);
-            static size_t f3_ok_for = 0;
-            if (f3 != f3_ok_for) {
-                if (!ensure_attn_fa3_shared_mem(f3)) { f3 = 0; }
-                else f3_ok_for = f3;
-            }
-            if (f3) {
+        if (!no_fa3 && ctx->has_imma && n_tokens >= 32 && !getenv("PICOLM_FORCE_SCALAR_ATTN")) {
+            if (picolm_gpu_attention_prefill_fa3_launch(
+                    ctx->stream, xb_out_dev, q_dev, g_kv_k_dev[device], g_kv_v_dev[device],
+                    layer_ordinal, start_pos, n_tokens, n_heads, n_kv_heads, head_dim, max_seq_len,
+                    kv_pos_stride_bytes, kv_head_stride_bytes, kv_pos_stride_v_bytes,
+                    kv_head_stride_v_bytes, n_swa, kv_type, kv_type_v)) {
                 gpu_dispatch_print("attn_prefill_fa3_dev");
-                dim3 grid3((unsigned)n_heads,
-                           (unsigned)((n_tokens + FA3_ROWS * FA3_WARPS - 1) / (FA3_ROWS * FA3_WARPS)), 1);
-                picolm_gpu_attention_prefill_fa3_kernel<<<grid3, 32 * FA3_WARPS, (unsigned)f3, ctx->stream>>>(
-                    xb_out_dev, q_dev, g_kv_k_dev[device], g_kv_v_dev[device],
-                    layer_ordinal, start_pos, n_tokens, n_heads, n_kv_heads, head_dim,
-                    max_seq_len, kv_pos_stride_bytes, kv_head_stride_bytes,
-                    kv_head_stride_v_bytes, n_swa, kv_type, fa3_tk);
-                if (gpu_ok(gpuGetLastError(), "attn prefill fa3")) return 1;
-                gpuGetLastError();
+                return 1;
             }
         }
     }
