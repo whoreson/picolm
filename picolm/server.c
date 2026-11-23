@@ -2340,6 +2340,28 @@ static void handle_slots_post(SOCKET sock, const char *body) {
                         }
                     }
 
+                    /* Sanity-check the offset we are about to seek to. If it
+                     * lands outside the file, the stride computation above is
+                     * wrong for this format -- say so with the numbers instead
+                     * of reporting a bogus magic value, which is what made the
+                     * TQ4 case look like a corrupt file rather than a reader
+                     * bug. */
+                    {
+                        off_t fsz = 0;
+#ifdef _WIN32
+                        fsz = _lseeki64(fd, 0, SEEK_END);
+#else
+                        fsz = lseek(fd, 0, SEEK_END);
+#endif
+                        if (fsz > 0 && (kv_end < 0 || kv_end + 8 > fsz)) {
+                            fprintf(stderr, "\n[server] checkpoint section offset %lld is "
+                                            "outside the file (%lld bytes) -- the KV row stride "
+                                            "for kv_type k=%d v=%d looks wrong\n",
+                                    (long long)kv_end, (long long)fsz,
+                                    (int)header[5], (int)header[6]);
+                        }
+                    }
+
                     /* Seek to end of KV data and try to read checkpoint magic */
 #ifdef _WIN32
                     _lseeki64(fd, kv_end, SEEK_SET);
