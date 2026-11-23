@@ -820,10 +820,15 @@ void gbnf_refresh_cache(gbnf_t *g, int n_threads) {
     build_first_byte_filter(g);
     double t1 = prof ? now_ms() : 0.0;
 
+    /* MSVC's OpenMP requires the loop variable to be declared outside the
+     * for and rejects the C99 form (`for (int i = ...)`) with C3015. The rest
+     * of the tree writes these loops the same way -- see the DOTPROD gemv
+     * fallback in quant.c. */
+    int i;
 #ifdef _OPENMP
     #pragma omp parallel for schedule(static)
 #endif
-    for (int i = 0; i < vs; i++)
+    for (i = 0; i < vs; i++)
         g->accept_cache[i] = (uint8_t)token_accepted_now(g, i);
 
     if (prof) {
@@ -908,10 +913,11 @@ void gbnf_apply(const gbnf_t *g, float *logits, int vocab_size) {
      * bug". The caller sees gbnf_is_complete() == 1 and ends generation. */
     if (g->stacks.n == 0) {
         int vs_dead = (vocab_size < g->vocab_size) ? vocab_size : g->vocab_size;
+        int i;
 #ifdef _OPENMP
         #pragma omp parallel for schedule(static)
 #endif
-        for (int i = 0; i < vs_dead; i++) logits[i] = GBNF_NEG_INF;
+        for (i = 0; i < vs_dead; i++) logits[i] = GBNF_NEG_INF;
         return;
     }
 
@@ -923,10 +929,11 @@ void gbnf_apply(const gbnf_t *g, float *logits, int vocab_size) {
     for (int s = 0; s < g->stacks.n; s++)
         if (g->stacks.v[s].n == 0) { complete = 1; break; }
 
+    int i;
 #ifdef _OPENMP
     #pragma omp parallel for schedule(static)
 #endif
-    for (int i = 0; i < vs; i++) {
+    for (i = 0; i < vs; i++) {
         if (i == g->eos_id) {
             if (!complete) logits[i] = GBNF_NEG_INF;
             continue;
