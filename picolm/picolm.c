@@ -1816,6 +1816,39 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* Known-bad configuration notice: Q4_0 *V* cache.
+     *
+     * Q4_0 K is fine and is used everywhere. Q4_0 as the VALUE cache is not:
+     * output quality degrades well beyond what 4 bits should cost, on CPU and
+     * GPU alike. That is the reported symptom, and it is NOT explained by the
+     * quantiser: quantize_row_q4_0() here matches llama.cpp's byte for byte,
+     * the dequantisers and the scale_add/fma_scale paths agree with it, and
+     * llama.cpp runs the same q4_0 V cache on the same models without the
+     * problem. So there is a real bug somewhere in the V-side path that nobody
+     * has isolated yet -- most likely in how V blocks are consumed during the
+     * attention accumulate for particular shapes, not in the bytes on disk.
+     *
+     * Nothing is disabled here: the configuration still runs, because the
+     * failure is gradual rather than a hard fault and refusing it outright
+     * would break the one way to reproduce it. The point of this message is
+     * that "q4_0 V looked bad" must not be mistaken for "4 bits is too
+     * lossy" -- the expected quality is close to Q8_0, and a large gap is a
+     * bug report, not a tuning result.
+     *
+     * Tracked as TODO(q4_0-v-cache). Prefer -ctv q8_0, or -ctk tq4 -ctv tq4
+     * (TQ3 requires a matching K, see the guard below) which reaches the same
+     * cache size and is numerically sound. */
+    if (kv_type_v == KV_CACHE_Q4_0 && !getenv("PICOLM_ALLOW_BAD_Q4V")) {
+        fprintf(stderr,
+            "WARNING: -ctv q4_0 (Q4_0 value cache) is a KNOWN-BAD configuration.\n"
+            "         Output quality degrades far more than 4 bits should cost, on CPU and\n"
+            "         GPU. The quantiser matches llama.cpp byte for byte, so this is an\n"
+            "         unfixed bug in our V path, not expected precision loss -- do not read\n"
+            "         a bad result as \"q4_0 V is too lossy\". Use -ctv q8_0, or\n"
+            "         -ctk tq4 -ctv tq4 (same cache size as q4_0, numerically sound).\n"
+            "         PICOLM_ALLOW_BAD_Q4V=1 silences this notice.\n");
+    }
+
     /* Register RoPE scaling CLI overrides (if any were given) before any
      * code path that calls model_load()/model_load_safetensors() below,
      * including --benchmark-ctx's own separate model_load() call. */
