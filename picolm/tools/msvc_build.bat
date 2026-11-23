@@ -303,7 +303,7 @@ set "MSVC_CF=%MSVC_CF% /D PICOLM_SERVER=1"
 if defined MSVC_VNNI_DEF set "MSVC_CF=!MSVC_CF! !MSVC_VNNI_DEF!"
 
 set "MSVC_CSRCS="
-for %%f in (picolm.c model_core.c model_recurrent_state.c model_attention.c model_moe.c model_gemma3n.c model_glm5.c model_sensenova.c model_ssm.c model_kv_cache.c model_gguf.c steer.c tensor.c type_dispatch.c quant.c sgemm.c sgemm_q0_neon_fast.c sgemm_q2_k_r4_neon.c sgemm_iq4nl_neon_fast.c sgemm_k_q8k_neon_fast.c sgemm_q2_k_neon.c sgemm_k_q8k_neon.c sgemm_q4_0x8.c sgemm_q4i_0x8.c sgemm_q4_0_r8.c sgemm_q8_0_r8.c sgemm_q8_k_r8.c sgemm_q8_k_r8_neon.c sgemm_iq2_k.c sgemm_iq2_k_r4.c sgemm_iq3_k.c sgemm_iq3_k_r4.c sgemm_iq4_k.c sgemm_iq4_nl_r4.c sgemm_q4_k_r4.c sgemm_q6_k_r4.c sgemm_iq6_k.c sgemm_iq4_xs.c tokenizer.c qwen_tokenize.c sampler.c grammar.c cJSON.c server.c csafetensors.c json.c safetensors.c) do (
+for %%f in (picolm.c model_core.c model_recurrent_state.c model_attention.c model_moe.c model_gemma3n.c model_glm5.c model_sensenova.c model_ssm.c model_kv_cache.c model_gguf.c steer.c tensor.c type_dispatch.c quant.c sgemm.c sgemm_q0_neon_fast.c sgemm_q2_k_r4_neon.c sgemm_iq4nl_neon_fast.c sgemm_k_q8k_neon_fast.c sgemm_q2_k_neon.c sgemm_k_q8k_neon.c sgemm_q4_0x8.c sgemm_q4i_0x8.c sgemm_q4_0_r8.c sgemm_q8_0_r8.c sgemm_q8_k_r8.c sgemm_q8_k_r8_neon.c sgemm_iq2_k.c sgemm_iq2_k_r4.c sgemm_iq3_k.c sgemm_iq3_k_r4.c sgemm_iq4_k.c sgemm_iq4_nl_r4.c sgemm_q4_k_r4.c sgemm_q6_k_r4.c sgemm_iq6_k.c sgemm_iq4_xs.c tokenizer.c qwen_tokenize.c sampler.c grammar.c gbnf.c cJSON.c server.c csafetensors.c json.c safetensors.c) do (
     set "MSVC_CSRCS=!MSVC_CSRCS! %%f"
 )
 
