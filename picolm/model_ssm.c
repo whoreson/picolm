@@ -4973,7 +4973,7 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
                                 (size_t)n_tokens * dim * sizeof(float));
         if (!ssm_out_buf) { fprintf(stderr, "OOM: ssm_out scratch\n"); exit(1); }
         if (!_SSM_SKIP(9))
-        matmul_batch(ssm_out_buf, xb2_batch, n_tokens, lw->ssm_out, value_dim, dim, lw->type_ssm_out);
+        matmul_batch(ssm_out_buf, xb2_vd, n_tokens, lw->ssm_out, value_dim, dim, lw->type_ssm_out);
         if (l <= 4 && _SSM_DBG) {
             float so[8], sor=0; int lt=n_tokens-1;
             for(int i=0;i<8;i++){so[i]=ssm_out_buf[lt*dim+i];sor+=so[i]*so[i];}sor=sqrtf(sor/8);
@@ -5094,7 +5094,7 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
                                 (size_t)n_tokens * dim * sizeof(float));
           if (!ssm_out_buf) { fprintf(stderr, "OOM: ssm_out scratch\n"); exit(1); }
           if (!_SSM_SKIP(9))
-        matmul_batch(ssm_out_buf, xb2_batch, n_tokens, lw->ssm_out, value_dim, dim, lw->type_ssm_out);
+        matmul_batch(ssm_out_buf, xb2_vd, n_tokens, lw->ssm_out, value_dim, dim, lw->type_ssm_out);
           double orm = 0; for(int i=0;i<dim;i++) orm+=ssm_out_buf[lt*dim+i]*ssm_out_buf[lt*dim+i];
           fprintf(stderr, "SSM_VERIFY l=0 cpu ssm_out_rms=%.6e\n", sqrt(orm/dim));
           fprintf(stderr, "SSM_VERIFY l=0 cpu ssm_out_last[:4]={%.6f,%.6f,%.6f,%.6f}\n",
