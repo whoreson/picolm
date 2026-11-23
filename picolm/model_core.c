@@ -1071,6 +1071,23 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
         s->kv_layer_count = kv_ord;
     }
 
+    /* TQ3 is too lossy to mix with another V format: 3-bit error in the
+     * attention SCORES is fine, but pairing it with an F16/8-bit V changes the
+     * output distribution enough to corrupt results, so require TQ3 on both.
+     *
+     * Checked HERE rather than in picolm.c's argument handling, because that
+     * code is CLI-only: picolm.c returns into server_main() before it, so
+     * `--server -ctk tq3 -ctv q8_0` used to start up and produce garbage.
+     * allocate_run_state() is the one place both loaders reach, so the rule
+     * cannot diverge between the CLI and the server. */
+    if ((kv_type_k == KV_CACHE_TQ3 && kv_type_v != KV_CACHE_TQ3) ||
+        (kv_type_v == KV_CACHE_TQ3 && kv_type_k != KV_CACHE_TQ3)) {
+        fprintf(stderr, "ERROR: TQ3 KV cache must be used for both K and V (-ctk tq3 -ctv tq3).\n");
+        fprintf(stderr, "       Mixed-mode (TQ3 K + non-TQ3 V or vice versa) produces corrupted output\n");
+        fprintf(stderr, "       because 3-bit quantization error in attention scores is too large.\n");
+        return -1;
+    }
+
     s->kv_type_k = kv_type_k;
     s->kv_type_v = kv_type_v;
     s->kv_row_size_k = sz_k_row;

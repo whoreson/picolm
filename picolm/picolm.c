@@ -2155,14 +2155,9 @@ int main(int argc, char **argv) {
         unsetenv("PICOLM_GPU");
     }
 
-    /* Guard: TQ3 is too lossy for mixed-mode. Require TQ3/TQ3 pairing. */
-    if ((kv_type_k == KV_CACHE_TQ3 && kv_type_v != KV_CACHE_TQ3) ||
-        (kv_type_v == KV_CACHE_TQ3 && kv_type_k != KV_CACHE_TQ3)) {
-        fprintf(stderr, "ERROR: TQ3 KV cache must be used for both K and V (-ctk tq3 -ctv tq3).\n");
-        fprintf(stderr, "       Mixed-mode (TQ3 K + non-TQ3 V or vice versa) produces corrupted output\n");
-        fprintf(stderr, "       because 3-bit quantization error in attention scores is too large.\n");
-        return 1;
-    }
+    /* The TQ3/TQ3 pairing rule lives in allocate_run_state() (model_core.c),
+     * not here: this point is CLI-only, and the server must enforce it too.
+     * Duplicating it here is how the two paths drifted apart before. */
     int load_ok = 0;
     if (is_safetensors) {
         load_ok = (model_load_safetensors(&model, model_path, context_override, kv_type_k, kv_type_v, k_cache_hadamard, v_cache_hadamard, num_threads) == 0);
