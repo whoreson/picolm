@@ -2444,7 +2444,7 @@ static void handle_slots_post(SOCKET sock, const char *body) {
 #else
                         read(fd, &cp_count, sizeof(cp_count));
 #endif
-                        if (cp_count > 0 && cp_count <= 128) {
+                        if (cp_count > 0 && cp_count <= 1024) {
                             /* Load checkpoints into linked list */
                             for (uint32_t i = 0; i < cp_count; i++) {
                                 uint32_t cp_n;
@@ -2507,18 +2507,27 @@ static void handle_slots_post(SOCKET sock, const char *body) {
                             }
                             fprintf(stderr, "\n");
                         } else {
-                            /* Skip checkpoint data */
+                            /* cp_count == 0 or cp_count > 1024: skip the data */
+                            if (cp_count > 1024) {
+                                fprintf(stderr, "\n[server] SKIPPING %u SSM checkpoints "
+                                        "(exceeds limit of 1024); increase the limit if needed\n",
+                                        cp_count);
+                            }
+                            /* Each checkpoint entry: 4 bytes (n_tokens) + checkpoint_snapshot_size bytes */
+                            size_t entry_sz = 4 + srv.checkpoint_snapshot_size;
+                            uint8_t *skip_buf = (uint8_t *)alloca(entry_sz < 4096 ? 4096 : entry_sz);
+                            for (uint32_t i = 0; i < cp_count; i++) {
+                                size_t remain = entry_sz;
+                                while (remain > 0) {
+                                    size_t chunk = remain < 4096 ? remain : 4096;
 #ifdef _WIN32
-                            uint8_t *skip_buf = (uint8_t *)alloca(4096);
-                            for (uint32_t i = 0; i < cp_count && cp_count <= 1024; i++) {
-                                _read(fd, (char *)skip_buf, 4096); /* skip 4 bytes */
-                            }
+                                    _read(fd, (char *)skip_buf, (unsigned)chunk);
 #else
-                            uint8_t *skip_buf = (uint8_t *)alloca(4096);
-                            for (uint32_t i = 0; i < cp_count && cp_count <= 1024; i++) {
-                                read(fd, skip_buf, 4096); /* skip 4 bytes */
-                            }
+                                    read(fd, skip_buf, chunk);
 #endif
+                                    remain -= chunk;
+                                }
+                            }
                         }
                     } else {
                         fprintf(stderr, "\n[server] No SSM checkpoint section found at offset %lld (magic=0x%08X, expected=0x43505350)\n",
