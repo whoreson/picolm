@@ -6064,12 +6064,6 @@ float *model_forward_prefill_range(model_t *m, const int *tokens, int n_tokens, 
                 /* enter: both streams start from the block input */
                 memcpy(mhc_strb, x_batch, (size_t)n_tokens * dim * sizeof(float));
             }
-            if (getenv("PICOLM_MHC_DBG") && l == 4) {
-                fprintf(stderr, "[MHC-BATCH l=4 t0] x_in[:4]=%.6f,%.6f,%.6f,%.6f strb[:4]=%.6f,%.6f,%.6f,%.6f\n",
-                        x_batch[0], x_batch[1], x_batch[2], x_batch[3],
-                        mhc_strb[0], mhc_strb[1], mhc_strb[2], mhc_strb[3]);
-            }
-
             /* ---- sublayer 1 router: concat [a;b] -> GEMM -> finish ---- */
             for (bi = 0; bi < n_tokens; bi++) {
                 memcpy(mhc_concat + (size_t)bi * 2 * dim, x_batch + (size_t)bi * dim, dim4);
@@ -6081,11 +6075,6 @@ float *model_forward_prefill_range(model_t *m, const int *tokens, int n_tokens, 
                 mhc_route_ctx_t rc = { mhc_branch, mhc_routl, x_batch, mhc_strb,
                                        mhc_routl, (const float *)lw->mhc_attn_b, dim };
                 tensor_parallel_for(n_tokens, mhc_route_task, &rc);
-            }
-            if (getenv("PICOLM_MHC_DBG") && l == 4) {
-                fprintf(stderr, "[MHC-BATCH l=4 t0] branch[:4]=%.6f,%.6f,%.6f,%.6f gates=%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
-                        mhc_branch[0], mhc_branch[1], mhc_branch[2], mhc_branch[3],
-                        mhc_routl[0], mhc_routl[1], mhc_routl[2], mhc_routl[3], mhc_routl[4], mhc_routl[5]);
             }
 
             if (mhc_gdn) {
@@ -6195,7 +6184,6 @@ float *model_forward_prefill_range(model_t *m, const int *tokens, int n_tokens, 
                                         || getenv("PICOLM_SSM_DBG")[0] == '2')) {
                 int lt = n_tokens - 1;
                 fprintf(stderr, "[CPU PFX l=%d] bx_last[:4]={%.6f,%.6f,%.6f,%.6f}\n", l, x_batch[(size_t)lt*dim], x_batch[(size_t)lt*dim+1], x_batch[(size_t)lt*dim+2], x_batch[(size_t)lt*dim+3]);
-                fprintf(stderr, "[CPU PFX l=%d] bx_tok0 [:4]={%.6f,%.6f,%.6f,%.6f}\n", l, x_batch[0], x_batch[1], x_batch[2], x_batch[3]);
             }
             continue;
         }
@@ -6760,7 +6748,6 @@ float *model_forward_prefill_range(model_t *m, const int *tokens, int n_tokens, 
                                     || getenv("PICOLM_SSM_DBG")[0] == '2')) {
             int lt = n_tokens - 1;
             fprintf(stderr, "[CPU PFX l=%d] bx_last[:4]={%.6f,%.6f,%.6f,%.6f}\n", l, x_batch[lt*dim], x_batch[lt*dim+1], x_batch[lt*dim+2], x_batch[lt*dim+3]);
-            fprintf(stderr, "[CPU PFX l=%d] bx_tok0 [:4]={%.6f,%.6f,%.6f,%.6f}\n", l, x_batch[0], x_batch[1], x_batch[2], x_batch[3]);
         }
         BENCH_LAYER_END(l, 1);
     }

@@ -82,14 +82,6 @@ static void mhc_route(float *out_branch, float *gates,
 void mhc_route_finish(float *out_branch, float *gates,
                       const float *a, const float *b, const float *raw8,
                       const float *bias, int d) {
-    static int dbg_first = 0;
-    int dbg = (dbg_first++ == 0);
-    if (dbg && getenv("PICOLM_MHC_DBG"))
-        fprintf(stderr, "[ROUTE1 a0-3=%.6f,%.6f,%.6f,%.6f b0-3=%.6f,%.6f,%.6f,%.6f\n"
-                " raw8=%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f bias0-3=%.4f,%.4f,%.4f,%.4f]\n",
-                a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3],
-                raw8[0], raw8[1], raw8[2], raw8[3], raw8[4], raw8[5], raw8[6], raw8[7],
-                bias[0], bias[1], bias[2], bias[3]);
     float ss = 0.0f;
     for (int i = 0; i < d; i++) ss += a[i]*a[i] + b[i]*b[i];
     const float rms = 1.0f / sqrtf(ss / (2.0f * d) + 1e-6f);
@@ -124,15 +116,6 @@ void mhc_route_finish(float *out_branch, float *gates,
     gates[3] = expf(m[0][1]);
     gates[4] = expf(m[1][0]);
     gates[5] = expf(m[1][1]);
-    if (dbg) {
-        fprintf(stderr, "[ROUTE1 a[:4]=%.6f,%.6f,%.6f,%.6f b[:4]=%.6f,%.6f,%.6f,%.6f\n"
-                " raw8=%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f bias=%.4f,%.4f\n"
-                " pre=%.4f,%.4f branch[:4]=%.6f,%.6f,%.6f,%.6f]\n",
-                a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3],
-                raw8[0], raw8[1], raw8[2], raw8[3], raw8[4], raw8[5], raw8[6], raw8[7],
-                bias[0], bias[1], pre0, pre1,
-                out_branch[0], out_branch[1], out_branch[2], out_branch[3]);
-    }
 }
 
 /* mHC merge (shared with the batched prefill): a' = m00*a + m01*b +
@@ -300,10 +283,6 @@ void sensenova_layer(model_t *m, run_state_t *s, int l, int pos,
         memcpy(str_b, s->x, dim * sizeof(float));
         *streams_active = 1;
     }
-    if (getenv("PICOLM_MHC_DBG") && l == 4 && pos == 0)
-        fprintf(stderr, "[MHC-TW l=4 t0] x_in[:4]=%.6f,%.6f,%.6f,%.6f strb[:4]=%.6f,%.6f,%.6f,%.6f\n",
-                s->x[0], s->x[1], s->x[2], s->x[3],
-                str_b[0], str_b[1], str_b[2], str_b[3]);
 
     /* -- sublayer 1: attention (GDN or full), routed -- */
     float *y;
@@ -326,10 +305,6 @@ void sensenova_layer(model_t *m, run_state_t *s, int l, int pos,
         y = s->xb;
     }
     /* merge: a'=x (in place), b'=str_b (in place), y from the sublayer */
-    if (getenv("PICOLM_MHC_DBG") && l == 4 && pos == 0)
-        fprintf(stderr, "[MHC-TW l=4 t0] branch[:4]=%.6f,%.6f,%.6f,%.6f gates=%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
-                branch[0], branch[1], branch[2], branch[3],
-                gates[0], gates[1], gates[2], gates[3], gates[4], gates[5]);
     mhc_merge_rows(s->x, str_b, s->x, str_b, y, gates, dim);
 
     /* -- sublayer 2: FFN, routed -- */
