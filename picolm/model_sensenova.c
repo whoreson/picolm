@@ -57,22 +57,44 @@
 #include "viz.h"
 #endif
 
-/* mHC router. Writes the routed branch to out_branch[d] and the 6 gate
- * scalars (post0, post1, m00, m01, m10, m11) to gates[0..6). */
+/* mHC router (decode path): fused GEMM + finish. Writes the routed branch
+ * to out_branch[d] and the 6 gate scalars (post0, post1, m00, m01, m10,
+ * m11) to gates[0..6). */
 static void mhc_route(float *out_branch, float *gates,
                       const float *a, const float *b,
                       const float *w, const float *bias, int d) {
-    float ss = 0.0f;
-    for (int i = 0; i < d; i++) ss += a[i]*a[i] + b[i]*b[i];
-    const float rms = 1.0f / sqrtf(ss / (2.0f * d) + 1e-6f);
-
     float lg[8];
     for (int k = 0; k < 8; k++) {
         const float *wk = w + (size_t)k * 2 * d;
         float acc = 0.0f;
         for (int i = 0; i < d; i++) acc += wk[i]*a[i] + wk[d + i]*b[i];
-        lg[k] = acc * rms + bias[k];
+        lg[k] = acc;
     }
+    mhc_route_finish(out_branch, gates, a, b, lg, bias, d);
+}
+
+/* Shared router finish (also used by the batched prefill, which computes
+ * the raw [n_tok][8] logits with matmul_batch and calls this per token).
+ * raw8[k] = dot(W_row_k, [a;b]) WITHOUT rms/bias. Applies the joint RMS
+ * scale, bias, sigmoid gates and the 20-iteration sinkhorn normalize,
+ * then forms branch = pre0*a + pre1*b. gates[0..6) = {post0, post1,
+ * m00, m01, m10, m11} (m* = exp of the normalized logit matrix). */
+void mhc_route_finish(float *out_branch, float *gates,
+                      const float *a, const float *b, const float *raw8,
+                      const float *bias, int d) {
+    static int dbg_first = 0;
+    int dbg = (dbg_first++ == 0);
+    if (dbg && getenv("PICOLM_MHC_DBG"))
+        fprintf(stderr, "[ROUTE1 a0-3=%.6f,%.6f,%.6f,%.6f b0-3=%.6f,%.6f,%.6f,%.6f\n"
+                " raw8=%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f bias0-3=%.4f,%.4f,%.4f,%.4f]\n",
+                a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3],
+                raw8[0], raw8[1], raw8[2], raw8[3], raw8[4], raw8[5], raw8[6], raw8[7],
+                bias[0], bias[1], bias[2], bias[3]);
+    float ss = 0.0f;
+    for (int i = 0; i < d; i++) ss += a[i]*a[i] + b[i]*b[i];
+    const float rms = 1.0f / sqrtf(ss / (2.0f * d) + 1e-6f);
+    float lg[8];
+    for (int k = 0; k < 8; k++) lg[k] = raw8[k] * rms + bias[k];
 
     const float pre0  = 1.0f / (1.0f + expf(-lg[0]));
     const float pre1  = 1.0f / (1.0f + expf(-lg[1]));
@@ -102,13 +124,23 @@ static void mhc_route(float *out_branch, float *gates,
     gates[3] = expf(m[0][1]);
     gates[4] = expf(m[1][0]);
     gates[5] = expf(m[1][1]);
+    if (dbg) {
+        fprintf(stderr, "[ROUTE1 a[:4]=%.6f,%.6f,%.6f,%.6f b[:4]=%.6f,%.6f,%.6f,%.6f\n"
+                " raw8=%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f bias=%.4f,%.4f\n"
+                " pre=%.4f,%.4f branch[:4]=%.6f,%.6f,%.6f,%.6f]\n",
+                a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3],
+                raw8[0], raw8[1], raw8[2], raw8[3], raw8[4], raw8[5], raw8[6], raw8[7],
+                bias[0], bias[1], pre0, pre1,
+                out_branch[0], out_branch[1], out_branch[2], out_branch[3]);
+    }
 }
 
-/* mHC merge: a' = m00*a + m01*b + post0*y; b' = m10*a + m11*b + post1*y.
- * a_out may alias a; b_out may alias b. y must not alias a_out/b_out. */
-static void mhc_merge(float *a_out, float *b_out,
-                      const float *a, const float *b, const float *y,
-                      const float *gates, int d) {
+/* mHC merge (shared with the batched prefill): a' = m00*a + m01*b +
+ * post0*y; b' = m10*a + m11*b + post1*y. a_out may alias a; b_out may
+ * alias b. y must not alias a_out/b_out. */
+void mhc_merge_rows(float *a_out, float *b_out,
+                    const float *a, const float *b, const float *y,
+                    const float *gates, int d) {
     const float post0 = gates[0], post1 = gates[1];
     const float m00 = gates[2], m01 = gates[3];
     const float m10 = gates[4], m11 = gates[5];
@@ -268,6 +300,10 @@ void sensenova_layer(model_t *m, run_state_t *s, int l, int pos,
         memcpy(str_b, s->x, dim * sizeof(float));
         *streams_active = 1;
     }
+    if (getenv("PICOLM_MHC_DBG") && l == 4 && pos == 0)
+        fprintf(stderr, "[MHC-TW l=4 t0] x_in[:4]=%.6f,%.6f,%.6f,%.6f strb[:4]=%.6f,%.6f,%.6f,%.6f\n",
+                s->x[0], s->x[1], s->x[2], s->x[3],
+                str_b[0], str_b[1], str_b[2], str_b[3]);
 
     /* -- sublayer 1: attention (GDN or full), routed -- */
     float *y;
@@ -290,14 +326,18 @@ void sensenova_layer(model_t *m, run_state_t *s, int l, int pos,
         y = s->xb;
     }
     /* merge: a'=x (in place), b'=str_b (in place), y from the sublayer */
-    mhc_merge(s->x, str_b, s->x, str_b, y, gates, dim);
+    if (getenv("PICOLM_MHC_DBG") && l == 4 && pos == 0)
+        fprintf(stderr, "[MHC-TW l=4 t0] branch[:4]=%.6f,%.6f,%.6f,%.6f gates=%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
+                branch[0], branch[1], branch[2], branch[3],
+                gates[0], gates[1], gates[2], gates[3], gates[4], gates[5]);
+    mhc_merge_rows(s->x, str_b, s->x, str_b, y, gates, dim);
 
     /* -- sublayer 2: FFN, routed -- */
     mhc_route(branch, gates, s->x, str_b,
               (const float *)lw->mhc_ffn_w, (const float *)lw->mhc_ffn_b, dim);
     rmsnorm(branch, branch, s->post_attn_norm_w[l], dim, c->rms_norm_eps);
     sensenova_ffn_sublayer(s, lw, dim, n_ffn, branch, sub_out);
-    mhc_merge(s->x, str_b, s->x, str_b, sub_out, gates, dim);
+    mhc_merge_rows(s->x, str_b, s->x, str_b, sub_out, gates, dim);
 
     if (kind == 2) {
         for (int i = 0; i < dim; i++) s->x[i] = 0.5f * (s->x[i] + str_b[i]);

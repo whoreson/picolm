@@ -258,4 +258,23 @@ static inline float hreduce256_ps(__m256 a) {
 #define aligned_alloc(a, s) valloc((s) + (a) - 1)
 #endif
 
+/* ---- SenseNova-Loop mHC router/merge primitives (model_sensenova.c) ----
+ * Shared by the decode path (mhc_route, fused GEMM+finish) and the batched
+ * prefill (raw logits from matmul_batch, then mhc_route_finish per token).
+ * mhc_route_finish: raw8[k] = dot(W_row_k, [a;b]) WITHOUT rms/bias; applies
+ * the joint RMS scale, bias, sigmoid gates, 20-iteration sinkhorn and forms
+ * branch = pre0*a + pre1*b. gates[0..6) = {post0, post1, m00, m01, m10, m11}.
+ * mhc_merge_rows: a' = m00*a + m01*b + post0*y; b' = m10*a + m11*b + post1*y
+ * (a_out may alias a, b_out may alias b, y must not alias either). */
+void mhc_route_finish(float *out_branch, float *gates,
+                      const float *a, const float *b, const float *raw8,
+                      const float *bias, int d);
+void mhc_merge_rows(float *a_out, float *b_out,
+                    const float *a, const float *b, const float *y,
+                    const float *gates, int d);
+/* One SenseNova layer body (plain or mHC route/merge), decode semantics.
+ * Also used by the batched prefill's PICOLM_MHC_TOKENWISE=1 A/B fallback. */
+void sensenova_layer(model_t *m, run_state_t *s, int l, int pos, int *streams_active);
+float *model_forward_sensenova(model_t *m, int token, int pos);
+
 #endif /* MODEL_INTERNAL_H */

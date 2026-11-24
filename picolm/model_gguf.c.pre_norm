@@ -1,0 +1,3120 @@
+#include "model.h"
+#include "tensor.h"
+#include "quant.h"
+#include "model_internal.h"
+#include <inttypes.h>
+#include <stdio.h>
+#ifndef PRIu64
+#define PRIu64 "llu"
+#endif
+#ifndef PRId64
+#define PRId64 "lld"
+#endif
+/* SSM verification debug (used in GGUF parsing) */
+#ifdef PICOLM_SSM_VERIFY
+#define _SSM_DBG 1
+#else
+#define _SSM_DBG (0)
+#endif
+#include <string.h>
+#include <stdlib.h>
+#include <errno.h>
+#ifdef _WIN32
+#include <windows.h>
+#include <io.h>
+#include <fcntl.h>
+#elif !defined(PICOLM_DOS)
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdint.h>
+#endif
+
+static uint8_t read_u8(reader_t *r) {
+    uint8_t v = r->data[r->pos];
+    r->pos += 1;
+    return v;
+}
+
+static uint16_t read_u16(reader_t *r) {
+    uint16_t v;
+    memcpy(&v, r->data + r->pos, 2);
+    r->pos += 2;
+    return v;
+}
+
+static uint32_t read_u32(reader_t *r) {
+    uint32_t v;
+    memcpy(&v, r->data + r->pos, 4);
+    r->pos += 4;
+    return GGUF_LE32(v);
+}
+
+static int32_t read_i32(reader_t *r) {
+    int32_t v;
+    memcpy(&v, r->data + r->pos, 4);
+    r->pos += 4;
+    return (int32_t)GGUF_LE32((uint32_t)v);
+}
+
+static uint64_t read_u64(reader_t *r) {
+    uint64_t v;
+    memcpy(&v, r->data + r->pos, 8);
+    r->pos += 8;
+    return GGUF_LE64(v);
+}
+
+static float read_f32(reader_t *r) {
+    uint32_t vi;
+    memcpy(&vi, r->data + r->pos, 4);
+    r->pos += 4;
+    vi = GGUF_LE32(vi);
+    float v;
+    memcpy(&v, &vi, 4);
+    return v;
+}
+
+typedef struct { const char *str; uint64_t len; } gguf_str_t;
+
+static gguf_str_t read_gguf_string(reader_t *r) {
+    gguf_str_t s;
+    s.len = read_u64(r);
+    s.str = (const char *)(r->data + r->pos);
+    r->pos += s.len;
+    return s;
+}
+
+static int str_eq(gguf_str_t s, const char *lit) {
+    size_t n = strlen(lit);
+    return s.len == n && memcmp(s.str, lit, n) == 0;
+}
+
+/* True if key ends with `suffix` (e.g. key="gemma3.attention.sliding_window",
+ * suffix=".attention.sliding_window"). Architecture-agnostic on purpose: it
+ * lets SWA-related keys (see below) be picked up for ANY architecture
+ * string the GGUF file declares -- current ones (gemma3, gemma3n) and any
+ * future one -- without hardcoding each family's name here. */
+static int key_has_suffix(gguf_str_t s, const char *suffix) {
+    size_t n = strlen(suffix);
+    return s.len >= n && memcmp(s.str + (s.len - n), suffix, n) == 0;
+}
+
+/* GLM-5.3-Flash arch prefix normalization.
+ * The GGUF spec puts general.architecture first, so by the time any
+ * arch-prefixed key arrives we know cfg->is_glm5. Both spellings
+ * ("glm5next" and "glm5-next") are canonicalised to "glm5next" so the
+ * existing str_eq chains only need one spelling. Returns a pointer to
+ * a static buffer when rewriting is needed, else the original. */
+static char glm5_keybuf[256];
+static gguf_str_t glm5_normalize_key(gguf_str_t key, int is_glm5) {
+    if (!is_glm5) return key;
+    if (key.len >= 10 && memcmp(key.str, "glm5-next.", 10) == 0) {
+        size_t rest = key.len - 9; /* "glm5-next." -> "glm5next." loses 1 char */
+        if (rest < sizeof(glm5_keybuf) - 1) {
+            memcpy(glm5_keybuf, "glm5next.", 9);
+            memcpy(glm5_keybuf + 9, key.str + 10, key.len - 10);
+            glm5_keybuf[9 + key.len - 10] = 0;
+            gguf_str_t out; out.str = glm5_keybuf; out.len = 9 + key.len - 10;
+            return out;
+        }
+    }
+    return key;
+}
+
+/* Forward declarations */
+static uint64_t skip_meta_value(reader_t *r, uint32_t vtype, int *is_numeric);
+static int gguf_format_value(char *buf, int buflen, reader_t *r, uint32_t vtype);
+
+/* Format a single scalar GGUF metadata value into buf (up to buflen-1 chars).
+ * Returns number of chars written (not counting null terminator). */
+static int gguf_format_value(char *buf, int buflen, reader_t *r, uint32_t vtype) {
+    switch (vtype) {
+        case GGUF_META_UINT8:   return snprintf(buf, buflen, "%u", read_u8(r));
+        case GGUF_META_INT8:    return snprintf(buf, buflen, "%d", (int8_t)read_u8(r));
+        case GGUF_META_UINT16:  return snprintf(buf, buflen, "%u", read_u16(r));
+        case GGUF_META_INT16:   return snprintf(buf, buflen, "%d", (int16_t)read_u16(r));
+        case GGUF_META_UINT32:  return snprintf(buf, buflen, "%u", read_u32(r));
+        case GGUF_META_INT32:   return snprintf(buf, buflen, "%d", read_i32(r));
+        case GGUF_META_UINT64:  return snprintf(buf, buflen, "%" PRIu64, read_u64(r));
+        case GGUF_META_INT64:   return snprintf(buf, buflen, "%" PRId64, (int64_t)read_u64(r));
+        case GGUF_META_FLOAT32: return snprintf(buf, buflen, "%g", (double)read_f32(r));
+        case GGUF_META_FLOAT64: { uint64_t raw = read_u64(r); double d; memcpy(&d, &raw, 8);
+#if defined(__APPLE__) && defined(__ppc__)
+            /* Big-endian: GGUF stores LE */
+            { uint64_t sw; memcpy(&sw, &raw, 8); sw = GGUF_LE64(sw); memcpy(&d, &sw, 8); }
+#endif
+            return snprintf(buf, buflen, "%g", d); }
+        case GGUF_META_BOOL:    return snprintf(buf, buflen, "%s", read_u8(r) ? "true" : "false");
+        case GGUF_META_STRING: {
+            gguf_str_t s = read_gguf_string(r);
+            int n = (int)s.len < buflen - 1 ? (int)s.len : buflen - 1;
+            memcpy(buf, s.str, (size_t)n);
+            buf[n] = '\0';
+            return n;
+        }
+        case GGUF_META_ARRAY: {
+            uint32_t arr_type = read_u32(r);
+            uint64_t arr_len  = read_u64(r);
+            if (arr_len == 0) { buf[0] = '['; buf[1] = ']'; buf[2] = '\0'; return 2; }
+            /* Sample first few elements, skip the rest */
+            int written = snprintf(buf, buflen, "[");
+            uint64_t show = arr_len < 4 ? arr_len : 3;
+            for (uint64_t i = 0; i < show; i++) {
+                char valbuf[64];
+                gguf_format_value(valbuf, (int)sizeof(valbuf), r, arr_type);
+                written += snprintf(buf + written, buflen - written, "%s%s",
+                    i > 0 ? ", " : "", valbuf);
+            }
+            /* Skip remaining elements */
+            { int dummy;
+              for (uint64_t i = show; i < arr_len; i++) {
+                  skip_meta_value(r, arr_type, &dummy);
+              } }
+            written += snprintf(buf + written, buflen - written,
+                arr_len > 4 ? ", ..%lu..]" : "]", (unsigned long)(arr_len - show));
+            return written;
+        }
+        default: return snprintf(buf, buflen, "<type %u>", vtype);
+    }
+}
+
+/* Format an ARRAY metadata value in full (all elements) into buf.
+ * Used by model_list_kv() for per-layer arrays (recurrent_layers,
+ * mhc.layer_kinds, rope sections, ...) where the truncated 3-element
+ * preview of gguf_format_value() hides the information that matters.
+ * Caller must have skipped the array type/length header already? No --
+ * like gguf_format_value(), this reads the header itself. Returns the
+ * number of chars written. */
+static int gguf_format_array_full(char *buf, int buflen, reader_t *r) {
+    uint32_t arr_type = read_u32(r);
+    uint64_t arr_len  = read_u64(r);
+    int written = snprintf(buf, (size_t)buflen, "[");
+    for (uint64_t i = 0; i < arr_len && written < buflen - 8; i++) {
+        char valbuf[64];
+        gguf_format_value(valbuf, (int)sizeof(valbuf), r, arr_type);
+        written += snprintf(buf + written, (size_t)(buflen - written), "%s%s",
+                            i > 0 ? ", " : "", valbuf);
+    }
+    written += snprintf(buf + written, (size_t)(buflen - written), "]");
+    return written;
+}
+
+/* Read a feed_forward_length value: scalar or array of scalars.
+ * Returns the max value in the array (or the scalar value).
+ * This handles Gemma-3n E2B models where feed_forward_length is an array
+ * [8192, 8192, ...] rather than a single scalar. */
+static uint64_t read_ffn_length(reader_t *r, uint32_t vtype) {
+    if (vtype == GGUF_META_ARRAY) {
+        uint32_t arr_type = read_u32(r);
+        uint64_t arr_len  = read_u64(r);
+        uint64_t max_val = 0;
+        for (uint64_t i = 0; i < arr_len; i++) {
+            uint64_t v = skip_meta_value(r, arr_type, NULL);
+            if (v > max_val) max_val = v;
+        }
+        return max_val;
+    }
+    return skip_meta_value(r, vtype, NULL);
+}
+
+static uint64_t skip_meta_value(reader_t *r, uint32_t vtype, int *is_numeric) {
+    if (is_numeric) *is_numeric = 1;
+    switch (vtype) {
+        case GGUF_META_UINT8:   return read_u8(r);
+        case GGUF_META_INT8:    return (uint64_t)(int64_t)(int8_t)read_u8(r);
+        case GGUF_META_UINT16:  return read_u16(r);
+        case GGUF_META_INT16:   return (uint64_t)(int64_t)(int16_t)read_u16(r);
+        case GGUF_META_UINT32:  return read_u32(r);
+        case GGUF_META_INT32:   return (uint64_t)(int64_t)read_i32(r);
+        case GGUF_META_UINT64:  return read_u64(r);
+        case GGUF_META_INT64:   return read_u64(r);
+        case GGUF_META_FLOAT32: { read_f32(r); *is_numeric = 0; return 0; }
+        case GGUF_META_FLOAT64: { r->pos += 8; *is_numeric = 0; return 0; }
+        case GGUF_META_BOOL:    return read_u8(r);
+        case GGUF_META_STRING:  { read_gguf_string(r); *is_numeric = 0; return 0; }
+        case GGUF_META_ARRAY: {
+            if (is_numeric) *is_numeric = 0;
+            uint32_t arr_type = read_u32(r);
+            uint64_t arr_len  = read_u64(r);
+            int dummy;
+            for (uint64_t i = 0; i < arr_len; i++) {
+                skip_meta_value(r, arr_type, &dummy);
+            }
+            return 0;
+        }
+        default:
+            fprintf(stderr, "Unknown GGUF metadata type: %u\n", vtype);
+            exit(1);
+    }
+}
+
+/* Warn when a config key is skipped due to unexpected vtype.
+ * Call this instead of bare skip_meta_value() when the else-branch
+ * of a vtype check silently drops a value that SHOULD have been read. */
+static void skip_meta_value_warn(reader_t *r, uint32_t vtype, const char *key_name) {
+    int dummy;
+    fprintf(stderr, "WARNING: key \"%s\" has unexpected GGUF type %u, skipping (value may be incorrect)\n",
+            key_name, vtype);
+    skip_meta_value(r, vtype, &dummy);
+}
+
+/* RoPE scaling type string -> enum (matches llama.cpp's LLAMA_ROPE_SCALING_TYPE_*).
+ * 0=none, 1=linear, 2=yarn, 3=longrope. Unrecognized strings default to
+ * linear, matching llama.cpp's behavior for forward-compatibility. */
+static int parse_rope_scaling_type(reader_t *r, uint32_t vtype) {
+    if (vtype != GGUF_META_STRING) { int dummy; skip_meta_value(r, vtype, &dummy); return 1; }
+    gguf_str_t s = read_gguf_string(r);
+    if (s.len == 4 && memcmp(s.str, "none", 4) == 0) return 0;
+    if (s.len == 6 && memcmp(s.str, "linear", 6) == 0) return 1;
+    if (s.len == 4 && memcmp(s.str, "yarn", 4) == 0) return 2;
+    if (s.len == 8 && memcmp(s.str, "longrope", 8) == 0) return 3;
+    return 1;
+}
+
+/* Forward declarations for split mmap helpers */
+static int mmap_one_file(split_mmap_t *s, const char *path);
+static int split_path_prefix(char *prefix, size_t maxlen, const char *split_path);
+static void split_path_build(char *path, size_t maxlen, const char *prefix, int split_no, int split_count);
+
+int mmap_file(model_t *m, const char *path) {
+    /* Store path for split derivation later */
+    strncpy(m->first_split_path, path, sizeof(m->first_split_path) - 1);
+    m->first_split_path[sizeof(m->first_split_path) - 1] = '\0';
+
+    /* .ffug = pre-processed big-endian swap (GGUF backwards) -- skip runtime swap */
+    size_t plen = strlen(path);
+    if (plen >= 5 && strcmp(path + plen - 5, ".ffug") == 0) {
+        m->be_preprocessed = 1;
+    }
+
+    /* Mmap as split 0 */
+    if (mmap_one_file(&m->splits[0], path) != 0) return -1;
+
+    /* Backward compat: legacy fields point to split 0 */
+    m->mmap_addr = m->splits[0].mmap_addr;
+    m->mmap_size = m->splits[0].mmap_size;
+#ifdef _WIN32
+    m->file_handle = m->splits[0].file_handle;
+    m->map_handle  = m->splits[0].map_handle;
+#elif !defined(PICOLM_DOS)
+    m->fd = m->splits[0].fd;
+#endif
+    m->n_splits = 1;
+
+    prepare_mmap(m->mmap_addr, m->mmap_size);
+    return 0;
+}
+
+
+/* ================================================================
+ * Split GGUF support
+ * ================================================================
+ *
+ * GGUF split files use the naming convention:
+ *   <prefix>-NNNNN-of-NNNNN.gguf  (1-based, zero-padded to 5 digits)
+ *
+ * Each split is a complete, valid GGUF file. Only the first split
+ * (index 0) contains full metadata. Tensor offsets are per-file.
+ */
+
+#define MAX_SPLIT_FILES 64
+
+/* Extract the prefix from a split file path.
+ * Pattern: <prefix>-DDDDD-of-DDDDD.gguf (e.g. "/path/model-Q4_0-split-00001-of-00003.gguf")
+ * Returns the prefix part (everything before "-DDDDD-of-").
+ * Returns 1 on success, 0 on failure (path doesn't match split convention). */
+static int split_path_prefix(char *prefix, size_t maxlen, const char *split_path) {
+    size_t plen = strlen(split_path);
+    /* Suffix is: -DDDDD-of-DDDDD.gguf = 20 chars. Minimum total path: 24 chars. */
+    if (plen < 24) return 0;
+
+    const char *suf = split_path + plen - 20;
+    /* Must end with .gguf */
+    if (strcmp(suf + 15, ".gguf") != 0) return 0;
+    /* First char must be dash */
+    if (suf[0] != '-') return 0;
+    /* DDDDD-of-DDDDD: positions 1-5 are digits, 6-9 are "-of-", 10-14 are digits */
+    for (int i = 1; i <= 5; i++) {
+        if (suf[i] < '0' || suf[i] > '9') return 0;
+    }
+    if (suf[6] != '-' || suf[7] != 'o' || suf[8] != 'f' || suf[9] != '-') return 0;
+    for (int i = 10; i <= 14; i++) {
+        if (suf[i] < '0' || suf[i] > '9') return 0;
+    }
+
+    size_t plen2 = (size_t)(suf - split_path);
+    if (plen2 >= maxlen) return 0;
+    memcpy(prefix, split_path, plen2);
+    prefix[plen2] = '\0';
+    return 1;
+}
+
+/* Construct a split file path from prefix, split_no (0-based), and split_count. */
+static void split_path_build(char *path, size_t maxlen, const char *prefix, int split_no, int split_count) {
+    /* Suffix "-NNNNN-of-NNNNN.gguf" is exactly 18 chars */
+    if (maxlen < 19) { path[0] = '\0'; return; }
+    int plen = snprintf(path, maxlen, "%s", prefix);
+    snprintf(path + plen, maxlen - (size_t)plen, "-%05d-of-%05d.gguf", split_no + 1, split_count);
+}
+
+/* Mmap a single split file into a split_mmap_t struct. */
+static int mmap_one_file(split_mmap_t *s, const char *path) {
+#ifdef _WIN32
+    HANDLE fh = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (fh == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "ERROR: cannot open model file '%s': %s\n",
+                path, GetLastError() > 0 ? "file not found or access denied" : "unknown error");
+        return -1;
+    }
+    LARGE_INTEGER fsize;
+    GetFileSizeEx(fh, &fsize);
+    s->mmap_size = (size_t)fsize.QuadPart;
+    HANDLE mh = CreateFileMappingA(fh, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!mh) {
+        fprintf(stderr, "ERROR: cannot map model file '%s' into memory\n", path);
+        CloseHandle(fh);
+        return -1;
+    }
+    void *addr = MapViewOfFile(mh, FILE_MAP_READ, 0, 0, 0);
+    if (!addr) {
+        fprintf(stderr, "ERROR: cannot view mapped model file '%s'\n", path);
+        CloseHandle(mh);
+        CloseHandle(fh);
+        return -1;
+    }
+    s->mmap_addr  = addr;
+    s->file_handle = fh;
+    s->map_handle  = mh;
+#elif defined(PICOLM_DOS)
+    /* DOS: no mmap, load entire file into malloc'd memory */
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "ERROR: cannot open model file '%s': %s\n", path, strerror(errno));
+        return -1;
+    }
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    s->mmap_size = (size_t)fsize;
+    void *buf = malloc(s->mmap_size);
+    if (!buf || fread(buf, 1, s->mmap_size, f) != s->mmap_size) {
+        fprintf(stderr, "ERROR: failed to read model file '%s': %s\n", path, strerror(errno));
+        fclose(f);
+        free(buf);
+        return -1;
+    }
+    fclose(f);
+    s->mmap_addr = buf;
+#else
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, "ERROR: cannot open model file '%s': %s\n", path, strerror(errno));
+        return -1;
+    }
+    /* Get file size: prefer fstat, but fall back to lseek on platforms where
+     * fstat returns garbage (e.g. iPhoneOS 1 on original iPhone, where
+     * st_size is a 7.6-exabyte nonsense value that truncates to 0 on 32-bit). */
+    struct stat st;
+    fstat(fd, &st);
+    off_t fsize = st.st_size;
+    if (fsize < 0) {
+        fprintf(stderr, "ERROR: cannot stat model file '%s': %s\n", path, strerror(errno));
+        close(fd);
+        return -1;
+    }
+#if defined(__SIZEOF_SIZE_T__) && __SIZEOF_SIZE_T__ < 8
+    /* On 32-bit platforms, size_t is 32-bit. Files larger than ~4 GB
+     * cannot be mmap'd and will silently truncate, causing misleading
+     * "corruption" errors later. Reject them early.
+     * Use uintmax_t to avoid sign-wrap when off_t is also 32-bit. */
+    if ((uintmax_t)fsize > (uintmax_t)SIZE_MAX) {
+        fprintf(stderr, "ERROR: model file '%s' is %lld bytes, which exceeds the 32-bit address space limit (~4 GB). "
+                "Use a smaller quantization or a 64-bit OS.\n", path, (long long)fsize);
+        close(fd);
+        return -1;
+    }
+#endif
+    s->mmap_size = (size_t)fsize;
+    if (s->mmap_size == 0) {
+        off_t off = lseek(fd, 0, SEEK_END);
+        if (off > 0) {
+            lseek(fd, 0, SEEK_SET);
+#if defined(__SIZEOF_SIZE_T__) && __SIZEOF_SIZE_T__ < 8
+            if ((uintmax_t)off > (uintmax_t)SIZE_MAX) {
+                fprintf(stderr, "ERROR: model file '%s' is %lld bytes (lseek), exceeds 32-bit limit.\n",
+                        path, (long long)off);
+                close(fd);
+                return -1;
+            }
+#endif
+            s->mmap_size = (size_t)off;
+        }
+    }
+    /* PROT_READ only: PROT_WRITE causes COW fault storms over CIFS/NFS on
+     * large models (see 9c1b3a5). PPC big-endian needs write access for the
+     * in-place byte-swap loop; it uses mprotect() around the swap region. */
+    void *addr = mmap(NULL, s->mmap_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (addr == MAP_FAILED) {
+        /* Fallback: some platforms (e.g. iPhoneOS 1) have broken file-backed
+         * mmap. Load entire file into malloc'd memory instead. */
+        void *buf = malloc(s->mmap_size);
+        if (buf && s->mmap_size > 0) {
+            size_t total = 0;
+            while (total < s->mmap_size) {
+                ssize_t n = read(fd, (char*)buf + total, s->mmap_size - total);
+                if (n <= 0) break;
+                total += (size_t)n;
+            }
+            close(fd);
+            if (total == s->mmap_size) {
+                fprintf(stderr, "WARN: mmap failed (%s), using malloc+read fallback for '%s'\n",
+                        strerror(errno), path);
+                s->mmap_addr = buf;
+                s->fd = -1; /* signal: malloc'd, not mmap'd */
+                return 0;
+            }
+            free(buf);
+        }
+        fprintf(stderr, "ERROR: cannot map model file '%s': %s\n", path, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    s->mmap_addr = addr;
+    s->fd = fd;
+#endif
+    return 0;
+}
+
+/* Unmap a single split file. */
+void munmap_one_file(split_mmap_t *s) {
+    if (!s->mmap_addr) return;
+#ifdef _WIN32
+    UnmapViewOfFile(s->mmap_addr);
+    CloseHandle(s->map_handle);
+    CloseHandle(s->file_handle);
+#elif defined(PICOLM_DOS)
+    free(s->mmap_addr);
+#else
+    if (s->fd >= 0) {
+        /* Normal mmap path */
+        munmap(s->mmap_addr, s->mmap_size);
+        close(s->fd);
+    } else {
+        /* malloc+read fallback (broken mmap platforms like iPhoneOS 1) */
+        free(s->mmap_addr);
+    }
+#endif
+    s->mmap_addr = NULL;
+}
+
+/* ---- Tensor listing ---- */
+
+const char *gguf_type_name(uint32_t type) {
+    switch (type) {
+        case 0:  return "f32";
+        case 1:  return "f16";
+        case 2:  return "q4_0";
+        case 3:  return "q4_1";
+        case 6:  return "q5_0";
+        case 7:  return "q5_1";
+        case 8:  return "q8_0";
+        case 9:  return "q8_1";
+        case 10: return "q2_k";
+        case 11: return "q3_k";
+        case 12: return "q4_k";
+        case 13: return "q5_k";
+        case 14: return "q6_k";
+        case 15: return "q8_k";
+        case 16: return "iq2_xxs";
+        case 17: return "iq2_xs";
+        case 18: return "iq3_xxs";
+        case 218: return "iq3_xxs_r4";
+        case 223: return "iq4_xs_r8";
+        case 210: return "q2_k_r4";
+        case 19: return "iq1_s";
+        case 20: return "iq4_nl";   /* GGML_TYPE_IQ4_NL (was mislabeled iq4_xxs) */
+        case 21: return "iq3_s";
+        case 22: return "iq2_s";
+        case 23: return "iq4_xs";
+        case 24: return "i8";       /* GGML_TYPE_I8 */
+        case 25: return "i16";      /* GGML_TYPE_I16 */
+        case 26: return "i32";      /* GGML_TYPE_I32 */
+        case 27: return "i64";      /* GGML_TYPE_I64 */
+        case 28: return "f64";      /* GGML_TYPE_F64 */
+        case 29: return "iq1_m";    /* GGML_TYPE_IQ1_M */
+        case 30: return "bf16";
+        case 31: return "q4_0_4_4";
+        case 32: return "q4_0_4_8";
+        case 33: return "q4_0_8_8";
+        case 34: return "q4i_0_8_8";
+        case 35: return "tq1_0";
+        case 36: return "tq2_0";
+        case 37: return "mxfp4";
+        case 38: return "q8_4";
+        case 39: return "q3_0";
+        case 40: return "nvfp4";  /* GGML_TYPE_NVFP4 (mainline, not in ik branch) */
+        case 41: return "q1_0";  /* GGML_TYPE_Q1_0_G128 (Bonsai) / GGML_TYPE_Q1_0 (mainline) */
+        case 42: return "q2_0";  /* GGML_TYPE_Q2_0 */
+        case 43: return "f8_e4m3";  /* GGML_TYPE_F8_E4M3 (mainline) */
+        case 133: return "q6_0";
+        /* ik_llama repacked types */
+        case 202: return "q4_0_r8";
+        case 203: return "q8_0_r8";
+        case 208: return "q8_0_r8";  /* also 208 in some GGUFs */
+        case 212: return "q4_k_r4";
+        case 213: return "q5_k_r4";
+        case 214: return "q6_k_r4";
+        case 137: return "iq2_k";
+        case 138: return "iq3_k";
+        case 337: return "iq2_k_r4";
+        case 338: return "iq3_k_r4";
+        case 139: return "iq4_k";
+        case 339: return "iq4_k_r4";
+        case 141: return "iq6_k";
+        case 220: return "iq4_nl_r4";
+        case 399: return "q8_k_r8";
+        default: return "unknown";
+    }
+}
+
+/* Scan Q8_0 tensor data for -128 bytes (PICOLM_SCAN_NEG128=1).
+ * Returns total number of -128 bytes found, -1 on error.
+ * Scans the GGUF file directly using the tensor metadata. */
+#if !defined(_WIN32) && !defined(PICOLM_DOS)
+int model_scan_neg128(const char *path) {
+    uint8_t *addr = NULL;
+    size_t fsize = 0;
+    int rc = -1;
+    int neg128_count = 0;
+    int q8_element_count = 0;
+    int fd = -1;
+    const int q8block = 34; /* sizeof(block_q8_0) */
+    const int q8vals = 32;
+
+    fd = open(path, O_RDONLY);
+    if (fd < 0) { fprintf(stderr, "ERROR: cannot open '%s': %s\n", path, strerror(errno)); return -1; }
+    { struct stat st;
+      if (fstat(fd, &st) >= 0) fsize = (size_t)st.st_size;
+    }
+    addr = mmap(NULL, fsize, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (!addr || addr == (void*)-1) { fprintf(stderr, "ERROR: cannot map '%s'\n", path); goto out; }
+
+    reader_t r = { .data = addr, .pos = 0, .size = fsize };
+    uint32_t magic = read_u32(&r);
+    if (magic != GGUF_MAGIC) { fprintf(stderr, "Not a GGUF\n"); goto out; }
+    uint32_t version = read_u32(&r);
+    uint64_t n_tensors = read_u64(&r);
+    uint64_t n_metadata = read_u64(&r);
+    for (uint64_t i = 0; i < n_metadata; i++) {
+        read_gguf_string(&r); /* key */
+        uint32_t t = read_u32(&r);
+        int dummy;
+        skip_meta_value(&r, t, &dummy);
+    }
+    for (uint64_t i = 0; i < n_tensors; i++) {
+        gguf_str_t name = read_gguf_string(&r);
+        uint32_t n_dims = read_u32(&r);
+        uint64_t dims[4] = {0};
+        for (uint32_t d = 0; d < n_dims; d++) dims[d] = read_u64(&r);
+        uint32_t type = read_u32(&r);
+        uint64_t offset = read_u64(&r);
+        if (version == 1) offset *= 4;
+
+        if (type == GGUF_TYPE_Q8_0) {
+            uint64_t total_elements = 1;
+            for (uint32_t d = 0; d < n_dims; d++) total_elements *= dims[d];
+            uint64_t n_blocks = total_elements / q8vals;
+            uint8_t *tensor_base = addr + offset;
+            size_t tensor_end = (size_t)tensor_base + (size_t)n_blocks * q8block;
+            if (tensor_base < addr || tensor_end > addr + fsize) {
+                fprintf(stderr, "SCAN: tensor out of bounds (offset=%lu, blocks=%lu, fsize=%zu)\n",
+                        (unsigned long)offset, (unsigned long)n_blocks, fsize);
+                continue;
+            }
+            for (uint64_t b = 0; b < n_blocks; b++) {
+                int8_t *qs = (int8_t *)(tensor_base + (size_t)b * q8block + 2);
+                for (int j = 0; j < q8vals; j++) {
+                    if (qs[j] == -128) neg128_count++;
+                    q8_element_count++;
+                }
+            }
+        }
+    }
+
+    rc = neg128_count;
+out:
+    if (addr && addr != MAP_FAILED) munmap(addr, fsize);
+    if (fd >= 0) close(fd);
+    return rc;
+}
+#else
+/* DOS: mmap is not available; scan not supported (debug utility only). */
+int model_scan_neg128(const char *path) { (void)path; return 0; }
+#endif
+
+int model_list_tensors(const char *path) {
+    uint8_t *addr = NULL;
+    size_t fsize = 0;
+    char *buf = NULL;
+    int rc = -1;
+#ifdef _WIN32
+    HANDLE fh = INVALID_HANDLE_VALUE;
+    HANDLE mh = NULL;
+#else
+    int fd = -1;
+#endif
+
+#ifdef _WIN32
+    fh = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                     OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (fh == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "ERROR: cannot open model file '%s'\n", path);
+        return -1;
+    }
+
+    { LARGE_INTEGER ls;
+      GetFileSizeEx(fh, &ls);
+      fsize = (size_t)ls.QuadPart; }
+
+    mh = CreateFileMappingA(fh, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!mh) {
+        fprintf(stderr, "ERROR: cannot map model file '%s' into memory\n", path);
+        goto out;
+    }
+
+    addr = MapViewOfFile(mh, FILE_MAP_READ, 0, 0, 0);
+    if (!addr) {
+        fprintf(stderr, "ERROR: cannot view mapped model file '%s'\n", path);
+        goto out;
+    }
+#elif defined(PICOLM_DOS)
+    {
+        FILE *f = fopen(path, "rb");
+        if (!f) { fprintf(stderr, "ERROR: cannot open model file '%s': %s\n", path, strerror(errno)); return -1; }
+        fseek(f, 0, SEEK_END);
+        fsize = (size_t)ftell(f);
+        fseek(f, 0, SEEK_SET);
+        addr = malloc(fsize);
+        if (!addr || fread(addr, 1, fsize, f) != fsize) {
+            fprintf(stderr, "ERROR: failed to read model file '%s'\n", path);
+            addr = NULL; fclose(f); goto out;
+        }
+        fclose(f);
+    }
+#else
+    fd = open(path, O_RDONLY);
+    if (fd < 0) { fprintf(stderr, "ERROR: cannot open model file '%s': %s\n", path, strerror(errno)); return -1; }
+
+    { struct stat st;
+      off_t off;
+      if (fstat(fd, &st) >= 0) fsize = (size_t)st.st_size;
+      else fsize = 0;
+      if (fsize == 0) {
+          off = lseek(fd, 0, SEEK_END);
+          if (off > 0) { lseek(fd, 0, SEEK_SET); fsize = (size_t)off; }
+      }
+      addr = mmap(NULL, fsize, PROT_READ, MAP_PRIVATE, fd, 0);
+      if (addr == MAP_FAILED) {
+          fprintf(stderr, "ERROR: cannot map model file '%s': %s\n", path, strerror(errno));
+          addr = NULL; goto out;
+      } }
+#endif
+
+    reader_t r = { .data = addr, .pos = 0, .size = fsize };
+
+    { uint32_t magic = read_u32(&r);
+      if (magic != GGUF_MAGIC) {
+          fprintf(stderr, "ERROR: '%s' is not a valid GGUF file (bad magic 0x%08X)\n", path, magic);
+          goto out;
+      } }
+
+    uint32_t version = read_u32(&r);
+    if (version < 2 || version > 3) {
+        fprintf(stderr, "ERROR: '%s' has unsupported GGUF version %u (need v2 or v3)\n", path, version);
+        goto out;
+    }
+    uint64_t n_tensors = read_u64(&r);
+    uint64_t n_metadata = read_u64(&r);
+
+    /* Skip metadata */
+    for (uint64_t i = 0; i < n_metadata; i++) {
+        (void)read_gguf_string(&r);
+        uint32_t vtype = read_u32(&r);
+        int dummy;
+        skip_meta_value(&r, vtype, &dummy);
+    }
+
+    /*
+     * Build the entire output (GGUF header + tensor table) into a buffer,
+     * then write it in a single fwrite() to avoid the "bit-bang"
+     * one-write-per-line problem when stdout is redirected to a slow
+     * destination (e.g. network share).
+     */
+    /* Buffer sizing: static header ~1.1KB + n_tensors * 112 bytes/line
+     * (the %-52s %-20s %-16s %-12s %u\n format never exceeds 112 bytes).
+     * The old 96-byte estimate was too small, silently truncating the
+     * tensor list for larger models (APPEND drops lines on overflow). */
+    { size_t buf_size = 1280 + n_tensors * 112 + 256;
+      buf = malloc(buf_size);
+      if (!buf) {
+          fprintf(stderr, "ERROR: out of memory\n");
+          goto out;
+      }
+
+      size_t pos = 0;
+      /* Safe append macro: clamps on truncation. Supports zero or more variadic args. */
+      #ifdef __clang__
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wgnu-zero-variadic-macro-arguments"
+#endif
+      #define APPEND(fmt, ...) do {                                          \
+          int _r = snprintf(buf + pos, buf_size - pos, fmt, ##__VA_ARGS__);  \
+          if (_r > 0) pos += (size_t)_r < (buf_size - pos) ? (size_t)_r : 0; \
+      } while (0)
+
+      APPEND("GGUF v%u: %" PRIu64 " metadata entries, %" PRIu64 " tensors\n\n",
+             version, n_metadata, n_tensors);
+      APPEND("%-52s %-20s %-16s %-12s %s\n",
+             "Name", "ne[] (raw GGUF order)", "matmul(n,d)", "Type", "Type ID");
+      APPEND("%-52s %-20s %-16s %-12s %s\n",
+             "----", "-------------------", "------------", "----", "-------");
+      APPEND("%s", "NOTE: ne[] is printed in RAW GGUF order (dims innermost-first, exactly as\n");
+      APPEND("%s", "  stored). ne[0] is the contiguous row length; ne[1] is the row count.\n");
+      APPEND("%s", "  This is the SAME order as --list-tensors' output for every rank, and the\n");
+      APPEND("%s", "  same order ggml prints. It is NOT the [out x in] math convention.\n");
+      APPEND("%s", "\n");
+      APPEND("%s", "matmul(out, x, W, n, d, type) reads d rows of n elements, so for a 2-D\n");
+      APPEND("%s", "  weight  n = ne[0] (input length),  d = ne[1] (output length).\n");
+      APPEND("%s", "  Passing them the other way round silently produces a wrong-shaped result:\n");
+      APPEND("%s", "  always cross-check against the matmul(n,d) column below.\n");
+      APPEND("%s", "  Tensors with rank != 2 have no single n,d and show '-' (slice them first).\n");
+      APPEND("%s", "\n");
+
+      for (uint64_t i = 0; i < n_tensors; i++) {
+          gguf_str_t name = read_gguf_string(&r);
+          uint32_t n_dims = read_u32(&r);
+          uint64_t dims[4] = {0};
+          for (uint32_t d = 0; d < n_dims; d++) dims[d] = read_u64(&r);
+          uint32_t type = read_u32(&r);
+          (void)read_u64(&r); /* offset */
+
+          char nbuf[56];
+          size_t nlen = name.len < sizeof(nbuf) ? name.len : sizeof(nbuf);
+          memcpy(nbuf, name.str, nlen);
+          nbuf[nlen] = '\0';
+          if (name.len >= sizeof(nbuf)) {
+              nbuf[nlen-4] = '.'; nbuf[nlen-3] = '.'; nbuf[nlen-2] = '.';
+          }
+
+          /* GGUF stores dims INNERMOST-FIRST, which is exactly ggml's ne[] order:
+           *   dims[0] = innermost (contiguous, = row length for a 2-D weight)
+           *   dims[1] = next up          (= row count for a 2-D weight)
+           * We print ne[] verbatim, for EVERY rank, so the listing matches ggml
+           * and the GGUF spec. The previous code printed 2-D tensors transposed
+           * as [out x in] while printing 3-D tensors in raw order, which made the
+           * table self-inconsistent and led directly to a matmul(n,d) mix-up.
+           *
+           * The matmul column spells out the argument order for 2-D weights:
+           *   matmul(out, x, W, n, d) reads d rows of n elements =>
+           *   n = ne[0] (input length), d = ne[1] (output length).
+           * For attn_q with ne = {4096, 8192}: n=4096, d=8192.
+           * Note this is the REVERSE of the "[out x in]" math convention. */
+          char dstr[40];
+          {
+              char *dp = dstr;
+              int drem = (int)(sizeof(dstr) - 1);
+              int n = snprintf(dp, (size_t)drem + 1, "%" PRIu64, dims[0]);
+              if (n > 0 && n < drem) { dp += n; drem -= n; } else drem = 0;
+              for (uint32_t d = 1; d < n_dims && drem > 1; d++) {
+                  n = snprintf(dp, (size_t)drem + 1, ",%" PRIu64, dims[d]);
+                  if (n > 0 && n < drem) { dp += n; drem -= n; } else { drem = 0; break; }
+              }
+              if (drem > 0) *dp = '\0';
+              else dstr[sizeof(dstr) - 1] = '\0';
+          }
+
+          /* matmul(n,d) is only meaningful for a single 2-D weight matrix. */
+          char mstr[32];
+          if (n_dims == 2) {
+              snprintf(mstr, sizeof(mstr), "n=%" PRIu64 ",d=%" PRIu64, dims[0], dims[1]);
+          } else if (n_dims == 1) {
+              snprintf(mstr, sizeof(mstr), "%s", "vector");
+          } else {
+              snprintf(mstr, sizeof(mstr), "%s", "-");
+          }
+
+          APPEND("%-52s %-20s %-16s %-12s %u\n",
+                 nbuf, dstr, mstr, gguf_type_name(type), type);
+      }
+#ifdef __clang__
+#pragma clang diagnostic pop
+#endif
+      #undef APPEND
+
+      fwrite(buf, 1, pos, stdout);
+      fflush(stdout);
+    }
+
+    rc = 0;
+out:
+    free(buf);
+#ifdef _WIN32
+    if (addr) UnmapViewOfFile(addr);
+    if (mh) CloseHandle(mh);
+    if (fh != INVALID_HANDLE_VALUE) CloseHandle(fh);
+#elif defined(PICOLM_DOS)
+    if (addr) free(addr);
+#else
+    if (addr) munmap(addr, fsize);
+    if (fd >= 0) close(fd);
+#endif
+    return rc;
+}
+
+/* ---- GGUF tensor dump (raw file bytes -> dequantized floats) ---- */
+
+/*
+ * model_dump_tensor(): print the first `n_show` elements of `n_rows` rows of a
+ * named tensor, dequantized from the RAW file bytes with PicoLM's own
+ * dequantize_row().
+ *
+ * This is the big-endian debugging workhorse: unlike the runtime tensors, it
+ * shows exactly what is in the file, with NO big-endian F16-scale swap applied.
+ * Comparing the same tensor between a LE host (correct output) and a BE host
+ * isolates a byte-swap bug from an inference bug immediately.
+ *
+ * CLI: --dump-tensor name[:row[:nrows[:nelem]]]
+ * Env: PICOLM_DUMP_TENSOR=same syntax (dumped right after model load)
+ *
+ * Returns 0 on success.
+ */
+int model_dump_tensor(const char *path, const char *spec) {
+    if (!path || !spec) return -1;
+
+    char tname[256];
+    long row0 = 0, nrows = 1, nelem = 8;
+    {
+        const char *c1 = strchr(spec, ':');
+        size_t tlen = c1 ? (size_t)(c1 - spec) : strlen(spec);
+        if (tlen >= sizeof(tname)) tlen = sizeof(tname) - 1;
+        memcpy(tname, spec, tlen);
+        tname[tlen] = '\0';
+        if (c1) {
+            row0 = strtol(c1 + 1, NULL, 10);
+            const char *c2 = strchr(c1 + 1, ':');
+            if (c2) {
+                nrows = strtol(c2 + 1, NULL, 10);
+                const char *c3 = strchr(c2 + 1, ':');
+                if (c3) nelem = strtol(c3 + 1, NULL, 10);
+            }
+        }
+    }
+    if (nrows <= 0) nrows = 1;
+    if (nelem < 0) nelem = 0;
+
+#ifdef _WIN32
+    fprintf(stderr, "ERROR: --dump-tensor is not supported on Windows builds\n");
+    (void)path;
+    return -1;
+#elif defined(PICOLM_DOS)
+    fprintf(stderr, "ERROR: --dump-tensor is not supported on DOS builds\n");
+    return -1;
+#else
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { fprintf(stderr, "ERROR: cannot open '%s': %s\n", path, strerror(errno)); return -1; }
+
+    size_t fsize = 0;
+    { struct stat st;
+      if (fstat(fd, &st) >= 0) fsize = (size_t)st.st_size; }
+    if (fsize == 0) { close(fd); fprintf(stderr, "ERROR: empty model file\n"); return -1; }
+
+    uint8_t *addr = mmap(NULL, fsize, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (addr == MAP_FAILED) { close(fd); fprintf(stderr, "ERROR: cannot map '%s'\n", path); return -1; }
+
+    reader_t r = { .data = addr, .pos = 0, .size = fsize };
+    int rc = -1;
+    uint8_t *buf = NULL;
+
+    uint32_t magic = read_u32(&r);
+    if (magic != GGUF_MAGIC) { fprintf(stderr, "ERROR: not a GGUF file\n"); goto out; }
+    uint32_t version = read_u32(&r);
+    uint64_t n_tensors = read_u64(&r);
+    uint64_t n_metadata = read_u64(&r);
+
+    uint64_t alignment = 32;
+    for (uint64_t i = 0; i < n_metadata; i++) {
+        gguf_str_t key = read_gguf_string(&r);
+        uint32_t vtype = read_u32(&r);
+        size_t vpos = r.pos;
+        int dummy = 0;
+        skip_meta_value(&r, vtype, &dummy);
+        if (key.len == 22 && !memcmp(key.str, "general.alignment", 17 + 5)) {
+            if (vtype == 4) { uint32_t a = 0; memcpy(&a, addr + vpos, 4);
+                              alignment = GGUF_LE32(a); }
+            else if (vtype == 10) { uint64_t a = 0; memcpy(&a, addr + vpos, 8);
+                                    alignment = GGUF_LE64(a); }
+        }
+    }
+
+    int found = 0;
+    uint64_t t_offset = 0, t_ne0 = 0, t_ne1 = 1;
+    uint32_t t_type = 0, t_ndim = 0;
+
+    for (uint64_t i = 0; i < n_tensors; i++) {
+        gguf_str_t name = read_gguf_string(&r);
+        uint32_t n_dims = read_u32(&r);
+        uint64_t dims[4] = {0, 0, 0, 0};
+        for (uint32_t d = 0; d < n_dims && d < 4; d++) dims[d] = read_u64(&r);
+        uint32_t type = read_u32(&r);
+        uint64_t offset = read_u64(&r);
+        if (version == 1) offset *= 4;
+
+        if (!found && name.len == strlen(tname) && !memcmp(name.str, tname, name.len)) {
+            found = 1;
+            t_offset = offset;
+            t_type = type;
+            t_ndim = n_dims;
+            t_ne0 = dims[0];
+            t_ne1 = (n_dims >= 2) ? dims[1] : 1;
+            for (uint32_t d = 2; d < n_dims && d < 4; d++) t_ne1 *= dims[d];
+        }
+    }
+
+    if (!found) {
+        fprintf(stderr, "ERROR: tensor '%s' not found in '%s'\n", tname, path);
+        goto out;
+    }
+
+    {
+        /* Tensor data begins after the tensor-info table, padded to alignment. */
+        uint64_t base = (r.pos + alignment - 1) & ~(alignment - 1);
+        size_t n = (size_t)t_ne0;
+
+        size_t bpr = 0;
+        switch ((gguf_type_t)t_type) {
+            case GGUF_TYPE_F32:  bpr = n * 4; break;
+            case GGUF_TYPE_F16:  bpr = n * 2; break;
+            case GGUF_TYPE_BF16: bpr = n * 2; break;
+            case GGUF_TYPE_Q8_0: bpr = n / 32 * sizeof(block_q8_0); break;
+            case GGUF_TYPE_Q4_0: bpr = n / 32 * sizeof(block_q4_0); break;
+            case GGUF_TYPE_Q4_1: bpr = n / 32 * sizeof(block_q4_1); break;
+            case GGUF_TYPE_Q5_0: bpr = n / 32 * sizeof(block_q5_0); break;
+            case GGUF_TYPE_Q5_1: bpr = n / 32 * sizeof(block_q5_1); break;
+            case GGUF_TYPE_Q2_K: bpr = n / 256 * sizeof(block_q2_K); break;
+            case GGUF_TYPE_Q3_K: bpr = n / 256 * sizeof(block_q3_K); break;
+            case GGUF_TYPE_Q4_K: bpr = n / 256 * sizeof(block_q4_K); break;
+            case GGUF_TYPE_Q5_K: bpr = n / 256 * sizeof(block_q5_K); break;
+            case GGUF_TYPE_Q6_K: bpr = n / 256 * sizeof(block_q6_K); break;
+            case GGUF_TYPE_IQ6_K: bpr = n / 256 * sizeof(block_iq6_k); break;
+            case GGUF_TYPE_Q6_0: bpr = n / 32 * sizeof(block_q6_0); break;
+            case GGUF_TYPE_IQ4_NL: bpr = n / 32 * sizeof(block_iq4_nl); break;
+            case GGUF_TYPE_Q2_0: bpr = n / 128 * sizeof(block_q2_0); break;
+            case GGUF_TYPE_Q1_0: bpr = n / 128 * sizeof(block_q1_0); break;
+            case GGUF_TYPE_IQ3_XXS:   bpr = n / 256 * sizeof(block_iq3_xxs); break;
+            case GGUF_TYPE_Q5_K_R4:    bpr = n / 256 * sizeof(block_q5_k_r4) / 4; break;
+            /* R4/R8: bpr is the per-row share of one interleaved group. */
+            case GGUF_TYPE_IQ3_XXS_R4: bpr = n / 256 * sizeof(block_iq3_xxs_r4) / 4; break;
+            case GGUF_TYPE_IQ4_XS_R8:  bpr = n / 256 * sizeof(block_iq4_xs_r8) / 8; break;
+            default:
+                fprintf(stderr, "ERROR: --dump-tensor: unsupported type %u (%s)\n",
+                        t_type, gguf_type_name((gguf_type_t)t_type));
+                goto out;
+        }
+
+        uint64_t need = base + t_offset + (uint64_t)bpr * (uint64_t)(row0 + nrows);
+        if ((size_t)need > fsize) {
+            fprintf(stderr, "ERROR: --dump-tensor: tensor exceeds file size\n");
+            goto out;
+        }
+
+        buf = (uint8_t *)malloc(n * sizeof(float));
+        if (!buf) { fprintf(stderr, "ERROR: out of memory\n"); goto out; }
+        float *f = (float *)buf;
+
+        fprintf(stderr, "DUMP tensor '%s' ne0=%" PRIu64 " ne1=%" PRIu64
+                        " type=%s(%u) file_off=%" PRIu64 " (raw, BE-only-HACKED-notes: no swap)\n",
+                tname, t_ne0, t_ne1, gguf_type_name((gguf_type_t)t_type),
+                t_type, base + t_offset);
+
+        for (long rr = 0; rr < nrows; rr++) {
+            long row = row0 + rr;
+            if ((uint64_t)row >= t_ne1) break;
+            const uint8_t *rowp = addr + base + t_offset + (uint64_t)row * bpr;
+            if (t_type == GGUF_TYPE_F32) memcpy(f, rowp, n * sizeof(float));
+            else if (t_type == GGUF_TYPE_Q5_K_R4) {
+                /* Row-interleaved: the group base is what the dequantizer wants. */
+                const uint8_t *gp = addr + base + t_offset +
+                                    (uint64_t)(row / 4) * bpr * 4;
+                dequantize_row_q5_k_r4_single((const block_q5_k_r4 *)gp, f, (int)n, row % 4);
+            }
+            else if (t_type == GGUF_TYPE_IQ3_XXS_R4) {
+                /* Row-interleaved: the group base is what the dequantizer wants. */
+                const uint8_t *gp = addr + base + t_offset +
+                                    (uint64_t)(row / 4) * bpr * 4;
+                dequantize_row_iq3_xxs_r4_single(gp, f, (int)n, row % 4);
+            }
+            else if (t_type == GGUF_TYPE_IQ4_XS_R8) {
+                const uint8_t *gp = addr + base + t_offset +
+                                    (uint64_t)(row / 8) * bpr * 8;
+                dequantize_row_iq4_xs_r8_single(gp, f, (int)n, row % 8);
+            }
+            else dequantize_row(rowp, f, (int)n, (gguf_type_t)t_type);
+            printf("DUMP %s[%ld] n=%zu:", tname, row, n);
+            long lim = (nelem < (long)n) ? nelem : (long)n;
+            for (long i = 0; i < lim; i++) printf(" %.6f", f[i]);
+            printf("\n");
+        }
+        fflush(stdout);
+        rc = 0;
+    }
+out:
+    free(buf);
+    munmap(addr, fsize);
+    close(fd);
+    return rc;
+#endif
+}
+
+/* ---- GGUF KV List ---- */
+
+int model_list_kv(const char *path) {
+    uint8_t *addr = NULL;
+    size_t fsize = 0;
+    char *buf = NULL;
+    int rc = -1;
+#ifdef _WIN32
+    HANDLE fh = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                            FILE_ATTRIBUTE_NORMAL, NULL);
+    if (fh == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "ERROR: cannot open model file '%s'\n", path);
+        return -1;
+    }
+    { LARGE_INTEGER sz;
+      GetFileSizeEx(fh, &sz);
+      fsize = (size_t)sz.QuadPart; }
+    HANDLE mh = CreateFileMappingA(fh, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (mh) {
+        addr = (uint8_t *)MapViewOfFile(mh, FILE_MAP_READ, 0, 0, fsize);
+    }
+#elif defined(PICOLM_DOS)
+    {
+        FILE *f = fopen(path, "rb");
+        if (!f) { fprintf(stderr, "ERROR: cannot open model file '%s': %s\n", path, strerror(errno)); return -1; }
+        fseek(f, 0, SEEK_END);
+        fsize = (size_t)ftell(f);
+        fseek(f, 0, SEEK_SET);
+        addr = malloc(fsize);
+        if (!addr || fread(addr, 1, fsize, f) != fsize) {
+            fprintf(stderr, "ERROR: failed to read model file '%s'\n", path);
+            addr = NULL; fclose(f); goto out;
+        }
+        fclose(f);
+    }
+#else
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { fprintf(stderr, "ERROR: cannot open model file '%s': %s\n", path, strerror(errno)); return -1; }
+    { struct stat st;
+      off_t off;
+      if (fstat(fd, &st) >= 0) fsize = (size_t)st.st_size;
+      else fsize = 0;
+      if (fsize == 0) {
+          off = lseek(fd, 0, SEEK_END);
+          if (off > 0) { lseek(fd, 0, SEEK_SET); fsize = (size_t)off; }
+      }
+      addr = mmap(NULL, fsize, PROT_READ, MAP_PRIVATE, fd, 0);
+      if (addr == MAP_FAILED) { addr = NULL; goto out; } }
+#endif
+
+    if (!addr) {
+        fprintf(stderr, "ERROR: failed to map model file '%s'\n", path);
+        goto out;
+    }
+
+    reader_t r = { .data = addr, .pos = 0, .size = fsize };
+
+    { uint32_t magic = read_u32(&r);
+      if (magic != GGUF_MAGIC) {
+          fprintf(stderr, "ERROR: '%s' is not a valid GGUF file (bad magic 0x%08X)\n", path, magic);
+          goto out;
+      } }
+
+    uint32_t version = read_u32(&r);
+    if (version < 2 || version > 3) {
+        fprintf(stderr, "ERROR: '%s' has unsupported GGUF version %u (need v2 or v3)\n", path, version);
+        goto out;
+    }
+    uint64_t n_tensors = read_u64(&r);
+    uint64_t n_metadata = read_u64(&r);
+
+    /* Buffer: key + value per entry, plus header. A single metadata value can be
+     * large (tokenizer.chat_template is several KB), so allow a generous fixed
+     * slab per entry instead of 128 bytes; otherwise long values are silently
+     * truncated. The APPEND macro already guards against overruns. */
+    { size_t buf_size = 4096 + (size_t)n_metadata * 8192;
+      buf = malloc(buf_size);
+      if (!buf) {
+          fprintf(stderr, "ERROR: out of memory\n");
+          goto out;
+      }
+
+      size_t pos = 0;
+      #define APPEND(fmt, ...) do {                                          \
+          int _r = snprintf(buf + pos, buf_size - pos, fmt, __VA_ARGS__);    \
+          if (_r > 0) pos += (size_t)_r < (buf_size - pos) ? (size_t)_r : 0; \
+      } while (0)
+
+      APPEND("GGUF v%u: %" PRIu64 " metadata entries, %" PRIu64 " tensors\n\n",
+             version, n_metadata, n_tensors);
+      APPEND("%-44s %-8s %s\n", "Key", "Type", "Value");
+      APPEND("%-44s %-8s %s\n", "---", "----", "-----");
+
+      for (uint64_t i = 0; i < n_metadata; i++) {
+          gguf_str_t key = read_gguf_string(&r);
+          uint32_t vtype = read_u32(&r);
+
+          /* Type name */
+          static const char *vtype_names[] = {
+              "U8","I8","U16","I16","U32","I32","F32",
+              "BOOL","STR","ARR","F64","U64","I64","BYTES"
+          };
+          const char *tname = (vtype < 14) ? vtype_names[vtype] : "???";
+
+          /* Truncate key for display */
+          char keybuf[48];
+          size_t klen = key.len < sizeof(keybuf) - 1 ? key.len : sizeof(keybuf) - 4;
+          memcpy(keybuf, key.str, klen);
+          keybuf[klen] = '\0';
+          if (key.len >= sizeof(keybuf) - 1) {
+              keybuf[klen-3] = '.'; keybuf[klen-2] = '.'; keybuf[klen-1] = '.';
+          }
+
+          /* Format the value (use large buffer for chat templates etc.)
+          * Numeric/bool arrays are expanded in FULL: the per-layer config
+          * arrays (attention.recurrent_layers, mhc.layer_kinds,
+          * rope.dimension_sections, head_count_kv patterns, ...) carry one
+          * entry per layer, and the truncated 3-element preview hides the
+          * pattern that actually matters. String arrays (vocab, merges,
+          * chat_template) keep the truncated preview. */
+          char valbuf[65536];
+          if (vtype == GGUF_META_ARRAY) {
+              /* element type = the u32 right after the key; peek without
+               * consuming (gguf_format_array_full re-reads it) */
+              uint32_t at;
+              { reader_t save = r; at = read_u32(&r); r = save; }
+              if (at != GGUF_META_STRING) {
+                  gguf_format_array_full(valbuf, (int)sizeof(valbuf), &r);
+              } else {
+                  gguf_format_value(valbuf, (int)sizeof(valbuf), &r, vtype);
+              }
+          } else {
+              gguf_format_value(valbuf, (int)sizeof(valbuf), &r, vtype);
+          }
+
+          /* Replace newlines in value with \\n for single-line display, or print multiline */
+          /* Check if multiline */
+          if (strchr(valbuf, '\n')) {
+              /* Print key on its own line, then value indented */
+              APPEND("%s [%s]:\n", keybuf, tname);
+              /* Indent each line of value */
+              const char *line = valbuf;
+              while (*line) {
+                  const char *nl = strchr(line, '\n');
+                  if (nl) {
+                      APPEND("  %.*s\n", (int)(nl - line), line);
+                      line = nl + 1;
+                  } else {
+                      APPEND("  %s\n", line);
+                      break;
+                  }
+              }
+          } else {
+              APPEND("%-44s %-8s %s\n", keybuf, tname, valbuf);
+          }
+      }
+      #undef APPEND
+
+      fwrite(buf, 1, pos, stdout);
+      fflush(stdout);
+    }
+
+    rc = 0;
+out:
+    free(buf);
+#ifdef _WIN32
+    if (addr) UnmapViewOfFile(addr);
+    if (mh) CloseHandle(mh);
+    if (fh != INVALID_HANDLE_VALUE) CloseHandle(fh);
+#elif defined(PICOLM_DOS)
+    if (addr) free(addr);
+#else
+    if (addr) munmap(addr, fsize);
+    if (fd >= 0) close(fd);
+#endif
+    return rc;
+}
+
+/* ---- GGUF Parser ---- */
+
+int parse_gguf(model_t *m, int max_seq_len) {
+    reader_t r = { .data = (const uint8_t *)m->mmap_addr, .pos = 0, .size = m->mmap_size };
+    model_config_t *cfg = &m->config;
+
+    uint32_t magic = read_u32(&r);
+    if (magic != GGUF_MAGIC) {
+        fprintf(stderr, "ERROR: model file is not a valid GGUF (bad magic 0x%08X)\n", magic);
+        return -1;
+    }
+
+    uint32_t version = read_u32(&r);
+    if (version < 2 || version > 3) {
+        fprintf(stderr, "ERROR: model has unsupported GGUF version %u (need v2 or v3)\n", version);
+        return -1;
+    }
+
+    uint64_t n_tensors  = read_u64(&r);
+    uint64_t n_metadata = read_u64(&r);
+
+    cfg->alignment = 32;
+    cfg->rope_freq_base = 10000.0f;
+    cfg->rms_norm_eps = 1e-5f;
+    cfg->rope_type = 0;  /* llama pairwise */
+    cfg->rope_dim = 0;   /* 0 = use head_dim (default) */
+    /* RoPE scaling defaults (llama.cpp: absent scaling.type => "linear" with
+     * freq_scale=1.0, which is a pure no-op -- identical to vanilla RoPE). */
+    cfg->rope_scaling_type = 1;      /* linear */
+    cfg->rope_freq_scale = 1.0f;
+    cfg->rope_attn_factor = 1.0f;
+    cfg->rope_beta_fast = 32.0f;
+    cfg->rope_beta_slow = 1.0f;
+    cfg->rope_ctx_orig = 0;          /* 0 = resolve to max_seq_len once context_length is known */
+    cfg->rope_yarn_log_mul = 0.0f;
+    cfg->rope_ext_factor = -1.0f;    /* unset; resolved after parsing (1.0 for yarn, 0.0 otherwise) */
+    cfg->rope_yarn_attn_factor = 1.0f;
+    cfg->rope_scaling_alpha = 0.0f;
+    cfg->rope_finetuned = 0;
+    cfg->max_seq_len = 2048;
+    cfg->weight_type = GGUF_TYPE_F16;
+    cfg->n_layer_sparsity = 0;
+    cfg->f_sparsity_std_mul = 0.0f;
+    cfg->n_swa = 0;
+    cfg->swa_period = 0;
+    memset(cfg->swa_layer_bool, 0, sizeof(cfg->swa_layer_bool));
+    cfg->has_swa_pattern = 0;
+    cfg->n_swa_pattern_len = 0;
+    cfg->rope_freq_base_swa = 10000.0f;
+    cfg->f_attention_scale = 0.0f;  /* 0 = use 1/sqrt(head_dim) default */
+    cfg->n_altup = 0;
+    cfg->i_altup_act = -1;
+    cfg->n_embd_altup = 0;
+    cfg->n_layer_kv_from_start = -1;
+    cfg->f_final_logit_softcapping = 0.0f;
+    cfg->laurel_rank = 0;
+    m->tok_bos_id = 1;
+    m->tok_eos_id = 2;
+    m->tok_add_bos = 1;
+    m->tok_add_space_prefix = 1;
+
+    for (uint64_t i = 0; i < n_metadata; i++) {
+        gguf_str_t key = read_gguf_string(&r);
+        uint32_t vtype = read_u32(&r);
+
+        /* Canonicalise "glm5-next." prefix to "glm5next." so the str_eq
+         * chains below only need one spelling. No-op for other arches and
+         * for the already-canonical "glm5next." spelling. */
+        key = glm5_normalize_key(key, cfg->is_glm5);
+
+        if (str_eq(key, "general.architecture")) {
+            int dummy;
+            gguf_str_t arch;
+            if (vtype == GGUF_META_STRING) {
+                arch = read_gguf_string(&r);
+                /* Check if architecture value contains "qwen3" (qwen3 or qwen35) */
+                for (uint64_t k = 0; k + 5 <= arch.len; k++) {
+                    if (arch.str[k] == 'q' && arch.str[k+1] == 'w' && arch.str[k+2] == 'e' &&
+                        arch.str[k+3] == 'n' && arch.str[k+4] == '3') {
+                        cfg->is_qwen = 1; break;
+                    }
+                }
+                /* Check for gemma3n */
+                for (uint64_t k = 0; k + 7 <= arch.len; k++) {
+                    if (arch.str[k] == 'g' && arch.str[k+1] == 'e' && arch.str[k+2] == 'm' &&
+                        arch.str[k+3] == 'm' && arch.str[k+4] == 'a' && arch.str[k+5] == '3' &&
+                        arch.str[k+6] == 'n') {
+                        cfg->is_gemma3n = 1; break;
+                    }
+                }
+                if (arch.len == 4 && strncmp(arch.str, "gpt2", 4) == 0) {
+                    cfg->is_gpt2 = 1;
+                }
+                /* Check for stablelm (Clio) */
+                for (uint64_t k = 0; k + 8 <= arch.len; k++) {
+                    if (arch.str[k] == 's' && arch.str[k+1] == 't' && arch.str[k+2] == 'a' &&
+                        arch.str[k+3] == 'b' && arch.str[k+4] == 'l' && arch.str[k+5] == 'e' &&
+                        arch.str[k+6] == 'l' && arch.str[k+7] == 'm') {
+                        cfg->is_stablelm = 1; break;
+                    }
+                }
+                /* Check for gptneox (Krake v2) */
+                for (uint64_t k = 0; k + 7 <= arch.len; k++) {
+                    if (arch.str[k] == 'g' && arch.str[k+1] == 'p' && arch.str[k+2] == 't' &&
+                        arch.str[k+3] == 'n' && arch.str[k+4] == 'e' && arch.str[k+5] == 'o' &&
+                        arch.str[k+6] == 'x') {
+                        cfg->is_gptneox = 1; break;
+                    }
+                }
+                /* Check for GLM-5.3-Flash: "glm5next" or "glm5-next" */
+                if ((arch.len == 8 && memcmp(arch.str, "glm5next", 8) == 0) ||
+                    (arch.len == 9 && memcmp(arch.str, "glm5-next", 9) == 0)) {
+                    cfg->is_glm5 = 1;
+                }
+                /* Check for Spark-X2.5: "spark2_5" */
+                if (arch.len == 8 && memcmp(arch.str, "spark2_5", 8) == 0) {
+                    cfg->is_spark25 = 1;
+                }
+            } else {
+                skip_meta_value(&r, vtype, &dummy);
+            }
+        } else
+
+
+        if (str_eq(key, "glm5next.embedding_length") || str_eq(key, "llama.embedding_length") || str_eq(key, "general.embedding_length")
+            || str_eq(key, "qwen2.embedding_length") || str_eq(key, "qwen3.embedding_length") || str_eq(key, "qwen35.embedding_length") || str_eq(key, "qwen35moe.embedding_length")
+            || str_eq(key, "gemma3n.embedding_length") || str_eq(key, "gpt2.embedding_length") || str_eq(key, "stablelm.embedding_length")
+            || str_eq(key, "gptneox.embedding_length") || str_eq(key, "spark2_5.embedding_length")) {
+            int dummy; cfg->n_embd = (int)skip_meta_value(&r, vtype, &dummy);
+            /* RoPE convention per family.
+             *
+             * This used to claim "Qwen3 and Qwen3.5 use pairwise RoPE (same as
+             * Llama); only set rope_type=1 for qwen2". That is WRONG. ik_llama
+             * (the implementation these GGUFs were quantised for) classifies
+             * LLM_ARCH_QWEN, QWEN2, QWEN2MOE, QWEN3, QWEN3MOE, QWEN3NEXT,
+             * QWEN35 and QWEN35MOE all as LLAMA_ROPE_TYPE_NEOX -- see
+             * llama_rope_type() in llama.cpp, where those cases share the NEOX
+             * group with PHI2/GEMMA/STARCODER2. Only LLAMA/BAICHUAN and friends
+             * are LLAMA_ROPE_TYPE_NORM (pairwise).
+             *
+             * Measured on Qwen3.6-27B vs the ik oracle (5-token prompt, greedy,
+             * identical token ids), switching this on fixes the full-attention
+             * layers and the near-tie divergence at pos 8:
+             *
+             *            cos(pos4)  cos(pos8)  rmsdiff(pos8)  top-5 at pos8
+             *   pairwise  0.99994    0.99355      0.2139      top-3/4 swapped
+             *   NEOX      0.99995    0.99783      0.1247      exact match
+             *
+             * Every position improves. Note the rotation is genuinely
+             * different, not a reordering: with rope_dim=64 and head_dim=256,
+             * NEOX pairs q[i] with q[i+32] while pairwise pairs q[2i] with
+             * q[2i+1].
+             *
+             * Gemma-3n stays pairwise if its key does not look like qwen/qwen2
+             * below -- it has its own branch. */
+            if (key.len >= 4 && key.str[0] == 'q' && key.str[1] == 'w'
+                && key.str[2] == 'e' && key.str[3] == 'n') {
+                /* qwen, qwen2*, qwen3*, qwen35*, qwen35moe* -> half-split RoPE.
+                 * Prefix match rather than a fixed offset, so plain QWEN
+                 * ("qwen.embedding_length") is covered as well. */
+                cfg->rope_type = 1;
+            }
+            /* TODO(rope-type-by-arch): decide rope_type from the parsed
+             * general.architecture string, not from a key-name prefix.
+             *
+             * As written, ANY architecture not listed above silently keeps the
+             * default rope_type = 0 (pairwise). That default is only correct
+             * for the llama/baichuan family. The half-split (NEOX-style) set
+             * per ik_llama's llama_rope_type() also includes PHI2, PHI3,
+             * GEMMA/GEMMA2/GEMMA3/GEMMA4, STARCODER2, OPENELM, GPTNEOX,
+             * CODESHELL, DOTS1, HUNYUAN_MOE, OPENAI_MOE, BAILINGMOE2,
+             * MINIMAX_M2, MIMO2, SEED_OSS and STEP35 -- every one of those
+             * would be rotated pairwise here and produce plausibly-fluent but
+             * wrong output, exactly as Qwen3.5/3.6 did before 7dc3bf4.
+             *
+             * Note gemma3n already sets rope_type=1 in its own branch below,
+             * and gptneox sets it = 1 in its branch -- but those are set from
+             * *flag* detection, not from this key, so the ordering matters and
+             * is fragile. An explicit arch -> rope_type := {PAIRWISE, NEOX,
+             * MROPE, IMROPE, NONE} table, applied once right after
+             * general.architecture is parsed, would remove the guesswork.
+             *
+             * Before changing this, note QWEN35/QWEN35MOE are IMROPE in
+             * ik_llama, which is NOT the same enum as NEOX (40 vs 2) -- they
+             * only coincide because ggml runs the same half-split loop for
+             * `is_neox || is_mrope` and text-only inference supplies the same
+             * scalar for all four mrope position components. If PicoLM ever
+             * supports multimodal Qwen3-VL/Qwen3.5-VL, plain half-split will
+             * no longer be sufficient and the mrope section layout will have to
+             * be implemented. See notes/picolm/qwen36_divergence_findings.md. */
+        } else if (str_eq(key, "glm5next.feed_forward_length") || str_eq(key, "llama.feed_forward_length") || str_eq(key, "general.feed_forward_length")
+            || str_eq(key, "qwen2.feed_forward_length") || str_eq(key, "qwen3.feed_forward_length") || str_eq(key, "qwen35.feed_forward_length")
+            || str_eq(key, "gemma3n.feed_forward_length") || str_eq(key, "gpt2.feed_forward_length") || str_eq(key, "stablelm.feed_forward_length")
+            || str_eq(key, "gptneox.feed_forward_length") || str_eq(key, "spark2_5.feed_forward_length")) {
+            cfg->n_ffn = (int)read_ffn_length(&r, vtype);
+        } else if (str_eq(key, "glm5next.attention.head_count") || str_eq(key, "llama.attention.head_count")
+            || str_eq(key, "qwen2.attention.head_count") || str_eq(key, "qwen3.attention.head_count") || str_eq(key, "qwen35.attention.head_count") || str_eq(key, "qwen35moe.attention.head_count")
+            || str_eq(key, "gemma3n.attention.head_count") || str_eq(key, "gpt2.attention.head_count") || str_eq(key, "stablelm.attention.head_count")
+            || str_eq(key, "gptneox.attention.head_count") || str_eq(key, "spark2_5.attention.head_count")) {
+            int dummy; cfg->n_heads = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (str_eq(key, "llama.attention.head_count_kv")
+            || str_eq(key, "qwen2.attention.head_count_kv") || str_eq(key, "qwen3.attention.head_count_kv") || str_eq(key, "qwen35.attention.head_count_kv") || str_eq(key, "qwen35moe.attention.head_count_kv")
+            || str_eq(key, "gemma3n.attention.head_count_kv") || str_eq(key, "gpt2.attention.head_count_kv") || str_eq(key, "stablelm.attention.head_count_kv")
+            || str_eq(key, "gptneox.attention.head_count_kv") || str_eq(key, "spark2_5.attention.head_count_kv")) {
+            int dummy; cfg->n_kv_heads = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (str_eq(key, "attention.key_length")
+            || str_eq(key, "llama.attention.key_length")
+            || str_eq(key, "qwen2.attention.key_length")
+            || str_eq(key, "qwen3.attention.key_length") || str_eq(key, "qwen35.attention.key_length")
+            || str_eq(key, "qwen35moe.attention.key_length")
+            || str_eq(key, "gemma3n.attention.key_length")
+            || str_eq(key, "spark2_5.attention.key_length")) {
+            /* Explicit head_dim (Qwen3/3.5/Gemma-3n/Mistral-Nemo may differ from n_embd/n_heads).
+             * GLM-5: attention.key_length is the KDA qkv output dim (d_inner), NOT
+             * head_dim. head_dim for MLA comes from attention.key_length_mla. We
+             * keep it only as a fallback; the authoritative value comes from the
+             * attn_q tensor shape (see the tensor mapping loop), because some
+             * GGUFs put the latent dim here instead. */
+            int dummy;
+            if (!cfg->is_glm5) cfg->head_dim = (int)skip_meta_value(&r, vtype, &dummy);
+            else { int v = (int)skip_meta_value(&r, vtype, &dummy);
+                   if (cfg->glm5_kda_d_inner <= 0) cfg->glm5_kda_d_inner = v; }
+        } else if (str_eq(key, "glm5next.block_count") || str_eq(key, "llama.block_count")
+            || str_eq(key, "qwen2.block_count") || str_eq(key, "qwen3.block_count") || str_eq(key, "qwen35.block_count") || str_eq(key, "qwen35moe.block_count")
+            || str_eq(key, "gemma3n.block_count") || str_eq(key, "gpt2.block_count") || str_eq(key, "stablelm.block_count")
+            || str_eq(key, "gptneox.block_count") || str_eq(key, "spark2_5.block_count")) {
+            int dummy; cfg->n_layers = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (str_eq(key, "glm5next.context_length") || str_eq(key, "llama.context_length")
+            || str_eq(key, "qwen2.context_length") || str_eq(key, "qwen3.context_length") || str_eq(key, "qwen35.context_length") || str_eq(key, "qwen35moe.context_length")
+            || str_eq(key, "gemma3n.context_length") || str_eq(key, "gpt2.context_length") || str_eq(key, "stablelm.context_length")
+            || str_eq(key, "gptneox.context_length") || str_eq(key, "spark2_5.context_length")) {
+            int dummy; cfg->max_seq_len = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (str_eq(key, "llama.rope.freq_base")
+            || str_eq(key, "qwen2.rope.freq_base") || str_eq(key, "qwen3.rope.freq_base") || str_eq(key, "qwen35.rope.freq_base") || str_eq(key, "qwen35moe.rope.freq_base")
+            || str_eq(key, "gemma3n.rope.freq_base") || str_eq(key, "gptneox.rope.freq_base")
+            || str_eq(key, "spark2_5.rope.freq_base")) {
+            if (vtype == GGUF_META_FLOAT32) {
+                cfg->rope_freq_base = read_f32(&r);
+            } else {
+                skip_meta_value_warn(&r, vtype, key.str);
+            }
+        } else if (str_eq(key, "qwen35.rope.dimension_count")
+            || str_eq(key, "qwen35moe.rope.dimension_count")
+            || str_eq(key, "llama.rope.dimension_count") || str_eq(key, "stablelm.rope.dimension_count")
+            || str_eq(key, "gptneox.rope.dimension_count")
+            || str_eq(key, "spark2_5.rope.dimension_count")) {
+            int dummy; cfg->rope_dim = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (str_eq(key, "spark2_5.rope.dimension_count_swa")) {
+            int dummy; cfg->rope_dim_swa = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (str_eq(key, "spark2_5.rope.freq_base_swa")) {
+            if (vtype == GGUF_META_FLOAT32) {
+                cfg->rope_freq_base_swa = read_f32(&r);
+            } else {
+                skip_meta_value_warn(&r, vtype, key.str);
+            }
+        } else if (str_eq(key, "rope.dimension_sections")
+            || str_eq(key, "qwen35.rope.dimension_sections")
+            || str_eq(key, "qwen35moe.rope.dimension_sections")) {
+            /* ARRAY of I32 (elem_type=5): [11, 11, 10, 0] for Qwen3.5 */
+            if (vtype == GGUF_META_ARRAY) {
+                uint32_t elem_type = read_u32(&r);
+                uint64_t elem_count = read_u64(&r);
+                cfg->rope_dim = 0;
+                for (uint64_t ei = 0; ei < elem_count; ei++) {
+                    if (elem_type == 4 || elem_type == 5) { /* U32 or I32 */
+                        int32_t v = read_i32(&r);
+                        cfg->rope_dim += v;
+                    } else {
+                        /* skip this element */
+                        if (elem_type == 0 || elem_type == 1) r.pos += 1;
+                        else if (elem_type == 2 || elem_type == 3) r.pos += 2;
+                        else if (elem_type == 6 || elem_type == 7 || elem_type == 11 || elem_type == 12) r.pos += 8;
+                        else r.pos += 4;
+                    }
+                }
+                cfg->rope_dim *= 2; /* each section is a pair */
+                /* NOTE: rope.dimension_sections is for MTP multi-rope, not for
+                 * the main transformer. The main transformer applies RoPE to the
+                 * full head_dim. We store rope_dim for future MTP support but
+                 * use head_dim for RoPE in model_forward(). Reset to 0 so the
+                 * (c->rope_dim > 0) ? c->rope_dim : head_dim fallback gives head_dim. */
+                cfg->rope_dim = 0;
+            } else {
+                skip_meta_value_warn(&r, vtype, key.str);
+            }
+        /* ---- RoPE scaling metadata (linear / YaRN / LongRoPE) ----
+         * %s is one of: llama, qwen2, qwen3, qwen35, qwen35moe, gemma3n. */
+        } else if (str_eq(key, "llama.rope.scaling.type")
+            || str_eq(key, "qwen2.rope.scaling.type") || str_eq(key, "qwen3.rope.scaling.type")
+            || str_eq(key, "qwen35.rope.scaling.type") || str_eq(key, "qwen35moe.rope.scaling.type")
+            || str_eq(key, "gemma3n.rope.scaling.type")) {
+            cfg->rope_scaling_type = parse_rope_scaling_type(&r, vtype);
+        } else if (str_eq(key, "llama.rope.scaling.factor")
+            || str_eq(key, "qwen2.rope.scaling.factor") || str_eq(key, "qwen3.rope.scaling.factor")
+            || str_eq(key, "qwen35.rope.scaling.factor") || str_eq(key, "qwen35moe.rope.scaling.factor")
+            || str_eq(key, "gemma3n.rope.scaling.factor")) {
+            /* GGUF stores the INVERSE of freq_scale: factor=0.5 => freq_scale=2.0 */
+            if (vtype == GGUF_META_FLOAT32) {
+                float factor = read_f32(&r);
+                cfg->rope_freq_scale = (factor == 0.0f) ? 1.0f : 1.0f / factor;
+            } else {
+                skip_meta_value_warn(&r, vtype, key.str);
+            }
+        } else if (str_eq(key, "llama.rope.scale_linear") || str_eq(key, "qwen2.rope.scale_linear")) {
+            /* Legacy key, only honored if scaling.factor hasn't already set it */
+            if (vtype == GGUF_META_FLOAT32) {
+                float factor = read_f32(&r);
+                if (cfg->rope_freq_scale == 1.0f) {
+                    cfg->rope_freq_scale = (factor == 0.0f) ? 1.0f : 1.0f / factor;
+                }
+            } else {
+                skip_meta_value_warn(&r, vtype, key.str);
+            }
+        } else if (str_eq(key, "llama.rope.scaling.original_context_length")
+            || str_eq(key, "qwen2.rope.scaling.original_context_length")
+            || str_eq(key, "qwen3.rope.scaling.original_context_length")
+            || str_eq(key, "qwen35.rope.scaling.original_context_length")
+            || str_eq(key, "qwen35moe.rope.scaling.original_context_length")
+            || str_eq(key, "gemma3n.rope.scaling.original_context_length")) {
+            int dummy; cfg->rope_ctx_orig = (uint32_t)skip_meta_value(&r, vtype, &dummy);
+        } else if (str_eq(key, "llama.rope.scaling.attn_factor")
+            || str_eq(key, "qwen2.rope.scaling.attn_factor") || str_eq(key, "qwen3.rope.scaling.attn_factor")) {
+            if (vtype == GGUF_META_FLOAT32) {
+                cfg->rope_attn_factor = read_f32(&r);
+            } else {
+                skip_meta_value_warn(&r, vtype, key.str);
+            }
+        } else if (str_eq(key, "llama.rope.scaling.yarn_ext_factor")
+            || str_eq(key, "qwen2.rope.scaling.yarn_ext_factor") || str_eq(key, "qwen3.rope.scaling.yarn_ext_factor")) {
+            if (vtype == GGUF_META_FLOAT32) {
+                cfg->rope_ext_factor = read_f32(&r);
+            } else {
+                skip_meta_value_warn(&r, vtype, key.str);
+            }
+        } else if (str_eq(key, "llama.rope.scaling.yarn_attn_factor")
+            || str_eq(key, "qwen2.rope.scaling.yarn_attn_factor") || str_eq(key, "qwen3.rope.scaling.yarn_attn_factor")) {
+            if (vtype == GGUF_META_FLOAT32) {
+                cfg->rope_yarn_attn_factor = read_f32(&r);
+            } else {
+                skip_meta_value_warn(&r, vtype, key.str);
+            }
+        } else if (str_eq(key, "llama.rope.scaling.yarn_beta_fast")
+            || str_eq(key, "qwen2.rope.scaling.yarn_beta_fast") || str_eq(key, "qwen3.rope.scaling.yarn_beta_fast")) {
+            if (vtype == GGUF_META_FLOAT32) {
+                cfg->rope_beta_fast = read_f32(&r);
+            } else {
+                skip_meta_value_warn(&r, vtype, key.str);
+            }
+        } else if (str_eq(key, "llama.rope.scaling.yarn_beta_slow")
+            || str_eq(key, "qwen2.rope.scaling.yarn_beta_slow") || str_eq(key, "qwen3.rope.scaling.yarn_beta_slow")) {
+            if (vtype == GGUF_META_FLOAT32) {
+                cfg->rope_beta_slow = read_f32(&r);
+            } else {
+                skip_meta_value_warn(&r, vtype, key.str);
+            }
+        } else if (str_eq(key, "llama.rope.scaling.yarn_log_multiplier")
+            || str_eq(key, "qwen3.rope.scaling.yarn_log_multiplier")) {
+            /* DeepSeek-V2-style mscale special case */
+            if (vtype == GGUF_META_FLOAT32) {
+                cfg->rope_yarn_log_mul = read_f32(&r);
+            } else {
+                skip_meta_value_warn(&r, vtype, key.str);
+            }
+        } else if (str_eq(key, "llama.rope.scaling.alpha")) {
+            /* NTK-aware alpha (XDRoPE); parsed but currently unused */
+            if (vtype == GGUF_META_FLOAT32) {
+                cfg->rope_scaling_alpha = read_f32(&r);
+            } else {
+                skip_meta_value_warn(&r, vtype, key.str);
+            }
+        } else if (str_eq(key, "llama.rope.scaling.finetuned")) {
+            if (vtype == GGUF_META_BOOL) {
+                cfg->rope_finetuned = read_u8(&r) ? 1 : 0;
+            } else {
+                skip_meta_value_warn(&r, vtype, key.str);
+            }
+        } else if (str_eq(key, "llama.attention.layer_norm_rms_epsilon")
+            || str_eq(key, "qwen2.attention.layer_norm_rms_epsilon")
+            || str_eq(key, "qwen3.attention.layer_norm_rms_epsilon") || str_eq(key, "qwen35.attention.layer_norm_rms_epsilon") || str_eq(key, "qwen35moe.attention.layer_norm_rms_epsilon")
+            || str_eq(key, "gemma3n.attention.layer_norm_rms_epsilon")
+            || str_eq(key, "gpt2.attention.layer_norm_epsilon") || str_eq(key, "stablelm.attention.layer_norm_epsilon")
+            || str_eq(key, "glm5next.attention.layer_norm_rms_epsilon")
+            || str_eq(key, "gptneox.attention.layer_norm_epsilon")
+            || str_eq(key, "spark2_5.attention.layer_norm_rms_epsilon")) {
+            /* Read epsilon from GGUF (F32 type=6 or F64 type=11 in metadata) */
+            if (vtype == GGUF_META_FLOAT32) { /* F32 */
+                cfg->rms_norm_eps = read_f32(&r);
+            } else if (vtype == 11) { /* F64 */
+                uint64_t vi;
+                memcpy(&vi, r.data + r.pos, 8); r.pos += 8;
+                vi = GGUF_LE64(vi);
+                double val; memcpy(&val, &vi, 8);
+                cfg->rms_norm_eps = (float)val;
+            } else {
+                skip_meta_value_warn(&r, vtype, key.str);
+            }
+        } else if (str_eq(key, "qwen35.ssm.conv_kernel") || str_eq(key, "qwen35moe.ssm.conv_kernel") || str_eq(key, "qwen3.ssm.conv_kernel")) {
+            int dummy; cfg->ssm_d_conv = (int)skip_meta_value(&r, vtype, &dummy); cfg->has_ssm = 1;
+        } else if (str_eq(key, "qwen35.ssm.state_size") || str_eq(key, "qwen35moe.ssm.state_size") || str_eq(key, "qwen3.ssm.state_size")) {
+            int dummy; cfg->ssm_d_state = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (str_eq(key, "qwen35.ssm.group_count") || str_eq(key, "qwen35moe.ssm.group_count") || str_eq(key, "qwen3.ssm.group_count")) {
+            int dummy; cfg->ssm_n_group = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (str_eq(key, "qwen35.ssm.time_step_rank") || str_eq(key, "qwen35moe.ssm.time_step_rank") || str_eq(key, "qwen3.ssm.time_step_rank")) {
+            int dummy; cfg->ssm_dt_rank = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (str_eq(key, "qwen35.ssm.inner_size") || str_eq(key, "qwen35moe.ssm.inner_size") || str_eq(key, "qwen3.ssm.inner_size")) {
+            int dummy; cfg->ssm_d_inner = (int)skip_meta_value(&r, vtype, &dummy);
+        /* Gemma-3n specific config */
+        } else if (str_eq(key, "gemma3n.altup.num_inputs")) {
+            int dummy; cfg->n_altup = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (str_eq(key, "gemma3n.altup.active_idx")) {
+            int dummy; cfg->i_altup_act = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (str_eq(key, "gemma3n.embedding_length_per_layer_input")) {
+            int dummy; cfg->n_embd_altup = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (str_eq(key, "gemma3n.attention.shared_kv_layers")) {
+            /* shared_kv_layers can be f32 or u32 depending on GGUF provenance.
+             * E4B GGUFs store it as f32, E2B GGUFs store it as u32.
+             * Value is the number of layers from the END that share KV.
+             * n_layer_kv_from_start = n_layers - shared_kv_layers */
+            int shared_kv = 0;
+            if (vtype == GGUF_META_FLOAT32) {
+                shared_kv = (int)read_f32(&r);
+            } else {
+                shared_kv = (int)skip_meta_value(&r, vtype, NULL);
+            }
+            cfg->n_layer_kv_from_start = cfg->n_layers - shared_kv;
+        } else if (key_has_suffix(key, ".attention.sliding_window")
+                   || str_eq(key, "attention.sliding_window")) {
+            /* Generic across architectures on purpose -- see key_has_suffix().
+             * May legitimately be a scalar or (rarely) a per-layer array of
+             * window sizes; read_ffn_length() already handles both (max of
+             * the array, or the scalar) and is not actually FFN-specific. */
+            cfg->n_swa = (int)read_ffn_length(&r, vtype);
+        } else if (key_has_suffix(key, ".attention.sliding_window_pattern")
+                   || str_eq(key, "attention.sliding_window_pattern")) {
+            /* ARRAY of bool: one entry per transformer layer, true = SWA,
+             * false = full/"global" attention -- exactly what llama.cpp
+             * exports for the Gemma-3 family (and, going forward, any
+             * other architecture using the same convention). Read it in
+             * full into swa_layer_bool[]; n_swa_layer[] itself is resolved
+             * from this once n_layers is known, right after this parse
+             * loop finishes (see "Resolve per-layer SWA window sizes"
+             * below). */
+            if (vtype == GGUF_META_ARRAY) {
+                uint32_t arr_type = read_u32(&r);
+                uint64_t arr_len  = read_u64(&r);
+                cfg->has_swa_pattern = 1;
+                cfg->n_swa_pattern_len = (int)(arr_len > (uint64_t)MAX_LAYERS ? (uint64_t)MAX_LAYERS : arr_len);
+                for (uint64_t k = 0; k < arr_len; k++) {
+                    int dummy;
+                    uint64_t v = skip_meta_value(&r, arr_type, &dummy);
+                    if (k < (uint64_t)MAX_LAYERS) cfg->swa_layer_bool[k] = (uint8_t)(v != 0);
+                }
+            } else {
+                int dummy; skip_meta_value(&r, vtype, &dummy);
+            }
+        }
+        /* MoE specific config (qwen35moe) */
+        else if (str_eq(key, "glm5next.expert_count") || str_eq(key, "qwen35moe.expert_count")) {
+            int dummy; cfg->n_expert = (int)skip_meta_value(&r, vtype, &dummy); cfg->has_moe = 1;
+        } else if (str_eq(key, "glm5next.expert_used_count") || str_eq(key, "qwen35moe.expert_used_count")) {
+            int dummy; cfg->n_expert_used = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (str_eq(key, "glm5next.expert_feed_forward_length") || str_eq(key, "qwen35moe.expert_feed_forward_length")) {
+            int dummy; cfg->n_ff_exp = (int)skip_meta_value(&r, vtype, &dummy);
+            /* NOTE: GLM-5 keeps n_ffn = the *dense* feed_forward_length (12288)
+             * because n_ffn also sizes s->hb/hb2 which the MoE path reuses as
+             * a [n_embd] output buffer. Clobbering it to n_ff_exp (2048) makes
+             * that buffer too small. Qwen35moe has no dense FFN, so it keeps
+             * the old reuse. */
+            if (!cfg->is_glm5) cfg->n_ffn = cfg->n_ff_exp;
+        } else if (str_eq(key, "glm5next.expert_shared_feed_forward_length") || str_eq(key, "qwen35moe.expert_shared_feed_forward_length")) {
+            int dummy; cfg->n_ff_shexp = (int)skip_meta_value(&r, vtype, &dummy);
+        }
+        /* Gemma-3n: laurel_rank is derived from tensor shapes, not from KV */
+        /* Gemma-3n: final_logit_softcapping default */
+        /* StableLM: parallel residual */
+        else if (str_eq(key, "stablelm.use_parallel_residual")
+            || str_eq(key, "gptneox.use_parallel_residual")) {
+            cfg->use_parallel_residual = read_u8(&r) ? 1 : 0;
+        } else if (str_eq(key, "general.alignment")) {
+            int dummy; cfg->alignment = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (str_eq(key, "llama.vocab_size")
+            || str_eq(key, "qwen2.vocab_size") || str_eq(key, "qwen3.vocab_size") || str_eq(key, "qwen35.vocab_size") || str_eq(key, "qwen35moe.vocab_size")
+            || str_eq(key, "gemma3n.vocab_size") || str_eq(key, "gpt2.vocab_size") || str_eq(key, "gptneox.vocab_size")
+            || str_eq(key, "glm5next.vocab_size") || str_eq(key, "spark2_5.vocab_size")) {
+            int dummy; cfg->vocab_size = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (str_eq(key, "tokenizer.ggml.bos_token_id")) {
+            int dummy; m->tok_bos_id = (uint32_t)skip_meta_value(&r, vtype, &dummy);
+        } else if (str_eq(key, "tokenizer.ggml.model")) {
+            /* Set default BOS token based on tokenizer model type */
+            if (vtype == GGUF_META_STRING) {
+                gguf_str_t model_name = read_gguf_string(&r);
+                if (model_name.len == 4 && strncmp(model_name.str, "gpt2", 4) == 0) {
+                    /* gpt2 tokenizer: BOS=11, like llama.cpp */
+                    if (m->tok_bos_id == 1) m->tok_bos_id = 11;
+                    m->tok_unknown_model = 1; /* clear when pre=smollm etc is seen */
+                } else if (model_name.len == 5 && strncmp(model_name.str, "llama", 5) == 0) {
+                    /* llama tokenizer: BOS=1 (already default) */
+                    ;
+                }
+            } else {
+                skip_meta_value_warn(&r, vtype, key.str);
+            }
+        } else if (str_eq(key, "tokenizer.ggml.eos_token_id")) {
+            int dummy; m->tok_eos_id = (uint32_t)skip_meta_value(&r, vtype, &dummy);
+        /* ---- GLM-5.3-Flash (glm5next / glm5-next) ----
+         * Prefix-agnostic suffix match: the GGUF arch string may be either
+         * spelling, and the KV keys carry it verbatim. */
+        } else if (cfg->is_glm5 && key_has_suffix(key, ".attention.head_count_kv")) {
+            /* Per-layer array: 0 = KDA layer, 1 = MLA layer (n_kv_heads=1).
+             * Also sets n_kv_heads to the max (1) for generic code paths. */
+            if (vtype == GGUF_META_ARRAY) {
+                uint32_t etype = read_u32(&r);
+                uint64_t n = read_u64(&r);
+                if (etype == GGUF_META_INT32 || etype == GGUF_META_UINT32) {
+                    int mla_seen = 0;
+                    for (uint64_t i = 0; i < n; i++) {
+                        int64_t v = read_i32(&r);
+                        if (i < (uint64_t)MAX_LAYERS) {
+                            cfg->glm5_layer_is_mla[i] = (v > 0) ? 1 : 0;
+                            if (v > 0) mla_seen = 1;
+                        }
+                    }
+                    cfg->glm5_mla_pattern_len = (int)n;
+                    if (n < (uint64_t)MAX_LAYERS)
+                        memset(cfg->glm5_layer_is_mla + n, 0, MAX_LAYERS - n);
+                    (void)mla_seen;
+                    cfg->n_kv_heads = 1;  /* MLA layers have 1 KV head */
+                } else {
+                    skip_meta_value(&r, vtype, NULL);
+                }
+            } else {
+                skip_meta_value(&r, vtype, NULL);
+            }
+        } else if (cfg->is_glm5 && key_has_suffix(key, ".attention.layer_norm_epsilon")) {
+            /* GLM-5 carries TWO normalisation epsilons:
+             *   attention.layer_norm_rms_epsilon (1e-5) -> every RMSNorm
+             *   attention.layer_norm_epsilon     (1e-6) -> the DSA indexer's
+             *                                              LayerNorm (with bias)
+             * They must not share a field: whichever KV was parsed last used to
+             * win, which silently set the RMS eps to 1e-6 and scaled every
+             * hc_pre/adam norm by ~0.5%. */
+            if (vtype == GGUF_META_FLOAT32) { cfg->glm5_ln_eps = read_f32(&r); }
+            else { skip_meta_value(&r, vtype, NULL); }
+        } else if (cfg->is_glm5 && key_has_suffix(key, ".attention.q_lora_rank")) {
+            int dummy; cfg->glm5_q_lora = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (cfg->is_glm5 && key_has_suffix(key, ".attention.kv_lora_rank")) {
+            int dummy; cfg->glm5_kv_lora = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (cfg->is_glm5 && key_has_suffix(key, ".attention.key_length_mla")) {
+            int dummy; cfg->glm5_mla_head_dim = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (cfg->is_glm5 && key_has_suffix(key, ".attention.value_length_mla")) {
+            int dummy; cfg->glm5_mla_head_dim = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (cfg->is_glm5 && key_has_suffix(key, ".kda.head_dim")) {
+            int dummy; cfg->glm5_kda_dim = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (cfg->is_glm5 && key_has_suffix(key, ".kda.gate_lower_bound")) {
+            if (vtype == GGUF_META_FLOAT32) { cfg->glm5_kda_lower_bound = read_f32(&r); }
+            else { skip_meta_value(&r, vtype, NULL); }
+        } else if (cfg->is_glm5 && key_has_suffix(key, ".ssm.conv_kernel")) {
+            int dummy; cfg->ssm_d_conv = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (cfg->is_glm5 && key_has_suffix(key, ".attention.indexer.head_count")) {
+            int dummy; cfg->glm5_idx_nh = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (cfg->is_glm5 && key_has_suffix(key, ".attention.indexer.key_length")) {
+            int dummy; cfg->glm5_idx_dim = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (cfg->is_glm5 && key_has_suffix(key, ".attention.indexer.top_k")) {
+            int dummy; cfg->glm5_idx_topk = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (cfg->is_glm5 && key_has_suffix(key, ".attention.indexer.kpool")) {
+            int dummy; cfg->glm5_idx_kpool = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (cfg->is_glm5 && key_has_suffix(key, ".hyper_connection.count")) {
+            int dummy; cfg->glm5_hc = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (cfg->is_glm5 && key_has_suffix(key, ".hyper_connection.sinkhorn_iterations")) {
+            int dummy; cfg->glm5_sinkhorn_iters = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (cfg->is_glm5 && key_has_suffix(key, ".hyper_connection.epsilon")) {
+            if (vtype == GGUF_META_FLOAT32) { cfg->glm5_hc_eps = read_f32(&r); }
+            else { skip_meta_value(&r, vtype, NULL); }
+        } else if (cfg->is_glm5 && key_has_suffix(key, ".expert_weights_scale")) {
+            if (vtype == GGUF_META_FLOAT32) { cfg->glm5_moe_scale = read_f32(&r); cfg->glm5_moe_scale_set = 1; }
+            else { skip_meta_value(&r, vtype, NULL); }
+        } else if (cfg->is_glm5 && key_has_suffix(key, ".expert_weights_norm")) {
+            if (vtype == GGUF_META_BOOL) { cfg->glm5_moe_norm = (int)read_u8(&r); }
+            else { skip_meta_value(&r, vtype, NULL); }
+        } else if (cfg->is_glm5 && key_has_suffix(key, ".leading_dense_block_count")) {
+            int dummy; cfg->n_layer_dense_lead = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (cfg->is_glm5 && key_has_suffix(key, ".nextn_predict_layers")) {
+            int dummy; cfg->n_mtp_layers = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (cfg->is_glm5 && key_has_suffix(key, ".swiglu_clamp_exp")) {
+            /* Per-layer array of f32; we take the first value (all 10.0 in practice). */
+            if (vtype == GGUF_META_ARRAY) {
+                uint32_t etype = read_u32(&r);
+                uint64_t n = read_u64(&r);
+                if (etype == GGUF_META_FLOAT32) {
+                    for (uint64_t i = 0; i < n; i++) {
+                        float v = read_f32(&r);
+                        if (i == 0) cfg->glm5_clamp_exp = v;
+                    }
+                } else { skip_meta_value(&r, vtype, NULL); }
+            } else { skip_meta_value(&r, vtype, NULL); }
+        } else if (cfg->is_glm5 && key_has_suffix(key, ".swiglu_clamp_shexp")) {
+            if (vtype == GGUF_META_ARRAY) {
+                uint32_t etype = read_u32(&r);
+                uint64_t n = read_u64(&r);
+                if (etype == GGUF_META_FLOAT32) {
+                    for (uint64_t i = 0; i < n; i++) {
+                        float v = read_f32(&r);
+                        if (i == 0) cfg->glm5_clamp_shexp = v;
+                    }
+                } else { skip_meta_value(&r, vtype, NULL); }
+            } else { skip_meta_value(&r, vtype, NULL); }
+        } else if (str_eq(key, "tokenizer.ggml.pre")) {
+            /* Detect space marker type for tokenization.
+             * GPT-2 BPE tokenizers use literal spaces, not U+2581. */
+            if (vtype == GGUF_META_STRING) {
+                gguf_str_t pre = read_gguf_string(&r);
+                if (pre.len >= 6 && strncmp(pre.str, "smollm", 6) == 0) {
+                    m->tok_space_marker = 1; /* U+0100 */
+                    m->tok_unknown_model = 0; /* smollm pre-tokenizer works with SPM */
+                } else if (pre.len >= 6 && strncmp(pre.str, "qwen35", 6) == 0) {
+                    m->tok_space_marker = 3; /* qwen35: U+0100, no prefix on first token */
+                    m->tok_unknown_model = 0;
+                } else if (pre.len == 4 && strncmp(pre.str, "glm4", 4) == 0) {
+                    /* GLM-4/GLM-5: GPT-2 byte-level BPE, \p{N}{1,3} digit grouping.
+                     * Handled by qwen_tokenize.c with QWEN_PRETOK_GLM4. */
+                    m->tok_space_marker = 0; /* literal space */
+                    m->tok_unknown_model = 0;
+                    cfg->is_glm4_tok = 1;
+                    /* GLM-4/GLM-5 use add_bos=false: the chat template itself
+                     * starts with [gMASK]<sop>, so prepending BOS would emit
+                     * <sop> twice. GGUFs from this family omit the KV, hence the
+                     * explicit default here (an explicit KV still wins). */
+                    m->tok_add_bos = 0;
+                } else if (pre.len == 6 && strncmp(pre.str, "tekken", 6) == 0) {
+                    /* Mistral Tekken tokenizer (Mistral-Nemo-2407 and later).
+                     * Same GPT-2-style byte-level BPE vocab/merges representation as
+                     * Qwen, but with Tekken's own pretokenizer regex. Handled entirely
+                     * by qwen_tokenize.c (native BPE path); tok_space_marker is unused
+                     * for this path (only consulted by the old SPM tokenizer.c). */
+                    cfg->is_tekken = 1;
+                    m->tok_unknown_model = 0;
+                } else if (pre.len >= 10 && strncmp(pre.str, "llama-bpe", 9) == 0) {
+                    /* llama-bpe: GPT-2 BPE with Llama preprocessing - unsupported, use U+0100 as best guess */
+                    m->tok_space_marker = 1;
+                } else if (pre.len >= 5 && strncmp(pre.str, "gpt-2", 5) == 0) {
+                    /* gpt-2: standard GPT-2 BPE preprocessing */
+                    m->tok_space_marker = 0; /* uses literal space, handled by Qwen tokenizer */
+                    m->tok_unknown_model = 0;
+                } else if (pre.len == 4 && strncmp(pre.str, "olmo", 4) == 0) {
+                    /* OLMo/GPTNeoX: GPT-2 BPE with ByteLevel pretokenizer.
+                     * Uses literal spaces, handled by qwen_tokenize.c BPE path.
+                     * tok_space_marker is unused for this path. */
+                    m->tok_unknown_model = 0;
+                } else if (pre.len == 8 && strncmp(pre.str, "spark2_5", 8) == 0) {
+                    /* Spark-X2.5: GPT-2 BPE with Spark pretokenizer.
+                     * Handled by qwen_tokenize.c (QWEN_PRETOK_SPARK25). */
+                    m->tok_unknown_model = 0;
+                } else {
+                    m->tok_space_marker = 0; /* U+2581 (default, SPM models) */
+                }
+            } else {
+                skip_meta_value_warn(&r, vtype, key.str);
+            }
+        } else if (str_eq(key, "tokenizer.ggml.add_bos_token")) {
+            int dummy; m->tok_add_bos = (int)skip_meta_value(&r, vtype, &dummy);
+            m->tok_add_bos_set = 1;
+        } else if (str_eq(key, "tokenizer.ggml.add_space_prefix")) {
+            int dummy; m->tok_add_space_prefix = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (str_eq(key, "tokenizer.ggml.tokens")) {
+            if (vtype != GGUF_META_ARRAY) {
+                int dummy; skip_meta_value(&r, vtype, &dummy);
+            } else {
+                uint32_t arr_type = read_u32(&r);
+                uint64_t arr_len  = read_u64(&r);
+                m->tok_tokens_data = r.data + r.pos;
+                m->tok_n_tokens = arr_len;
+                int dummy;
+                for (uint64_t j = 0; j < arr_len; j++) {
+                    skip_meta_value(&r, arr_type, &dummy);
+                }
+            }
+        } else if (str_eq(key, "tokenizer.ggml.scores")) {
+            if (vtype != GGUF_META_ARRAY) {
+                int dummy; skip_meta_value(&r, vtype, &dummy);
+            } else {
+                uint32_t arr_type = read_u32(&r);
+                uint64_t arr_len  = read_u64(&r);
+                (void)arr_type;
+                m->tok_scores_data = r.data + r.pos;
+                m->tok_n_scores = arr_len;
+                r.pos += arr_len * 4;
+            }
+        } else if (str_eq(key, "tokenizer.ggml.merges")) {
+            if (vtype != GGUF_META_ARRAY) {
+                int dummy; skip_meta_value(&r, vtype, &dummy);
+            } else {
+                uint32_t arr_type = read_u32(&r);
+                uint64_t arr_len  = read_u64(&r);
+                if (arr_type == GGUF_META_STRING) {
+                    m->tok_merges_data = r.data + r.pos;
+                    m->tok_n_merges = arr_len;
+                }
+                { const uint8_t *pp = r.data + r.pos;
+                  uint64_t nn = arr_len;
+                  for (uint64_t ii = 0; ii < nn; ii++) {
+                      uint64_t sl; memcpy(&sl, pp, 8); sl = GGUF_LE64(sl); pp += 8 + sl; }
+                  r.pos = (size_t)(pp - r.data); }
+            }
+        } else if (str_eq(key, "tokenizer.ggml.token_type")) {
+            if (vtype != GGUF_META_ARRAY) {
+                int dummy; skip_meta_value(&r, vtype, &dummy);
+            } else {
+                uint32_t arr_type = read_u32(&r);
+                uint64_t arr_len  = read_u64(&r);
+                if (arr_type == GGUF_META_INT32 || arr_type == GGUF_META_UINT32) {
+                    m->tok_token_type_data = r.data + r.pos;
+                    m->tok_n_token_type = arr_len;
+                    r.pos += arr_len * 4;
+                } else {
+                    int dummy;
+                    for (uint64_t j = 0; j < arr_len; j++) {
+                        skip_meta_value(&r, arr_type, &dummy);
+                    }
+                }
+            }
+        /* Split GGUF metadata */
+        } else if (str_eq(key, "split.count")) {
+            int dummy; m->split_count = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (str_eq(key, "split.no")) {
+            int dummy; m->split_no = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (str_eq(key, "split.tensors.count")) {
+            int dummy; m->split_tensors_count = (int)skip_meta_value(&r, vtype, &dummy);
+        } else {
+            int dummy; skip_meta_value(&r, vtype, &dummy);
+        }
+    }
+
+    /* Resolve YaRN original context length: if the GGUF didn't give an
+     * explicit "*.rope.scaling.original_context_length", default to the
+     * model's own trained context length (n_ctx_train), matching
+     * llama-hparams.h. This must happen BEFORE the -c/--ctx-size override
+     * below, since that overrides max_seq_len to whatever the user wants
+     * to run at (often larger, when the whole point is context extension). */
+    if (cfg->rope_ctx_orig == 0) {
+        cfg->rope_ctx_orig = (uint32_t)cfg->max_seq_len;
+    }
+
+    /* Apply user-specified context length override (-c option) */
+    if (max_seq_len > 0) {
+        cfg->max_seq_len = max_seq_len;
+    }
+
+    /* ---- Split GGUF: detect and prepare ---- */
+    {
+        int total_splits = m->split_count > 1 ? m->split_count : 1;
+        m->n_splits = total_splits;
+
+        if (total_splits > 1) {
+            /* Derive prefix from first split path */
+            char prefix[512];
+            if (!split_path_prefix(prefix, sizeof(prefix), m->first_split_path)) {
+                fprintf(stderr, "Split model: could not derive prefix from path '%s'\n", m->first_split_path);
+                return -1;
+            }
+
+            fprintf(stderr, "Split model: %d splits, total tensors=%d\n",
+                    total_splits, m->split_tensors_count);
+
+            /* Mmap remaining splits */
+            for (int si = 1; si < total_splits; si++) {
+                char split_path[512];
+                split_path_build(split_path, sizeof(split_path), prefix, si, total_splits);
+
+                if (mmap_one_file(&m->splits[si], split_path) != 0) {
+                    /* Clean up already-mapped splits */
+                    for (int sj = 1; sj <= si; sj++) munmap_one_file(&m->splits[sj]);
+                    return -1;
+                }
+                prepare_mmap(m->splits[si].mmap_addr, m->splits[si].mmap_size);
+            }
+        }
+    }
+
+    /* Validate required config fields before using them */
+    if (cfg->n_embd <= 0 || cfg->n_heads <= 0 || cfg->n_layers <= 0) {
+        fprintf(stderr, "Model architecture not recognized (n_embd=%d n_heads=%d n_layers=%d)\n",
+                cfg->n_embd, cfg->n_heads, cfg->n_layers);
+        return -1;
+    }
+
+    /* head_dim: use GGUF's attention.key_length if set (Qwen3), else derive */
+    if (cfg->head_dim <= 0) {
+        cfg->head_dim = cfg->n_embd / cfg->n_heads;
+    }
+
+    /* GPT-2 defaults: no GQA, MHA with n_kv_heads = n_heads */
+    if (cfg->is_gpt2) {
+        if (cfg->n_kv_heads <= 0) cfg->n_kv_heads = cfg->n_heads;
+        /* GPT-2 uses learned positional embeddings, not RoPE */
+        cfg->rope_type = -1; /* -1 = no RoPE */
+    }
+
+    /* StableLM defaults */
+    if (cfg->is_stablelm) {
+        if (cfg->rope_freq_base <= 0) cfg->rope_freq_base = 10000.0f;
+        if (cfg->rope_dim <= 0) cfg->rope_dim = cfg->head_dim;
+        /* Clio/StableLM: no space prefix prepend (transformers doesn't prepend) */
+        m->tok_add_space_prefix = 0;
+        /* StableLM uses HF half-split RoPE (rope_type=1), NOT llama pairwise (0).
+         * The GGUF conversion does NOT permute Q/K weight rows, so PicoLM must
+         * pair (q[i], q[i+half]) instead of (q[2i], q[2i+1]).
+         * Verified: PicoLM bq[:4] matches HF q_proj[:4] unpermuted. */
+        cfg->rope_type = 1;
+    }
+
+    /* GPTNeoX (Krake v2) defaults */
+    if (cfg->is_gptneox) {
+        if (cfg->n_kv_heads <= 0) cfg->n_kv_heads = cfg->n_heads; /* MHA, no GQA */
+        if (cfg->rope_freq_base <= 0) cfg->rope_freq_base = 10000.0f;
+        if (cfg->rope_dim <= 0) cfg->rope_dim = cfg->head_dim;
+        /* GPTNeoX uses NeoX split-halves RoPE (rope_type=1), NOT pairwise (0).
+         * Verified: llama.cpp uses GGML_ROPE_TYPE_NEOX for GPTNeoX.
+         * Pairs (q[i], q[i+half_rot]) instead of (q[2i], q[2i+1]). */
+        cfg->rope_type = 1;
+        /* GPTNeoX uses parallel residual */
+        if (!cfg->use_parallel_residual) cfg->use_parallel_residual = 1;
+    }
+
+    /* Spark-X2.5 defaults */
+    if (cfg->is_spark25) {
+        if (cfg->n_kv_heads <= 0) cfg->n_kv_heads = cfg->n_heads;
+        if (cfg->rope_freq_base <= 0) cfg->rope_freq_base = 5000000.0f;
+        if (cfg->rope_dim <= 0) cfg->rope_dim = cfg->head_dim;
+        if (cfg->rope_dim_swa <= 0) cfg->rope_dim_swa = cfg->head_dim;
+        if (cfg->rope_freq_base_swa <= 0) cfg->rope_freq_base_swa = 10000.0f;
+        /* Spark uses GPT-NeoX RoPE (consecutive pairs, llama.cpp: LLAMA_ROPE_TYPE_NEOX) */
+        cfg->rope_type = 1;
+    }
+
+    /* Gemma-3n defaults */
+    if (cfg->is_gemma3n) {
+        if (cfg->n_altup <= 0) cfg->n_altup = 4;
+        if (cfg->i_altup_act < 0) cfg->i_altup_act = 0;
+        if (cfg->n_embd_altup <= 0) cfg->n_embd_altup = 256;
+        if (cfg->n_layer_kv_from_start < 0) cfg->n_layer_kv_from_start = cfg->n_layers;
+        if (cfg->f_final_logit_softcapping <= 0) cfg->f_final_logit_softcapping = 30.0f;
+        /* Gemma-3n uses NeoX-style RoPE (split halves), not Llama pairwise */
+        cfg->rope_type = 1;
+        /* Attention scale: 1.0 (no 1/sqrt(head_dim) scaling, QK-norm handles it) */
+        cfg->f_attention_scale = 1.0f;
+        /* Activation sparsity: first 10 layers use gaussian_topk */
+        cfg->n_layer_sparsity = 10;
+        cfg->f_sparsity_std_mul = 1.6448533535003662f;
+        /* SWA: period 5, window 512. SWA layers use freq_base=10000 */
+        cfg->swa_period = 5;
+        cfg->rope_freq_base_swa = 10000.0f;
+    }
+
+    /* ---- Resolve per-layer SWA window sizes (n_swa_layer[]) ----
+     * This is the single step that turns whatever the GGUF file (or the
+     * family defaults just above) provided into the per-layer array every
+     * attention code path actually consults -- CPU decode/prefill, every
+     * GPU backend's decode/prefill kernels, all of it (see model.h's
+     * n_swa_layer[] doc comment). Runs once n_layers is final, in
+     * priority order:
+     *   1. an explicit per-layer boolean pattern read from the GGUF file
+     *      itself (has_swa_pattern, from any "*.attention.sliding_window_
+     *      pattern" key -- architecture-agnostic, see key_has_suffix());
+     *   2. a period, either read directly from the GGUF or defaulted for
+     *      a known family above (e.g. Gemma-3n's swa_period=5);
+     *   3. if only a window size was given with no pattern/period at all,
+     *      every layer is SWA (covers "one fixed window for the whole
+     *      model" architectures, e.g. Gemma-3's simple case);
+     *   4. otherwise every entry is 0 (full attention) -- the no-op case
+     *      for every model family that predates SWA (Llama, Mistral, Qwen,
+     *      GPT-2, ...) and the only case those families ever hit.
+     * A brand new SWA architecture in the future needs nothing beyond
+     * whichever of the above its GGUF export already matches -- no
+     * attention-kernel changes, on any backend, ever again. */
+    memset(cfg->n_swa_layer, 0, sizeof(cfg->n_swa_layer));
+    if (cfg->n_swa > 0) {
+        if (cfg->has_swa_pattern) {
+            for (int l = 0; l < cfg->n_layers && l < MAX_LAYERS; l++) {
+                int is_swa = (l < cfg->n_swa_pattern_len) ? cfg->swa_layer_bool[l] : 0;
+                cfg->n_swa_layer[l] = is_swa ? cfg->n_swa : 0;
+            }
+        } else if (cfg->swa_period > 0) {
+            for (int l = 0; l < cfg->n_layers && l < MAX_LAYERS; l++) {
+                int is_swa = (l % cfg->swa_period) < (cfg->swa_period - 1);
+                cfg->n_swa_layer[l] = is_swa ? cfg->n_swa : 0;
+            }
+        } else {
+            for (int l = 0; l < cfg->n_layers && l < MAX_LAYERS; l++) cfg->n_swa_layer[l] = cfg->n_swa;
+        }
+    }
+    /* ---- Parse tensor info entries (split-aware) ---- */
+    /* tensor_info_t with split_idx */
+    typedef struct {
+        gguf_str_t name;
+        uint32_t   n_dims;
+        uint64_t   dims[4];
+        uint32_t   type;
+        uint64_t   offset;
+        int        split_idx;
+    } tensor_info_t;
+
+    /* Total tensor count: use split.tensors.count if split, else header n_tensors */
+    uint64_t total_tensor_count = (m->split_tensors_count > 0) ? (uint64_t)m->split_tensors_count : n_tensors;
+
+    tensor_info_t *tinfos = (tensor_info_t *)malloc(total_tensor_count * sizeof(tensor_info_t));
+    if (!tinfos) { fprintf(stderr, "OOM allocating tensor info\n"); return -1; }
+
+    /* Parse tensor tables from each split */
+    {
+        uint64_t tidx = 0;
+        for (int si = 0; si < m->n_splits; si++) {
+            reader_t sr;
+            uint64_t s_n_tensors;
+
+            if (si == 0) {
+                /* Split 0: we already parsed metadata, reader 'r' is positioned after it.
+                 * We need the per-file n_tensors. Re-read header to get it, then reuse
+                 * the existing reader position (after metadata) for tensor entries. */
+                {
+                    reader_t hr = (reader_t){ .data = (const uint8_t *)m->splits[0].mmap_addr,
+                                              .pos = 0, .size = m->splits[0].mmap_size };
+                    (void)read_u32(&hr); /* magic */
+                    (void)read_u32(&hr); /* version */
+                    s_n_tensors = read_u64(&hr);
+                }
+                /* Continue reading tensor entries from 'r' (positioned after metadata) */
+                for (uint64_t ti = 0; ti < s_n_tensors; ti++) {
+                    tinfos[tidx].name     = read_gguf_string(&r);
+                    tinfos[tidx].n_dims   = read_u32(&r);
+                    for (uint32_t d = 0; d < tinfos[tidx].n_dims; d++) {
+                        tinfos[tidx].dims[d] = read_u64(&r);
+                    }
+                    tinfos[tidx].type     = read_u32(&r);
+                    tinfos[tidx].offset   = read_u64(&r);
+                    tinfos[tidx].split_idx = 0;
+                    tidx++;
+                }
+                /* tensor_data_base for split 0: after all tensor entries in split 0 */
+                m->tensor_data_base[0] = (r.pos + cfg->alignment - 1) & ~((size_t)cfg->alignment - 1);
+            } else {
+                /* Other splits: parse from scratch */
+                sr = (reader_t){ .data = (const uint8_t *)m->splits[si].mmap_addr,
+                                .pos = 0, .size = m->splits[si].mmap_size };
+                (void)read_u32(&sr); /* magic */
+                (void)read_u32(&sr); /* version */
+                s_n_tensors = read_u64(&sr);
+                uint64_t s_n_metadata = read_u64(&sr);
+                for (uint64_t mi = 0; mi < s_n_metadata; mi++) {
+                    (void)read_gguf_string(&sr);
+                    uint32_t svtype = read_u32(&sr);
+                    int dummy;
+                    skip_meta_value(&sr, svtype, &dummy);
+                }
+
+                for (uint64_t ti = 0; ti < s_n_tensors; ti++) {
+                    tinfos[tidx].name     = read_gguf_string(&sr);
+                    tinfos[tidx].n_dims   = read_u32(&sr);
+                    for (uint32_t d = 0; d < tinfos[tidx].n_dims; d++) {
+                        tinfos[tidx].dims[d] = read_u64(&sr);
+                    }
+                    tinfos[tidx].type     = read_u32(&sr);
+                    tinfos[tidx].offset   = read_u64(&sr);
+                    tinfos[tidx].split_idx = si;
+                    tidx++;
+                }
+                /* tensor_data_base: after tensor entries */
+                m->tensor_data_base[si] = (sr.pos + cfg->alignment - 1) & ~((size_t)cfg->alignment - 1);
+            }
+        }
+        /* Verify tensor count matches */
+        if (tidx != total_tensor_count) {
+            fprintf(stderr, "Split model: expected %lu tensors but got %lu\n",
+                    (unsigned long)total_tensor_count, (unsigned long)tidx);
+            free(tinfos);
+            return -1;
+        }
+    }
+
+    /* Detect MTP (Multi-Token Prediction) layers by scanning for "nextn" tensors */
+    cfg->has_mtp = 0;
+    cfg->n_mtp_layers = 0;
+    for (uint64_t i = 0; i < total_tensor_count; i++) {
+        if (strstr(tinfos[i].name.str, "nextn.") && tinfos[i].name.len > 0) {
+            cfg->has_mtp = 1;
+            break;
+        }
+    }
+
+    model_weights_t *w = &m->weights;
+    memset(w, 0, sizeof(*w));
+
+    /* GLM-5: allocate the per-layer extension array (zeroed). */
+    if (cfg->is_glm5) {
+        w->glm5 = (glm5_layer_weights_t *)calloc(MAX_LAYERS, sizeof(glm5_layer_weights_t));
+        if (!w->glm5) { fprintf(stderr, "OOM: glm5 layer weights\n"); return -1; }
+    }
+
+    for (uint64_t i = 0; i < total_tensor_count; i++) {
+        /* Resolve tensor pointer from the correct split's mmap region */
+        int si = tinfos[i].split_idx;
+        size_t off = m->tensor_data_base[si] + tinfos[i].offset;
+        gguf_type_t qtype = (gguf_type_t)tinfos[i].type;
+        /* Normalize ik_llama GGUF type aliases: 208 is Q8_0_R8 in some GGUFs
+         * (same layout as 203, just a different type ID assignment). */
+        if (qtype == (gguf_type_t)208)
+            qtype = GGUF_TYPE_Q8_0_R8;
+        /* Check tensor data is within file bounds */
+        size_t row_sz = gguf_type_row_size(qtype, (int)tinfos[i].dims[0]);
+            size_t rows = 1;
+            for (uint32_t _d = 1; _d < tinfos[i].n_dims; _d++) rows *= tinfos[i].dims[_d];
+            size_t sz = rows * row_sz;
+            if (off + sz > m->splits[si].mmap_size) {
+                fprintf(stderr, "ERROR: tensor '%.*s' data extends beyond file bounds (offset=%lu, size=%lu, file=%lu). Model is corrupted or incomplete.\n",
+                        (int)tinfos[i].name.len, tinfos[i].name.str, (unsigned long)off, (unsigned long)sz, (unsigned long)m->splits[si].mmap_size);
+                free(tinfos);
+                return -1;
+            }
+        const void *ptr = (const uint8_t *)m->splits[si].mmap_addr + off;
+
+        if (str_eq(tinfos[i].name, "token_embd.weight")) {
+            w->token_embd = ptr; w->type_token_embd = qtype;
+        } else if (str_eq(tinfos[i].name, "output_norm.weight")) {
+            w->output_norm = ptr; w->type_output_norm = qtype;
+        } else if (str_eq(tinfos[i].name, "output_norm.bias")) {
+            w->output_norm_bias = ptr; /* GPT-2: [n_embd] F32 */
+        } else if (str_eq(tinfos[i].name, "output.weight")) {
+            w->output = ptr; w->type_output = qtype;
+        } else if (str_eq(tinfos[i].name, "position_embd.weight")) {
+            w->position_embd = ptr; w->type_position_embd = qtype;
+        } else {
+            int layer = -1;
+            char suffix[64] = {0};
+
+            if (tinfos[i].name.len > 4 && memcmp(tinfos[i].name.str, "blk.", 4) == 0) {
+                const char *p = tinfos[i].name.str + 4;
+                const char *end = tinfos[i].name.str + tinfos[i].name.len;
+                layer = 0;
+                while (p < end && *p >= '0' && *p <= '9') {
+                    layer = layer * 10 + (*p - '0');
+                    p++;
+                }
+                if (p < end && *p == '.') {
+                    p++;
+                    size_t slen = (size_t)(end - p);
+                    if (slen < sizeof(suffix)) {
+                        memcpy(suffix, p, slen);
+                        suffix[slen] = '\0';
+                    }
+                }
+            }
+
+            if (layer >= 0 && layer < MAX_LAYERS) {
+                layer_weights_t *lw = &w->layers[layer];
+                glm5_layer_weights_t *gw = w->glm5 ? &w->glm5[layer] : NULL;
+                if (strcmp(suffix, "attn_norm.weight") == 0) {
+                    lw->attn_norm = ptr; lw->type_attn_norm = qtype;
+                } else if (strcmp(suffix, "attn_q.weight") == 0) {
+                    lw->attn_q = ptr; lw->type_attn_q = qtype;
+                    if (cfg->is_glm5 && tinfos[i].n_dims >= 2) {
+                        /* attn_q only exists on KDA layers: [n_embd, d_inner].
+                         * d_inner = dims[1] (output rows). This is authoritative:
+                         * attention.key_length is unreliable across GGUF versions. */
+                        cfg->glm5_kda_d_inner = (int)tinfos[i].dims[1];
+                        cfg->glm5_kda_d_inner_set = 1;
+                    }
+                } else if (strcmp(suffix, "attn_k.weight") == 0) {
+                    lw->attn_k = ptr; lw->type_attn_k = qtype; lw->is_attn_layer = 1;
+                } else if (strcmp(suffix, "attn_v.weight") == 0) {
+                    lw->attn_v = ptr; lw->type_attn_v = qtype; lw->is_attn_layer = 1;
+                } else if (strcmp(suffix, "attn_output.weight") == 0) {
+                    lw->attn_output = ptr; lw->type_attn_output = qtype;
+                } else if (strcmp(suffix, "attn_q_norm.weight") == 0) {
+                    lw->attn_q_norm = ptr; lw->type_attn_q_norm = qtype;
+                } else if (strcmp(suffix, "attn_k_norm.weight") == 0) {
+                    lw->attn_k_norm = ptr; lw->type_attn_k_norm = qtype;
+                } else if (strcmp(suffix, "ffn_norm.weight") == 0) {
+                    lw->post_attn_norm = ptr; lw->type_post_attn_norm = qtype;
+                } else if (strcmp(suffix, "post_attention_norm.weight") == 0) {
+                    /* Standard models (Llama, Qwen2/3/3.5/3.6): this is the
+                     * FFN pre-norm (alias for ffn_norm).
+                     * Gemma-3n: separate attention post-norm (ffn_norm exists too). */
+                    if (cfg->is_gemma3n) {
+                        lw->attn_post_norm = ptr; lw->type_attn_post_norm = qtype;
+                    } else {
+                        lw->post_attn_norm = ptr; lw->type_post_attn_norm = qtype;
+                    }
+                } else if (strcmp(suffix, "ffn_gate.weight") == 0) {
+                    lw->ffn_gate = ptr; lw->type_ffn_gate = qtype;
+                } else if (strcmp(suffix, "ffn_down.weight") == 0) {
+                    lw->ffn_down = ptr; lw->type_ffn_down = qtype;
+                } else if (strcmp(suffix, "ffn_up.weight") == 0) {
+                    lw->ffn_up = ptr; lw->type_ffn_up = qtype;
+                }
+                /* LongRoPE per-dimension frequency factors, F32 [n_rot/2] */
+                else if (strcmp(suffix, "rope_factors_long.weight") == 0) {
+                    lw->rope_factors_long = ptr;
+                } else if (strcmp(suffix, "rope_factors_short.weight") == 0) {
+                    lw->rope_factors_short = ptr;
+                } else if (strcmp(suffix, "rope_freqs.weight") == 0) {
+                    lw->rope_freqs = ptr;
+                }
+                /* MoE tensors (qwen35moe) */
+                else if (strcmp(suffix, "ffn_gate_exps.weight") == 0) {
+                    lw->ffn_gate_exps = ptr; lw->type_ffn_gate_exps = qtype;
+                } else if (strcmp(suffix, "ffn_up_exps.weight") == 0) {
+                    lw->ffn_up_exps = ptr; lw->type_ffn_up_exps = qtype;
+                } else if (strcmp(suffix, "ffn_down_exps.weight") == 0) {
+                    lw->ffn_down_exps = ptr; lw->type_ffn_down_exps = qtype;
+                } else if (strcmp(suffix, "ffn_gate_inp.weight") == 0) {
+                    lw->ffn_gate_inp = ptr; lw->type_ffn_gate_inp = qtype;
+                } else if (strcmp(suffix, "ffn_gate_inp_shexp.weight") == 0) {
+                    lw->ffn_gate_inp_shexp = ptr; lw->type_ffn_gate_inp_shexp = qtype;
+                } else if (strcmp(suffix, "ffn_gate_shexp.weight") == 0) {
+                    lw->ffn_gate_shexp = ptr; lw->type_ffn_gate_shexp = qtype;
+                } else if (strcmp(suffix, "ffn_up_shexp.weight") == 0) {
+                    lw->ffn_up_shexp = ptr; lw->type_ffn_up_shexp = qtype;
+                } else if (strcmp(suffix, "ffn_down_shexp.weight") == 0) {
+                    lw->ffn_down_shexp = ptr; lw->type_ffn_down_shexp = qtype;
+                }
+                /* SSM tensors (Qwen3.5) / GPT-2 fused QKV */
+                else if (strcmp(suffix, "attn_qkv.weight") == 0) {
+                    lw->attn_qkv = ptr; lw->type_attn_qkv = qtype;
+                    /* Only set is_attn_layer for GPT-2/GPTNeoX/Spark models. SSM models with
+                     * attn_qkv (Qwen3.6 hybrid) should not be marked as attention
+                     * layers here -- the separate attn_k/attn_v loaders set it for
+                     * mixed-arch layers that have those tensors. */
+                    if (m->config.is_gpt2 || m->config.is_gptneox || m->config.is_spark25) lw->is_attn_layer = 1;
+                } else if (strcmp(suffix, "attn_gate.weight") == 0) {
+                    if (cfg->is_spark25) {
+                        /* Spark-X2.5: [n_embd, n_head] head-wise gate */
+                        lw->attn_gate = ptr; lw->type_attn_gate = qtype;
+                    } else {
+                        /* SSM (Qwen3.5): [n_embd, value_dim] gate */
+                        lw->attn_gate_ssm = ptr; lw->type_attn_gate_ssm = qtype;
+                    }
+                } else if (!cfg->is_glm5 && strcmp(suffix, "ssm_a") == 0) {
+                    lw->ssm_a = ptr; lw->type_ssm_a = qtype;
+                } else if (strcmp(suffix, "ssm_alpha.weight") == 0) {
+                    lw->ssm_alpha = ptr; lw->type_ssm_alpha = qtype;
+                } else if (!cfg->is_glm5 && strcmp(suffix, "ssm_beta.weight") == 0) {
+                    lw->ssm_beta = ptr; lw->type_ssm_beta = qtype;
+                } else if (!cfg->is_glm5 && strcmp(suffix, "ssm_conv1d.weight") == 0) {
+                    lw->ssm_conv1d = ptr; lw->type_ssm_conv1d = qtype;
+                } else if (!cfg->is_glm5 && strcmp(suffix, "ssm_dt.bias") == 0) {
+                    lw->ssm_dt = ptr; lw->type_ssm_dt = qtype;
+                } else if (!cfg->is_glm5 && strcmp(suffix, "ssm_norm.weight") == 0) {
+                    lw->ssm_norm = ptr;
+                } else if (!cfg->is_glm5 && strcmp(suffix, "ssm_out.weight") == 0) {
+                    lw->ssm_out = ptr; lw->type_ssm_out = qtype;
+                }
+                /* ---- GLM-5.3-Flash (glm5next) per-layer tensors ----
+                 * KDA conv/gate tensors use ssm_* names that clash with the
+                 * Qwen SSM fields, so intercept them into the glm5 slots.
+                 * attn_q/k/v and attn_output are shared with MLA (a layer is
+                 * either KDA or MLA, never both); they land in the generic
+                 * lw-> fields and the forward pass disambiguates via
+                 * cfg->glm5_layer_is_mla[]. */
+                else if (cfg->is_glm5 && strcmp(suffix, "ssm_conv1d_q.weight") == 0) {
+                    gw->kda_conv_q = ptr;
+                } else if (cfg->is_glm5 && strcmp(suffix, "ssm_conv1d_k.weight") == 0) {
+                    gw->kda_conv_k = ptr;
+                } else if (cfg->is_glm5 && strcmp(suffix, "ssm_conv1d_v.weight") == 0) {
+                    gw->kda_conv_v = ptr;
+                } else if (cfg->is_glm5 && strcmp(suffix, "ssm_f_a.weight") == 0) {
+                    gw->kda_f_a = ptr; gw->type_kda_f_a = qtype;
+                } else if (cfg->is_glm5 && strcmp(suffix, "ssm_f_b.weight") == 0) {
+                    gw->kda_f_b = ptr; gw->type_kda_f_b = qtype;
+                } else if (cfg->is_glm5 && strcmp(suffix, "ssm_g_a.weight") == 0) {
+                    gw->kda_g_a = ptr; gw->type_kda_g_a = qtype;
+                } else if (cfg->is_glm5 && strcmp(suffix, "ssm_g_b.weight") == 0) {
+                    gw->kda_g_b = ptr; gw->type_kda_g_b = qtype;
+                } else if (cfg->is_glm5 && strcmp(suffix, "ssm_beta.weight") == 0) {
+                    gw->kda_beta = ptr; gw->type_kda_beta = qtype;
+                } else if (cfg->is_glm5 && strcmp(suffix, "ssm_a") == 0) {
+                    gw->kda_a = ptr;
+                } else if (cfg->is_glm5 && strcmp(suffix, "exp_probs_b.bias") == 0) {
+                    gw->exp_probs_b = ptr;
+                } else if (cfg->is_glm5 && strcmp(suffix, "ssm_dt.bias") == 0) {
+                    gw->kda_dt_bias = ptr;
+                } else if (cfg->is_glm5 && strcmp(suffix, "ssm_norm.weight") == 0) {
+                    gw->kda_norm = ptr;
+                }
+                else if (cfg->is_glm5 && strcmp(suffix, "hc_attn_fn.weight") == 0) {
+                    gw->hc_attn_fn = ptr; gw->type_hc_attn_fn = qtype;
+                } else if (cfg->is_glm5 && strcmp(suffix, "hc_attn_base.weight") == 0) {
+                    gw->hc_attn_base = ptr;
+                } else if (cfg->is_glm5 && strcmp(suffix, "hc_attn_scale.weight") == 0) {
+                    gw->hc_attn_scale = ptr;
+                } else if (cfg->is_glm5 && strcmp(suffix, "hc_ffn_fn.weight") == 0) {
+                    gw->hc_ffn_fn = ptr; gw->type_hc_ffn_fn = qtype;
+                } else if (cfg->is_glm5 && strcmp(suffix, "hc_ffn_base.weight") == 0) {
+                    gw->hc_ffn_base = ptr;
+                } else if (cfg->is_glm5 && strcmp(suffix, "hc_ffn_scale.weight") == 0) {
+                    gw->hc_ffn_scale = ptr;
+                }
+                /* GLM-5 MLA (absorbed, NoPE): attn_q_a/q_a_norm/q_b/kv_a_mqa/
+                 * kv_a_norm/k_b/v_b + attn_output (shared name with KDA). */
+                else if (cfg->is_glm5 && strcmp(suffix, "attn_q_a.weight") == 0) {
+                    gw->mla_q_a = ptr; gw->type_mla_q_a = qtype;
+                } else if (cfg->is_glm5 && strcmp(suffix, "attn_q_a_norm.weight") == 0) {
+                    gw->mla_q_a_norm = ptr;
+                } else if (cfg->is_glm5 && strcmp(suffix, "attn_q_b.weight") == 0) {
+                    gw->mla_q_b = ptr; gw->type_mla_q_b = qtype;
+                } else if (cfg->is_glm5 && strcmp(suffix, "attn_kv_a_mqa.weight") == 0) {
+                    gw->mla_kv_a_mqa = ptr; gw->type_mla_kv_a_mqa = qtype;
+                } else if (cfg->is_glm5 && strcmp(suffix, "attn_kv_a_norm.weight") == 0) {
+                    gw->mla_kv_a_norm = ptr;
+                } else if (cfg->is_glm5 && strcmp(suffix, "attn_k_b.weight") == 0) {
+                    gw->mla_k_b = ptr; gw->type_mla_k_b = qtype;
+                } else if (cfg->is_glm5 && strcmp(suffix, "attn_v_b.weight") == 0) {
+                    gw->mla_v_b = ptr; gw->type_mla_v_b = qtype;
+                }
+                /* GLM-5 DSA indexer (MLA layers only) */
+                else if (cfg->is_glm5 && strcmp(suffix, "indexer.k_norm.weight") == 0) {
+                    gw->idx_k_norm_w = ptr;
+                } else if (cfg->is_glm5 && strcmp(suffix, "indexer.k_norm.bias") == 0) {
+                    gw->idx_k_norm_b = ptr;
+                } else if (cfg->is_glm5 && strcmp(suffix, "indexer.proj.weight") == 0) {
+                    gw->idx_proj = ptr; gw->type_idx_proj = qtype;
+                } else if (cfg->is_glm5 && strcmp(suffix, "indexer.attn_k.weight") == 0) {
+                    gw->idx_attn_k = ptr; gw->type_idx_attn_k = qtype;
+                } else if (cfg->is_glm5 && strcmp(suffix, "indexer.attn_q_b.weight") == 0) {
+                    gw->idx_q_b = ptr; gw->type_idx_q_b = qtype;
+                } else if (cfg->is_glm5 && strcmp(suffix, "indexer_compressor_gate.weight") == 0) {
+                    gw->idx_gate = ptr; gw->type_idx_gate = qtype;
+                } else if (cfg->is_glm5 && strcmp(suffix, "indexer_compressor_ape.weight") == 0) {
+                    gw->idx_ape = ptr; gw->type_idx_ape = qtype;
+                }
+                /* GLM-5 NextN (MTP) block, layer n_layers-1 */
+                else if (cfg->is_glm5 && strncmp(suffix, "nextn.", 6) == 0) {
+                    const char *ns = suffix + 6;
+                    if (strcmp(ns, "eh_proj.weight") == 0) {
+                        m->weights.glm5g.nextn_eh_proj = ptr; m->weights.glm5g.type_nextn_eh_proj = qtype;
+                    } else if (strcmp(ns, "enorm.weight") == 0) {
+                        m->weights.glm5g.nextn_enorm = ptr;
+                    } else if (strcmp(ns, "hnorm.weight") == 0) {
+                        m->weights.glm5g.nextn_hnorm = ptr;
+                    } else if (strcmp(ns, "shared_head_norm.weight") == 0) {
+                        m->weights.glm5g.nextn_shared_head_norm = ptr;
+                    }
+                }
+                /* GPT-2 bias tensors (all F32) */
+                else if (strcmp(suffix, "attn_qkv.bias") == 0) {
+                    lw->attn_qkv_bias = ptr;
+                } else if (strcmp(suffix, "attn_output.bias") == 0) {
+                    lw->attn_output_bias = ptr;
+                } else if (strcmp(suffix, "ffn_up.bias") == 0) {
+                    lw->ffn_up_bias = ptr;
+                } else if (strcmp(suffix, "ffn_down.bias") == 0) {
+                    lw->ffn_down_bias = ptr;
+                }
+                /* GPT-2 LayerNorm bias tensors (F32) */
+                else if (strcmp(suffix, "attn_norm.bias") == 0) {
+                    lw->attn_norm_bias = ptr;
+                } else if (strcmp(suffix, "ffn_norm.bias") == 0) {
+                    lw->post_attn_norm_bias = ptr;
+                }
+                /* Gemma-3n tensors */
+                else if (strcmp(suffix, "attn_post_norm.weight") == 0) {
+                    lw->attn_post_norm = ptr; lw->type_attn_post_norm = qtype;
+                } else if (strcmp(suffix, "post_ffw_norm.weight") == 0) {
+                    lw->post_ffw_norm = ptr; lw->type_post_ffw_norm = qtype;
+                } else if (strcmp(suffix, "per_layer_inp_gate.weight") == 0
+                        || strcmp(suffix, "inp_gate.weight") == 0) {
+                    lw->per_layer_inp_gate = ptr; lw->type_per_layer_inp_gate = qtype;
+                } else if (strcmp(suffix, "per_layer_proj.weight") == 0
+                        || strcmp(suffix, "proj.weight") == 0) {
+                    lw->per_layer_proj = ptr; lw->type_per_layer_proj = qtype;
+                } else if (strcmp(suffix, "per_layer_post_norm.weight") == 0
+                        || strcmp(suffix, "post_norm.weight") == 0) {
+                    lw->per_layer_post_norm = ptr; lw->type_per_layer_post_norm = qtype;
+                } else if (strcmp(suffix, "altup_correct_coef.weight") == 0) {
+                    lw->altup_correct_coef = ptr;
+                } else if (strcmp(suffix, "altup_correct_scale.weight") == 0) {
+                    lw->altup_correct_scale = ptr;
+                } else if (strcmp(suffix, "altup_predict_coef.weight") == 0) {
+                    lw->altup_predict_coef = ptr;
+                } else if (strcmp(suffix, "altup_router.weight") == 0) {
+                    lw->altup_router = ptr; lw->type_altup_router = qtype;
+                } else if (strcmp(suffix, "altup_router_norm.weight") == 0) {
+                    lw->altup_router_norm = ptr;
+                } else if (strcmp(suffix, "laurel_l.weight") == 0) {
+                    lw->laurel_l = ptr; lw->type_laurel_l = qtype;
+                    if (layer == 0 && _SSM_DBG) fprintf(stderr, "DBG laurel_l type=%d\n", qtype);
+                    /* Derive laurel_rank from tensor shape [n_embd, laurel_rank] */
+                    for (uint64_t ti = 0; ti < total_tensor_count; ti++) {
+                        if (tinfos[ti].name.len > 4 && memcmp(tinfos[ti].name.str, "blk.", 4) == 0) {
+                            const char *p = tinfos[ti].name.str + 4;
+                            int bl = 0;
+                            while (*p >= '0' && *p <= '9') { bl = bl * 10 + (*p - '0'); p++; }
+                            if (*p != '.' || bl != layer) continue;
+                            p++; /* skip dot */
+                            if (strncmp(p, "laurel_l.weight", 15) == 0 && tinfos[ti].n_dims >= 2) {
+                                cfg->laurel_rank = (int)tinfos[ti].dims[1];
+                                break;
+                            }
+                        }
+                    }
+                } else if (strcmp(suffix, "laurel_r.weight") == 0) {
+                    lw->laurel_r = ptr; lw->type_laurel_r = qtype;
+                    if (layer == 0 && _SSM_DBG) fprintf(stderr, "DBG laurel_r type=%d\n", qtype);
+                } else if (strcmp(suffix, "laurel_post_norm.weight") == 0) {
+                    lw->laurel_post_norm = ptr;
+                }
+            } else if (cfg->is_gemma3n) {
+                /* Gemma-3n global tensors (not under blk.) */
+                if (str_eq(tinfos[i].name, "altup_proj.weight")) {
+                    w->altup_proj = ptr; w->type_altup_proj = qtype;
+                } else if (str_eq(tinfos[i].name, "altup_unembd_proj.weight")) {
+                    w->altup_unembd_proj = ptr; w->type_altup_unembd_proj = qtype;
+                } else if (str_eq(tinfos[i].name, "per_layer_token_embd.weight")) {
+                    w->per_layer_tok_embd = ptr; w->type_per_layer_tok_embd = qtype;
+                } else if (str_eq(tinfos[i].name, "per_layer_model_proj.weight")) {
+                    w->per_layer_model_proj = ptr; w->type_per_layer_model_proj = qtype;
+                } else if (str_eq(tinfos[i].name, "per_layer_proj_norm.weight")) {
+                    w->per_layer_proj_norm = ptr;
+                    if (_SSM_DBG) fprintf(stderr, "DBG per_layer_proj_norm type=%d\n", qtype);
+                }
+            }
+        }
+    }
+
+    if (!w->output) {
+        w->output = w->token_embd;
+        w->type_output = w->type_token_embd;
+    }
+
+    if (cfg->vocab_size == 0) {
+        for (uint64_t i = 0; i < total_tensor_count; i++) {
+            if (str_eq(tinfos[i].name, "token_embd.weight")) {
+                if (tinfos[i].n_dims >= 2) {
+                    int d0 = (int)tinfos[i].dims[0];
+                    int d1 = (int)tinfos[i].dims[1];
+                    cfg->vocab_size = (d0 == cfg->n_embd) ? d1 : d0;
+                }
+                break;
+            }
+        }
+    }
+    if (cfg->vocab_size == 0 && m->tok_n_tokens > 0) {
+        cfg->vocab_size = (int)m->tok_n_tokens;
+    }
+
+    // For SSM models, the first layer may not have attn_q
+    if (cfg->has_ssm && w->layers[0].type_attn_q == 0) {
+        cfg->weight_type = w->layers[0].type_attn_qkv;
+    } else if (cfg->is_gpt2 || cfg->is_gptneox) {
+        cfg->weight_type = w->layers[0].type_attn_qkv;
+    } else {
+        cfg->weight_type = w->layers[0].type_attn_q;
+    }
+
+    /* GLM-5.3-Flash (glm5next): derive config, validate, classify layers. */
+    if (cfg->is_glm5) {
+        if (cfg->glm5_hc <= 0) cfg->glm5_hc = 4;
+        if (cfg->glm5_sinkhorn_iters <= 0) cfg->glm5_sinkhorn_iters = 20;
+        if (cfg->glm5_hc_eps <= 0.0f) cfg->glm5_hc_eps = 1e-6f;
+        if (cfg->glm5_kda_dim <= 0) cfg->glm5_kda_dim = 128;
+        if (cfg->ssm_d_conv <= 0) cfg->ssm_d_conv = 4;
+        /* d_inner (KDA qkv output dim) is derived from the attn_q tensor shape
+         * (dims[1] = output rows = n_kda_heads * kda_dim) during tensor mapping.
+         * attention.key_length is only a fallback (some GGUF revisions store the
+         * MLA latent dim there instead of d_inner). */
+        if (!cfg->glm5_kda_d_inner_set || cfg->glm5_kda_d_inner <= 0) {
+            fprintf(stderr, "ERROR: glm5: no KDA layers (attn_q) found to derive d_inner\n");
+            return -1;
+        }
+        if (cfg->glm5_kda_d_inner % cfg->glm5_kda_dim != 0) {
+            fprintf(stderr, "ERROR: glm5: d_inner=%d not a multiple of kda.head_dim=%d\n",
+                    cfg->glm5_kda_d_inner, cfg->glm5_kda_dim);
+            return -1;
+        }
+        cfg->glm5_n_kda_heads = cfg->glm5_kda_d_inner / cfg->glm5_kda_dim;
+        if (cfg->glm5_kda_d_inner != cfg->n_heads * cfg->glm5_kda_dim)
+            fprintf(stderr, "glm5: NOTE d_inner=%d but n_heads(%d)*kda_dim(%d)=%d\n",
+                    cfg->glm5_kda_d_inner, cfg->n_heads, cfg->glm5_kda_dim,
+                    cfg->n_heads * cfg->glm5_kda_dim);
+        if (cfg->glm5_idx_kpool <= 0) cfg->glm5_idx_kpool = 4;
+        /* MLA head dim: key_length_mla (256), not key_length (512 = kv_lora+rot) */
+        if (cfg->glm5_mla_head_dim <= 0) cfg->glm5_mla_head_dim = 256;
+        /* head_dim for the generic code: MLA absorbs K into the latent, so the
+         * "head dim" that matters for RoPE etc. is 0 (NoPE, no rotary). */
+        cfg->head_dim = cfg->glm5_mla_head_dim;
+        cfg->has_moe = 1;             /* MoE from layer n_dense_lead onward */
+        cfg->has_ssm = 0;             /* KDA is not the Qwen SSM path */
+        cfg->rope_dim = 0;            /* NoPE */
+        cfg->rope_type = 0;
+        /* Classify layers: head_count_kv[l] > 0 => MLA, else KDA. The array
+         * was stored into glm5_layer_is_mla during KV parse. */
+        if (cfg->glm5_mla_pattern_len > 0 && cfg->glm5_mla_pattern_len < cfg->n_layers)
+            fprintf(stderr, "WARN: glm5: head_count_kv has %d entries for %d layers\n",
+                    cfg->glm5_mla_pattern_len, cfg->n_layers);
+        /* Trunk layers = n_layers - n_mtp_layers. nextn_predict_layers was
+         * parsed from the KV metadata; also count trailing blocks that carry
+         * "nextn." tensors (belt and braces, and the authoritative source when
+         * the KV is absent). NOTE: this must happen BEFORE the layer
+         * classification below, which uses n_layer_kv_from_start. */
+        {
+            int mtp = 0;
+            for (int i = cfg->n_layers - 1; i >= 0; i--) {
+                int has_nextn = 0;
+                for (uint64_t ti = 0; ti < total_tensor_count; ti++) {
+                    const char *nm = tinfos[ti].name.str;
+                    if (!nm || strncmp(nm, "blk.", 4) != 0) continue;
+                    const char *q = nm + 4;
+                    int bl = 0;
+                    while (*q >= '0' && *q <= '9') { bl = bl * 10 + (*q - '0'); q++; }
+                    if (*q != '.') continue;
+                    if (bl == i && strstr(nm, "nextn.")) { has_nextn = 1; break; }
+                }
+                if (has_nextn) mtp++;
+                else break;   /* MTP layers are contiguous at the end */
+            }
+            if (mtp > 0) cfg->n_mtp_layers = mtp;
+        }
+        cfg->n_layer_kv_from_start = cfg->n_layers - cfg->n_mtp_layers;
+        if (cfg->n_layer_kv_from_start <= 0 || cfg->n_layer_kv_from_start > cfg->n_layers)
+            cfg->n_layer_kv_from_start = cfg->n_layers;
+        int n_mla = 0, n_kda = 0;
+        for (int l = 0; l < cfg->n_layers && l < MAX_LAYERS; l++) {
+            if (l >= cfg->n_layer_kv_from_start) {
+                /* NextN layer: MLA-shaped but not a trunk layer. Exclude it from
+                 * the MLA ordinals so the latent cache stays trunk-sized. */
+                cfg->glm5_layer_mla_ord[l] = -1;
+                continue;
+            }
+            if (cfg->glm5_layer_is_mla[l]) {
+                cfg->glm5_layer_mla_ord[l] = n_mla++;
+            } else {
+                cfg->glm5_layer_mla_ord[l] = -1;
+                n_kda++;
+            }
+        }
+        if (n_mla == 0) {
+            fprintf(stderr, "ERROR: glm5: no MLA layers found (head_count_kv array all zero?)\n");
+            return -1;
+        }
+        cfg->glm5_n_mla = n_mla;
+        /* GLM-4/5 templates begin with [gMASK]<sop>, so BOS must not be
+         * prepended (it would emit <sop> twice). Honour an explicit
+         * tokenizer.ggml.add_bos_token if the GGUF has one. */
+        if (!m->tok_add_bos_set && cfg->is_glm4_tok) m->tok_add_bos = 0;
+        cfg->glm5_n_kda = n_kda;
+        if (getenv("PICOLM_DBG_GLM5")) {
+            int mapped = 0;
+            for (int l = 0; l < cfg->n_layers; l++)
+                if (w->glm5 && w->glm5[l].hc_attn_fn) mapped++;
+            fprintf(stderr, "GLM5 map check: w->glm5=%p, layers with hc_attn_fn=%d/%d\n",
+                    (void*)w->glm5, mapped, cfg->n_layers);
+            for (int l = 0; l < cfg->n_layers && l < 8; l++)
+                fprintf(stderr, "  l=%d is_mla=%d hc_attn_fn=%p base=%p attn_q=%p\n",
+                        l, cfg->glm5_layer_is_mla[l],
+                        w->glm5 ? w->glm5[l].hc_attn_fn : NULL,
+                        w->glm5 ? w->glm5[l].hc_attn_base : NULL,
+                        w->layers[l].attn_q);
+        }
+        /* Enable the DSA k-pool indexer only when the model actually carries
+         * indexer weights on an MLA layer and the kpool geometry is sane.
+         * Indexer proj must be F32: the reference multiplies it by
+         * 1/sqrt(d*nh) before use, and re-quantizing would change the top-k
+         * ordering (which is discrete -- errors do not degrade gracefully). */
+        cfg->glm5_use_dsa = 0;
+        if (cfg->glm5_idx_nh > 0 && cfg->glm5_idx_dim > 0 &&
+            cfg->glm5_idx_kpool > 0 && cfg->glm5_idx_topk > 0) {
+            int with_weights = 0, missing = 0;
+            for (int l = 0; l < cfg->n_layers; l++) {
+                if (!cfg->glm5_layer_is_mla[l] || cfg->glm5_layer_mla_ord[l] < 0) continue;
+                const glm5_layer_weights_t *g = &w->glm5[l];
+                if (g->idx_attn_k && g->idx_gate && g->idx_q_b && g->idx_proj &&
+                    g->idx_ape && g->idx_k_norm_w && g->idx_k_norm_b) with_weights++;
+                else missing++;
+            }
+            cfg->glm5_use_dsa = (with_weights > 0);
+            if (getenv("PICOLM_DBG_GLM5") || getenv("PICOLM_GLM5_STATS"))
+                fprintf(stderr, "glm5: DSA indexer %s (%d MLA layers with weights, %d without)\n",
+                        cfg->glm5_use_dsa ? "ENABLED" : "disabled", with_weights, missing);
+        }
+        /* OFF by default, matching the reference build: ik_llama.cpp declares
+         * cparams.dsa but never assigns it or exposes a CLI flag, so the
+         * shipped implementation always runs DENSE MLA. Verified on the tiny
+         * oracle model: with a 17-token prompt (> kpool=4, so the indexer does
+         * activate) ik's greedy tokens match PicoLM's dense path exactly and
+         * differ from PicoLM's DSA path.
+         *
+         * PICOLM_GLM5_DSA=1 turns the indexer on. It is implemented and
+         * exercised, but it is not bit-comparable against this reference; only
+         * enable it for long-context work where sparse attention is wanted. */
+        if (!getenv("PICOLM_GLM5_DSA")) cfg->glm5_use_dsa = 0;
+        if (getenv("PICOLM_DBG_GLM5") || cfg->glm5_use_dsa) {
+            fprintf(stderr, "glm5: %d layers (%d MLA, %d KDA), hc=%d, q_lora=%d, kv_lora=%d, "
+                    "mla_hd=%d, kda_dim=%d, idx=%d/%d/%d, dsa=%d, moe=%d/%d scale=%.2f\n",
+                    cfg->n_layers, n_mla, n_kda, cfg->glm5_hc, cfg->glm5_q_lora,
+                    cfg->glm5_kv_lora, cfg->glm5_mla_head_dim, cfg->glm5_kda_dim,
+                    cfg->glm5_idx_nh, cfg->glm5_idx_topk, cfg->glm5_idx_kpool,
+                    cfg->glm5_use_dsa,
+                    cfg->n_expert, cfg->n_expert_used, cfg->glm5_moe_scale);
+        }
+    }
+
+    /* Verify required tensors for StableLM */
+    if (cfg->is_stablelm) {
+        for (int l = 0; l < cfg->n_layers; l++) {
+            layer_weights_t *lw = &w->layers[l];
+            if (!lw->attn_q || !lw->attn_k || !lw->attn_v || !lw->attn_output ||
+                !lw->ffn_gate || !lw->ffn_up || !lw->ffn_down) {
+                fprintf(stderr, "ERROR: StableLM model missing required tensors at layer %d\n", l);
+                return -1;
+            }
+        }
+    }
+
+    /* Verify required tensors for GPTNeoX */
+    if (cfg->is_gptneox) {
+        for (int l = 0; l < cfg->n_layers; l++) {
+            layer_weights_t *lw = &w->layers[l];
+            if (!lw->attn_qkv || !lw->attn_output ||
+                !lw->ffn_up || !lw->ffn_down) {
+                fprintf(stderr, "ERROR: GPTNeoX model missing required tensors at layer %d\n", l);
+                return -1;
+            }
+        }
+    }
+
+    /* Verify required tensors for Spark-X2.5 */
+    if (cfg->is_spark25) {
+        for (int l = 0; l < cfg->n_layers; l++) {
+            layer_weights_t *lw = &w->layers[l];
+            if (!lw->attn_qkv || !lw->attn_gate || !lw->attn_output ||
+                !lw->ffn_gate || !lw->ffn_up || !lw->ffn_down) {
+                fprintf(stderr, "ERROR: Spark-X2.5 model missing required tensors at layer %d\n", l);
+                return -1;
+            }
+        }
+        /* Spark GGUFs may be missing output_norm.weight. If so, we create
+         * a dummy F32 all-ones buffer so the forward pass RMSNorm becomes
+         * effectively a no-op (norm by 1.0). This matches the GGUF that
+         * was observed in the wild. */
+        if (!w->output_norm) {
+            w->output_norm = calloc(cfg->n_embd, sizeof(float));
+            if (!w->output_norm) {
+                fprintf(stderr, "ERROR: Spark-X2.5: failed to allocate dummy output_norm\n");
+                return -1;
+            }
+            for (int i = 0; i < cfg->n_embd; i++) {
+                ((float *)w->output_norm)[i] = 1.0f;
+            }
+            w->type_output_norm = GGUF_TYPE_F32;
+            fprintf(stderr, "WARN: Spark-X2.5: output_norm.weight missing, using dummy (all ones)\n");
+        }
+    }
+
+    /* Count MTP layers from the end: layers with "nextn" tensors.
+     * GLM-5 already did this inside its derive block (before layer
+     * classification); skip here so n_mtp_layers is not double-counted. */
+    if (cfg->has_mtp && !cfg->is_glm5) {
+        for (int i = cfg->n_layers - 1; i >= 0; i--) {
+            int has_nextn = 0;
+            for (uint64_t ti = 0; ti < total_tensor_count; ti++) {
+                if (strstr(tinfos[ti].name.str, "blk.") == NULL) continue;
+                const char *p = tinfos[ti].name.str + 4;
+                int bl = 0;
+                while (*p >= '0' && *p <= '9') { bl = bl * 10 + (*p - '0'); p++; }
+                if (*p != '.') continue;
+                if (bl == i && strstr(tinfos[ti].name.str, "nextn.")) {
+                    has_nextn = 1; break;
+                }
+            }
+            if (has_nextn) {
+                cfg->n_mtp_layers++;
+            } else {
+                break; /* MTP layers are contiguous at the end */
+            }
+        }
+    }
+
+    fprintf(stderr, "Model config:\n");
+    fprintf(stderr, "  n_embd=%d, n_ffn=%d, n_heads=%d, n_kv_heads=%d\n",
+            cfg->n_embd, cfg->n_ffn, cfg->n_heads, cfg->n_kv_heads);
+        fprintf(stderr, "  n_layers=%d, vocab_size=%d, max_seq=%d\n",
+            cfg->n_layers, cfg->vocab_size, cfg->max_seq_len);
+    if (cfg->has_ssm) {
+        int conv_dim = 2 * cfg->ssm_d_state * cfg->ssm_n_group + cfg->ssm_d_inner;
+        fprintf(stderr, "  SSM: conv=%d state=%d groups=%d dt_rank=%d inner=%d conv_dim=%d\n",
+                cfg->ssm_d_conv, cfg->ssm_d_state, cfg->ssm_n_group,
+                cfg->ssm_dt_rank, cfg->ssm_d_inner, conv_dim);
+        int attn_count = 0, ssm_count = 0;
+        for (int i = 0; i < cfg->n_layers; i++) {
+            if (w->layers[i].is_attn_layer) attn_count++; else ssm_count++;
+        }
+        fprintf(stderr, "  Layers: %d SSM + %d full attention\n", ssm_count, attn_count);
+        /* The recurrence derives head_v_dim = ssm_d_inner / n_v_heads with
+         * integer division (model_ssm.c), and n_v_heads comes from
+         * ssm.time_step_rank. If inner is not a multiple of dt_rank that
+         * division TRUNCATES: the last few value channels of every head are
+         * never addressed, and the gated-norm loop reads one norm_w span past
+         * its end. Both are silent -- no crash, just wrong numbers, and the
+         * error is batch-size independent so it looks like a quantisation
+         * difference. Refuse to load instead. (Found while generating a tiny
+         * oracle model: inner=256 with dt_rank=12 truncated to 21.) */
+        if (cfg->ssm_dt_rank > 0 && cfg->ssm_d_inner > 0 &&
+            cfg->ssm_d_inner % cfg->ssm_dt_rank != 0) {
+            fprintf(stderr,
+                    "ERROR: SSM: inner_size=%d is not a multiple of time_step_rank=%d.\n"
+                    "       head_v_dim = inner / time_step_rank would truncate to %d,\n"
+                    "       dropping %d value channels per head and reading past the\n"
+                    "       gated-norm weights. The model file is inconsistent.\n",
+                    cfg->ssm_d_inner, cfg->ssm_dt_rank,
+                    cfg->ssm_d_inner / cfg->ssm_dt_rank,
+                    cfg->ssm_d_inner - (cfg->ssm_d_inner / cfg->ssm_dt_rank) * cfg->ssm_dt_rank);
+            return -1;
+        }
+        if (cfg->ssm_dt_rank > 0 && cfg->ssm_d_state > 0 &&
+            cfg->ssm_d_inner % cfg->ssm_dt_rank == 0 &&
+            cfg->ssm_d_inner / cfg->ssm_dt_rank % cfg->ssm_d_state != 0) {
+            /* Only a warning: head_v_dim need not be a multiple of d_state for
+             * the recurrence to be well-defined, but a mismatch usually means
+             * the file is describing a different architecture than we assume. */
+            fprintf(stderr,
+                    "WARN: SSM: head_v_dim=%d is not a multiple of state_size=%d;\n"
+                    "      interpretation of this model may be wrong.\n",
+                    cfg->ssm_d_inner / cfg->ssm_dt_rank, cfg->ssm_d_state);
+        }
+    }
+    fprintf(stderr, "  head_dim=%d, rope_dim=%d, rope_base=%.1f\n", cfg->head_dim, cfg->rope_dim, (double)cfg->rope_freq_base);
+    if (cfg->has_moe) {
+        fprintf(stderr, "  MoE: experts=%d used=%d ff_exp=%d ff_shexp=%d\n",
+                cfg->n_expert, cfg->n_expert_used, cfg->n_ff_exp, cfg->n_ff_shexp);
+    }
+    if (cfg->is_gemma3n) {
+        fprintf(stderr, "  Gemma-3n: altup=%d active=%d laurel_rank=%d embd_altup=%d kv_layers=%d softcap=%.1f\n",
+                cfg->n_altup, cfg->i_altup_act, cfg->laurel_rank, cfg->n_embd_altup,
+                cfg->n_layer_kv_from_start, (double)cfg->f_final_logit_softcapping);
+    }
+    if (cfg->is_spark25) {
+        fprintf(stderr, "  Spark-X2.5: rope_dim=%d rope_dim_swa=%d freq_base=%.0f freq_base_swa=%.0f swa=%d\n",
+                cfg->rope_dim, cfg->rope_dim_swa,
+                (double)cfg->rope_freq_base, (double)cfg->rope_freq_base_swa,
+                cfg->n_swa);
+    }
+    /* On big-endian, GGUF stores all multi-byte values as little-endian.
+     * Swap F16 values in-place for all quantized block types that contain FP16 scales.
+     *
+     * The mmap is PROT_READ (COW mappings over CIFS fail with PROT_WRITE on
+     * low-RAM machines; see 9c1b3a5). We temporarily mprotect each split to
+     * PROT_READ|PROT_WRITE for the swap loop, then restore PROT_READ. */
+#if defined(__APPLE__) && defined(__ppc__) || (defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__) || defined(__BIG_ENDIAN__)
+#include <time.h>
+    if (!m->be_preprocessed) {
+        int be_start = clock();
+        fprintf(stderr, "Big-endian: swapping F16 values...\n");
+
+    /* Temporarily make all split mmap regions writable for in-place byte swap.
+     * We must do this because GGUF stores all multi-byte values in LE, and the
+     * quantized block scales (FP16) need swapping. Original commit 6ddcd2d used
+     * PROT_READ|PROT_WRITE from the start; 9c1b3a5 changed to PROT_READ for
+     * CIFS compatibility, so we use mprotect around the swap. */
+    for (int _si = 0; _si < m->n_splits; _si++) {
+        if (m->splits[_si].mmap_addr && m->splits[_si].mmap_size > 0) {
+            mprotect(m->splits[_si].mmap_addr, m->splits[_si].mmap_size,
+                     PROT_READ | PROT_WRITE);
+        }
+    }
+
+    for (uint64_t i = 0; i < total_tensor_count; i++) {
+        gguf_type_t qt = (gguf_type_t)tinfos[i].type;
+        int _si = tinfos[i].split_idx;
+        void *ptr = (void *)((uint8_t *)m->splits[_si].mmap_addr + m->tensor_data_base[_si] + tinfos[i].offset);
+        size_t nrows = tinfos[i].dims[0];
+        for (uint64_t d = 1; d < tinfos[i].n_dims; d++) nrows *= tinfos[i].dims[d];
+
+        if (qt == GGUF_TYPE_F32) {
+            size_t total = nrows;
+            size_t _fi;
+            for (_fi = 0; _fi < total; _fi++) {
+                uint32_t v = ((uint32_t *)ptr)[_fi];
+                ((uint32_t *)ptr)[_fi] = (v >> 24) | ((v >> 8) & 0xff00) |
+                                          ((v << 8) & 0xff0000) | (v << 24);
+            }
+        } else if (qt == GGUF_TYPE_F16 || qt == GGUF_TYPE_BF16) {
+            uint16_t *f16p = (uint16_t *)ptr;
+            swap_f16_block(f16p, nrows);
+        } else if (qt == GGUF_TYPE_Q8_0) {
+            size_t nblocks = nrows / 32;
+            for (size_t b = 0; b < nblocks; b++) {
+                block_q8_0 *blk = (block_q8_0 *)((uint8_t *)ptr + b * sizeof(block_q8_0));
+                blk->d = GGUF_LE16(blk->d);
+            }
+            /* BE swap verified: first block's d field is now in host byte order */
+        } else if (qt == GGUF_TYPE_Q4_0 ||
+                   qt == GGUF_TYPE_IQ4_NL ||
+                   qt == GGUF_TYPE_Q4_0_4_4 || qt == GGUF_TYPE_Q4_0_8_8 ||
+                   qt == GGUF_TYPE_Q4I_0_8_8 || qt == GGUF_TYPE_Q4_0_R8) {
+            /* Element count per physical block group. The interleaved formats
+             * pack SEVERAL rows into one block, so dividing the element count
+             * by 32 (as for plain Q4_0) walks past the tensor: nblocks would be
+             * 4x or 8x too large and the loop would byte-swap the `d` fields of
+             * whatever tensor happens to follow in the file.
+             *
+             *   Q4_0 / IQ4_NL   : 32 elements per 18-byte block
+             *   Q4_0_4_4        : 4 rows x 32 = 128 elements per 72-byte block
+             *   Q4_0_8_8 / _R8  : 8 rows x 32 = 256 elements per 144-byte block
+             *   Q4I_0_8_8       : 8 rows x 32 = 256 elements per 272-byte block
+             * (Visible with a mixed-quant GGUF such as
+             *  models/stories260K-stuffed.gguf: layer 1 holds q4_0_r8/q8_0_r8
+             *  tensors and the logits went NaN right after it.) */
+            size_t bs, elems_per_block;
+            switch (qt) {
+                case GGUF_TYPE_Q4_0_4_4:
+                    bs = sizeof(block_q4_0x4); elems_per_block = 4 * 32; break;
+                case GGUF_TYPE_Q4_0_8_8:
+                case GGUF_TYPE_Q4_0_R8:
+                    bs = sizeof(block_q4_0x8); elems_per_block = 8 * 32; break;
+                case GGUF_TYPE_Q4I_0_8_8:
+                    bs = sizeof(block_q4i_0x8); elems_per_block = 8 * 32; break;
+                default: /* Q4_0, IQ4_NL */
+                    bs = sizeof(block_q4_0); elems_per_block = 32; break;
+            }
+            size_t nblocks = nrows / elems_per_block;
+            if (qt == GGUF_TYPE_Q4_0_4_4) {
+                /* Q4_0_4_4: 4 FP16 deltas per block group */
+                for (size_t b = 0; b < nblocks; b++) {
+                    block_q4_0x4 *blk = (block_q4_0x4 *)((uint8_t *)ptr + b * bs);
+                    for (int r = 0; r < 4; r++) blk->d[r] = GGUF_LE16(blk->d[r]);
+                }
+            } else if (qt == GGUF_TYPE_Q4_0_R8 || qt == GGUF_TYPE_Q4_0_8_8) {
+                /* Q4_0_R8 / Q4_0_8_8: 8 FP16 deltas per block group */
+                for (size_t b = 0; b < nblocks; b++) {
+                    block_q4_0x8 *blk = (block_q4_0x8 *)((uint8_t *)ptr + b * bs);
+                    for (int r = 0; r < 8; r++) blk->d[r] = GGUF_LE16(blk->d[r]);
+                }
+            } else if (qt == GGUF_TYPE_Q4I_0_8_8) {
+                /* Q4I_0_8_8: 8 FP16 deltas per block group */
+                for (size_t b = 0; b < nblocks; b++) {
+                    block_q4i_0x8 *blk = (block_q4i_0x8 *)((uint8_t *)ptr + b * bs);
+                    for (int r = 0; r < 8; r++) blk->d[r] = GGUF_LE16(blk->d[r]);
+                }
+            } else {
+                for (size_t b = 0; b < nblocks; b++) {
+                    block_q4_0 *blk = (block_q4_0 *)((uint8_t *)ptr + b * bs);
+                    blk->d = GGUF_LE16(blk->d);
+                }
+            }
+        } else if (qt == GGUF_TYPE_Q8_K_R8) {
+            /* Q8_K_R8: 8 rows x 256 = 2048 elements per block group, with
+             * 8 FP16 deltas at the front. Handled before the Q4_0 family so it
+             * cannot be mistaken for a 32-element 18-byte Q4_0 block. */
+            size_t nb = nrows / (8 * 256);
+            for (size_t b = 0; b < nb; b++) {
+                block_q8_k_r8 *blk = (block_q8_k_r8 *)((uint8_t *)ptr + b * sizeof(block_q8_k_r8));
+                for (int r = 0; r < 8; r++) blk->d[r] = GGUF_LE16(blk->d[r]);
+            }
+        } else if (qt == GGUF_TYPE_Q2_0) {
+            size_t nblocks = nrows / 128;
+            for (size_t b = 0; b < nblocks; b++) {
+                block_q2_0 *blk = (block_q2_0 *)((uint8_t *)ptr + b * sizeof(block_q2_0));
+                blk->d = GGUF_LE16(blk->d);
+            }
+        } else if (qt == GGUF_TYPE_Q1_0) {
+            size_t nblocks = nrows / 128;
+            for (size_t b = 0; b < nblocks; b++) {
+                block_q1_0 *blk = (block_q1_0 *)((uint8_t *)ptr + b * sizeof(block_q1_0));
+                blk->d = GGUF_LE16(blk->d);
+            }
+        } else if (qt == GGUF_TYPE_Q5_K) {
+            size_t nblocks = nrows / 256;
+            for (size_t b = 0; b < nblocks; b++) {
+                block_q5_K *blk = (block_q5_K *)((uint8_t *)ptr + b * sizeof(block_q5_K));
+                blk->d = GGUF_LE16(blk->d);
+                blk->dm = GGUF_LE16(blk->dm);
+            }
+        } else if (qt == GGUF_TYPE_Q6_K) {
+            size_t nblocks = nrows / 256;
+            for (size_t b = 0; b < nblocks; b++) {
+                block_q6_K *blk = (block_q6_K *)((uint8_t *)ptr + b * sizeof(block_q6_K));
+                blk->d = GGUF_LE16(blk->d);
+            }
+        } else if (qt == GGUF_TYPE_Q6_K_R4) {
+            /* Q6_K_R4: 840-byte block group covers 4 rows x 256 = 1024
+             * elements (not 256 like plain Q6_K), 4 FP16 deltas per group. */
+            size_t nblocks = nrows / 1024;
+            for (size_t b = 0; b < nblocks; b++) {
+                block_q6_K_R4 *blk = (block_q6_K_R4 *)((uint8_t *)ptr + b * sizeof(block_q6_K_R4));
+                for (int r = 0; r < 4; r++) blk->d[r] = GGUF_LE16(blk->d[r]);
+            }
+        } else if (qt == GGUF_TYPE_Q3_K) {
+            size_t nblocks = nrows / 256;
+            for (size_t b = 0; b < nblocks; b++) {
+                block_q3_K *blk = (block_q3_K *)((uint8_t *)ptr + b * sizeof(block_q3_K));
+                blk->d = GGUF_LE16(blk->d);
+            }
+        } else if (qt == GGUF_TYPE_Q2_K) {
+            size_t nblocks = nrows / 256;
+            for (size_t b = 0; b < nblocks; b++) {
+                block_q2_K *blk = (block_q2_K *)((uint8_t *)ptr + b * sizeof(block_q2_K));
+                blk->d = GGUF_LE16(blk->d);
+                blk->dmin = GGUF_LE16(blk->dmin);
+            }
+        } else if (qt == GGUF_TYPE_IQ4_XS) {
+            size_t nblocks = nrows / 256;
+            for (size_t b = 0; b < nblocks; b++) {
+                block_iq4_xs *blk = (block_iq4_xs *)((uint8_t *)ptr + b * sizeof(block_iq4_xs));
+                blk->d = GGUF_LE16(blk->d);
+            }
+        } else if (qt == GGUF_TYPE_Q5_0) {
+            size_t nblocks = nrows / 32;
+            for (size_t b = 0; b < nblocks; b++) {
+                block_q5_0 *blk = (block_q5_0 *)((uint8_t *)ptr + b * sizeof(block_q5_0));
+                blk->d = GGUF_LE16(blk->d);
+            }
+        } else if (qt == GGUF_TYPE_Q5_1) {
+            size_t nblocks = nrows / 32;
+            for (size_t b = 0; b < nblocks; b++) {
+                block_q5_1 *blk = (block_q5_1 *)((uint8_t *)ptr + b * sizeof(block_q5_1));
+                blk->d = GGUF_LE16(blk->d);
+                blk->m = GGUF_LE16(blk->m);
+            }
+        } else if (qt == GGUF_TYPE_Q6_0) {
+            size_t nblocks = nrows / 32;
+            for (size_t b = 0; b < nblocks; b++) {
+                block_q6_0 *blk = (block_q6_0 *)((uint8_t *)ptr + b * sizeof(block_q6_0));
+                blk->d = GGUF_LE16(blk->d);
+            }
+        } else if (qt == GGUF_TYPE_Q4_1) {
+            /* Q4_1: 1 FP16 delta + 1 FP16 min per block (20 bytes, 32 values) */
+            size_t nblocks = nrows / 32;
+            for (size_t b = 0; b < nblocks; b++) {
+                block_q4_1 *blk = (block_q4_1 *)((uint8_t *)ptr + b * sizeof(block_q4_1));
+                blk->d = GGUF_LE16(blk->d);
+                blk->m = GGUF_LE16(blk->m);
+            }
+        } else if (qt == GGUF_TYPE_Q8_0_R8 || qt == (gguf_type_t)208) {
+            size_t nblocks = nrows / 256;
+            for (size_t b = 0; b < nblocks; b++) {
+                block_q8_0_r8 *blk = (block_q8_0_r8 *)((uint8_t *)ptr + b * sizeof(block_q8_0_r8));
+                for (int r = 0; r < 8; r++) blk->d[r] = GGUF_LE16(blk->d[r]);
+            }
+        } else if (qt == GGUF_TYPE_IQ4_NL_R4) {
+            size_t nblocks = nrows / 128;
+            for (size_t b = 0; b < nblocks; b++) {
+                block_iq4_nl_r4 *blk = (block_iq4_nl_r4 *)((uint8_t *)ptr + b * sizeof(block_iq4_nl_r4));
+                for (int r = 0; r < 4; r++) blk->d[r] = GGUF_LE16(blk->d[r]);
+            }
+        } else {
+            fprintf(stderr, "WARNING: big-endian BE swap: unsupported tensor type %u (%s) for tensor '%.*s' -- data will be corrupted\n",
+                    (unsigned)qt, gguf_type_name(qt), (int)tinfos[i].name.len, tinfos[i].name.str);
+        }
+    }
+        fprintf(stderr, "Big-endian: swap done (%.0fms)\n", (clock() - be_start) / (double)CLOCKS_PER_SEC * 1000);
+
+        /* Restore mmap regions to read-only */
+        for (int _si = 0; _si < m->n_splits; _si++) {
+            if (m->splits[_si].mmap_addr && m->splits[_si].mmap_size > 0) {
+                mprotect(m->splits[_si].mmap_addr, m->splits[_si].mmap_size, PROT_READ);
+            }
+        }
+    } else {
+        fprintf(stderr, "Big-endian: pre-processed (.ffug), skipping swap\n");
+    }
+#endif
+
+    free(tinfos);
+    return 0;
+}

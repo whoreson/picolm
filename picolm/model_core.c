@@ -2709,8 +2709,9 @@ static void repack_model_weights_q4_0x8(model_t *m) {
 float *model_forward_gemma3n(model_t *m, int token, int pos);
 float *model_forward_glm5(model_t *m, int token, int pos);
 float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens, int start_pos, volatile int *interrupt);
-/* ---- SenseNova-Loop forward pass (mHC 2-stream routing + looped blocks) ---- */
-float *model_forward_sensenova(model_t *m, int token, int pos);
+/* ---- SenseNova-Loop forward pass (mHC 2-stream routing + looped blocks) ----
+ * model_forward_sensenova is declared in model_internal.h along with the
+ * shared mHC router-finish / merge primitives. */
 
 /* ---- GPT-2 forward pass (specialized) ---- */
 /* PICOLM_DBG_LAYER=<pos> / PICOLM_DBG_LAYER_N=<n>: dump the per-layer residual
@@ -5061,6 +5062,47 @@ static void batch_add_task(int idx, void *ctxp) {
     for (int d2 = 0; d2 < ctx->dim; d2++) a[d2] += b[d2];
 }
 
+/* ---- SenseNova mHC batched-prefill tasks ----
+ * Router finish: raw8[t][8] (GEMM output, no rms/bias) -> gates[t][8]
+ * (in place, 6 used) + branch[t] = pre0*a[t] + pre1*b[t]. One token per
+ * task; the sinkhorn/sigmoid math is shared with the decode path via
+ * mhc_route_finish() (model_sensenova.c) so the two paths cannot drift. */
+typedef struct {
+    float *branch, *gates;
+    const float *a, *b, *raw8, *bias;
+    int dim;
+} mhc_route_ctx_t;
+
+static void mhc_route_task(int idx, void *ctxp) {
+    mhc_route_ctx_t *ctx = (mhc_route_ctx_t *)ctxp;
+    mhc_route_finish(ctx->branch + (size_t)idx * ctx->dim,
+                     ctx->gates + (size_t)idx * 8,
+                     ctx->a + (size_t)idx * ctx->dim,
+                     ctx->b + (size_t)idx * ctx->dim,
+                     ctx->raw8 + (size_t)idx * 8,
+                     ctx->bias, ctx->dim);
+}
+
+/* Merge: a' = m00*a + m01*b + post0*y; b' = m10*a + m11*b + post1*y.
+ * a == x_batch row, b == strb row (both updated in place), y == sublayer
+ * output row (xb2_batch). When avg_exit is set (kind-2 exit block) the
+ * streams are additionally averaged into a, matching the decode path. */
+typedef struct {
+    float *a, *b;
+    const float *y, *gates;
+    int dim, avg_exit;
+} mhc_merge_ctx_t;
+
+static void mhc_merge_task(int idx, void *ctxp) {
+    mhc_merge_ctx_t *ctx = (mhc_merge_ctx_t *)ctxp;
+    float *a = ctx->a + (size_t)idx * ctx->dim;
+    float *b = ctx->b + (size_t)idx * ctx->dim;
+    mhc_merge_rows(a, b, a, b, ctx->y + (size_t)idx * ctx->dim,
+                   ctx->gates + (size_t)idx * 8, ctx->dim);
+    if (ctx->avg_exit)
+        for (int d2 = 0; d2 < ctx->dim; d2++) a[d2] = 0.5f * (a[d2] + b[d2]);
+}
+
 /* Per-token RoPE + KV-cache store for batched prefill (CPU path). Mirrors the serial loop in
  * model_forward_prefill token for token: tokens are independent here (each writes its own Q/K/V
  * rows and its own KV cache row), so the loop runs on the thread pool instead of the main thread.
@@ -5732,18 +5774,11 @@ float *model_forward_prefill_range(model_t *m, const int *tokens, int n_tokens, 
         g_is_prefill = 0;
         return m->state.logits;
     }
-    /* SenseNova-Loop: batched prefill not yet implemented -- per-token
-     * fallback (mHC routing is per-token stateful across layers; batching
-     * needs the route/merge hoisted into the batch loop). */
-    if (m->config.is_sensenova_loop) {
-        g_is_prefill = 1;
-        for (int i = 0; i < n_tokens; i++) {
-            if (interrupt && *interrupt) break;
-            (void)model_forward(m, tokens[i], start_pos + i);
-        }
-        g_is_prefill = 0;
-        return m->state.logits;
-    }
+    /* SenseNova-Loop: batched prefill lives in model_forward_prefill_range
+     * (mHC route/merge batched; GDN cores per-token via mhc_sublayer_only).
+     * PICOLM_MHC_TOKENWISE=1 forces the mHC layer bodies through the decode
+     * path (sensenova_layer) for output-parity debugging. */
+
     /* GLM-5: batched prefill (KDA projections batched, sequential KDA tail,
      * per-token MLA). Falls back to the per-token path if the prefill arena
      * is missing or the chunk size is exceeded. */
@@ -5822,7 +5857,8 @@ float *model_forward_prefill_range(model_t *m, const int *tokens, int n_tokens, 
      * The multi-float region comment at each declaration should stay either
      * way; it is currently the only record of the intended stride. */
     size_t sz = bs * (dim + max_dim + dim + q_full_dim + 2 * kv_dim +
-                      2 * ffn_buf_size + q_full_dim + q_dim);
+                      2 * ffn_buf_size + q_full_dim + q_dim +
+                      (c->is_sensenova_loop ? 4 * dim + 8 : 0));
     float *buf = (float *)malloc(sz * sizeof(float));
     if (!buf) { fprintf(stderr, "OOM: prefill batch\n"); exit(1); }
     float *p = buf;
@@ -5855,6 +5891,18 @@ float *model_forward_prefill_range(model_t *m, const int *tokens, int n_tokens, 
      * touches hb2_batch, but it made the stride of hb2_batch impossible to
      * reason about. Give the gate its own allocation. */
     float *gate_batch = p; p += bs * q_dim;
+
+    /* SenseNova mHC batched-prefill scratch: second residual stream,
+     * routed branch (norm source for the sublayers), router GEMM input
+     * concat [a;b] (2*dim), router raw logits (8 per token, gates are
+     * formed in place by mhc_route_finish). Unused on other models. */
+    float *mhc_strb = NULL, *mhc_branch = NULL, *mhc_concat = NULL, *mhc_routl = NULL;
+    if (c->is_sensenova_loop) {
+        mhc_strb   = p; p += bs * (size_t)dim;
+        mhc_branch = p; p += bs * (size_t)dim;
+        mhc_concat = p; p += bs * (size_t)2 * dim;
+        mhc_routl  = p; p += bs * 8;
+    }
 
     /* Embedding lookup. With do_embed == 0 the caller supplies the residual in
      * x_in ([n_tokens][x_in_stride]) -- BATCHED, so it goes into x_batch, which
@@ -5924,6 +5972,10 @@ float *model_forward_prefill_range(model_t *m, const int *tokens, int n_tokens, 
 
     /* Profiling counters */
     int attn_ordinal = 0; /* KV cache ordinal for attention layers (SSM models) */
+    /* SenseNova mHC: A/B fallback to the per-token decode body
+     * (sensenova_layer) inside the prefill loop, for output-parity
+     * debugging of the batched route/merge path. */
+    const int mhc_prefill_tokenwise = getenv("PICOLM_MHC_TOKENWISE") != NULL;
 #ifdef PICOLM_GPU
     int gpu_ok = m->gpu.active;
     int gpu_dev = m->gpu.device;
@@ -5983,27 +6035,155 @@ float *model_forward_prefill_range(model_t *m, const int *tokens, int n_tokens, 
         }
 #endif
 
-        /* SenseNova-Loop mHC blocks (kinds 1/4/2): the route/merge chain is
-         * sequential per token but each token is independent, so run the
-         * decode layer body per token over the batch. Kind-0 (plain) layers
-         * fall through to the fully batched path below. The mHC stream
-         * state (streams_active) is a property of the layer-kind sequence,
-         * identical for every token, so it is tracked once per layer.
-         * Scratch: sensenova_layer() works in s->x/s->xb/s->xb2/s->hb/s->hb2,
-         * none of which are live across layer iterations of this loop. */
-        if (c->is_sensenova_loop && c->mhc_layer_kinds[l] != 0) {
-            /* kind 1 seeds both streams from the residual; kind 2 merges
-             * them back into x and resets. Interior (4) carries them.
-             * streams_active ON ENTRY to layer l: the loop segments are
-             * contiguous ([first_enter .. start2+shift)), so the state is
-             * "inside" for every l past the first enter, up to the last
-             * exit. kind-1 layers reseed regardless, kind-2 clears after
-             * the merge, so this one value is exact for all cases. */
-            int streams_active =
-                (l > c->mhc_loop_first && l < c->mhc_loop_start2 + c->mhc_loop_shift);
+        /* SenseNova-Loop mHC blocks (kinds 1/4/2), fully batched: the router
+         * GEMMs run through matmul_batch ([n,2*dim] x [2*dim,8], F32), the
+         * per-token router finish (rms scale + bias + sinkhorn + branch
+         * formation) and the merges run as tensor_parallel_for tasks, and
+         * the sublayers reuse the batched machinery:
+         *   - attention sublayers fall through to the shared batched
+         *     attention + FFN block below, with the norm sources and the
+         *     two residual adds swapped for route/merge (mhc_attn flag);
+         *   - GDN sublayers run per-token ssm_forward with
+         *     mhc_sublayer_only=1 (core only: norm + conv/state + out
+         *     proj, no residual, no FFN -- matching the Qwen3.5 SSM-layer
+         *     prefill default, which is also per-token), then a batched
+         *     FFN tail.
+         * Stream layout per token: a = x_batch row, b = mhc_strb row.
+         * kind 1 seeds b = a; kind 4 carries; kind 2 merges and folds
+         * the average into a. Kind-0 layers fall through untouched.
+         * Scratch: sensenova_layer()/s->x is NOT used here; per-token
+         * GDN cores borrow s->x/s->xb2 which are dead across layer
+         * iterations of this loop. */
+        if (c->is_sensenova_loop && c->mhc_layer_kinds[l] != 0 &&
+            !mhc_prefill_tokenwise) {
+            const uint8_t mhc_kind = c->mhc_layer_kinds[l];
+            const int mhc_gdn = c->has_ssm && !lw->is_attn_layer;
+            const size_t dim4 = (size_t)dim * sizeof(float);
+
+            if (mhc_kind == 1) {
+                /* enter: both streams start from the block input */
+                memcpy(mhc_strb, x_batch, (size_t)n_tokens * dim * sizeof(float));
+            }
+            if (getenv("PICOLM_MHC_DBG") && l == 4) {
+                fprintf(stderr, "[MHC-BATCH l=4 t0] x_in[:4]=%.6f,%.6f,%.6f,%.6f strb[:4]=%.6f,%.6f,%.6f,%.6f\n",
+                        x_batch[0], x_batch[1], x_batch[2], x_batch[3],
+                        mhc_strb[0], mhc_strb[1], mhc_strb[2], mhc_strb[3]);
+            }
+
+            /* ---- sublayer 1 router: concat [a;b] -> GEMM -> finish ---- */
             for (bi = 0; bi < n_tokens; bi++) {
+                memcpy(mhc_concat + (size_t)bi * 2 * dim, x_batch + (size_t)bi * dim, dim4);
+                memcpy(mhc_concat + (size_t)bi * 2 * dim + dim, mhc_strb + (size_t)bi * dim, dim4);
+            }
+            tensor_set_repacked(NULL);
+            matmul_batch(mhc_routl, mhc_concat, n_tokens, lw->mhc_attn_w, 2 * dim, 8, GGUF_TYPE_F32);
+            {
+                mhc_route_ctx_t rc = { mhc_branch, mhc_routl, x_batch, mhc_strb,
+                                       mhc_routl, (const float *)lw->mhc_attn_b, dim };
+                tensor_parallel_for(n_tokens, mhc_route_task, &rc);
+            }
+            if (getenv("PICOLM_MHC_DBG") && l == 4) {
+                fprintf(stderr, "[MHC-BATCH l=4 t0] branch[:4]=%.6f,%.6f,%.6f,%.6f gates=%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
+                        mhc_branch[0], mhc_branch[1], mhc_branch[2], mhc_branch[3],
+                        mhc_routl[0], mhc_routl[1], mhc_routl[2], mhc_routl[3], mhc_routl[4], mhc_routl[5]);
+            }
+
+            if (mhc_gdn) {
+                /* GDN core per token: y1 -> xb_batch (dim stride; the
+                 * attention block that owns xb_batch's max_dim stride is
+                 * skipped on these layers). */
+                for (bi = 0; bi < n_tokens; bi++) {
+                    memcpy(s->x, mhc_branch + (size_t)bi * dim, dim4);
+                    s->mhc_sublayer_only = 1;
+                    ssm_forward(m, s, s->x, s->xb2, lw, l, start_pos + bi, NULL);
+                    s->mhc_sublayer_only = 0;
+                    memcpy(xb_batch + (size_t)bi * dim, s->xb2, dim4);
+                }
+                /* merge 1: streams += routed y1 */
+                {
+                    mhc_merge_ctx_t mc = { x_batch, mhc_strb, xb_batch, mhc_routl, dim, 0 };
+                    tensor_parallel_for(n_tokens, mhc_merge_task, &mc);
+                }
+                /* ---- sublayer 2 router (FFN) ---- */
+                for (bi = 0; bi < n_tokens; bi++) {
+                    memcpy(mhc_concat + (size_t)bi * 2 * dim, x_batch + (size_t)bi * dim, dim4);
+                    memcpy(mhc_concat + (size_t)bi * 2 * dim + dim, mhc_strb + (size_t)bi * dim, dim4);
+                }
+                matmul_batch(mhc_routl, mhc_concat, n_tokens, lw->mhc_ffn_w, 2 * dim, 8, GGUF_TYPE_F32);
+                {
+                    mhc_route_ctx_t rc = { mhc_branch, mhc_routl, x_batch, mhc_strb,
+                                           mhc_routl, (const float *)lw->mhc_ffn_b, dim };
+                    tensor_parallel_for(n_tokens, mhc_route_task, &rc);
+                }
+                /* batched FFN sublayer: norm(branch) -> gate/up -> silu*mul -> down */
+                {
+                    batch_rmsnorm_ctx_t fc = { xb_batch, mhc_branch, s->post_attn_norm_w[l], dim, c->rms_norm_eps };
+                    tensor_parallel_for(n_tokens, batch_rmsnorm_task, &fc);
+                }
+                matmul_dual_batch(hb_batch, hb2_batch, xb_batch, n_tokens,
+                                  lw->ffn_gate, lw->ffn_up, dim, n_ffn,
+                                  lw->type_ffn_gate, lw->type_ffn_up);
+                {
+                    silu_mul_ctx_t sctx = { hb_batch, hb2_batch, n_ffn };
+                    tensor_parallel_for(n_tokens, silu_mul_task, &sctx);
+                }
+                matmul_batch(xb2_batch, hb_batch, n_tokens, lw->ffn_down, n_ffn, dim, lw->type_ffn_down);
+                /* merge 2 (+ exit average on kind-2 blocks) */
+                {
+                    mhc_merge_ctx_t mc = { x_batch, mhc_strb, xb2_batch, mhc_routl, dim,
+                                           mhc_kind == 2 };
+                    tensor_parallel_for(n_tokens, mhc_merge_task, &mc);
+                }
+                steer_hook(l, x_batch, n_tokens, dim, start_pos);
+#ifdef PICOLM_VIZ
+                viz_push_batch(l, start_pos, x_batch, n_tokens, dim);
+#endif
+                BENCH_LAYER_END(l, 1);
+                if (_PICOLM_DBG_RUNTIME && (l < 3 || l == c->n_layers - 1
+                                            || getenv("PICOLM_SSM_DBG")[0] == '2')) {
+                    int lt = n_tokens - 1;
+                    fprintf(stderr, "[CPU PFX l=%d] bx_last[:4]={%.6f,%.6f,%.6f,%.6f}\n", l, x_batch[(size_t)lt*dim], x_batch[(size_t)lt*dim+1], x_batch[(size_t)lt*dim+2], x_batch[(size_t)lt*dim+3]);
+                }
+                continue;
+            }
+
+            /* mHC attention layer: fall through to the shared batched
+             * attention + FFN block. mhc_attn (declared below, outside the
+             * if) swaps the norm sources and the residual adds for
+             * route/merge. gates1 live in mhc_routl until the
+             * post-attention hook runs router 2. */
+        }
+        const int mhc_attn = c->is_sensenova_loop && c->mhc_layer_kinds[l] != 0
+                             && !(c->has_ssm && !lw->is_attn_layer);
+        const int mhc_exit = mhc_attn && c->mhc_layer_kinds[l] == 2;
+        const size_t dim4 = (size_t)dim * sizeof(float);
+
+        /* A/B fallback: run the mHC layer bodies per token through the
+         * decode path (sensenova_layer). Slower (per-token GDN cores AND
+         * per-token attention/FFN), but bit-comparable to model_forward_
+         * range for parity debugging of the batched route/merge above. */
+        if (c->is_sensenova_loop && c->mhc_layer_kinds[l] != 0 &&
+            mhc_prefill_tokenwise) {
+            const uint8_t tk = c->mhc_layer_kinds[l];
+            for (bi = 0; bi < n_tokens; bi++) {
+                /* streams_active MUST be recomputed per token: it is passed
+                 * by pointer and sensenova_layer mutates it (kind-1 seeds,
+                 * kind-2 clears). Sharing one variable across the token loop
+                 * let token 0's kind-2 exit clear the flag for tokens 1..n,
+                 * which then RESEEDED str_b at the same kind-2 layer instead
+                 * of merging the carried streams. */
+                int streams_active =
+                    (l > c->mhc_loop_first && l < c->mhc_loop_start2 + c->mhc_loop_shift);
                 memcpy(s->x, x_batch + (size_t)bi * dim, dim * sizeof(float));
+                /* The second mHC stream is per-token state that must persist
+                 * across layers: spill/restore it around each token's layer
+                 * body (s->mhc_str_b holds ONE token's stream). Kind-1 seeds
+                 * it from x inside the layer; kind-2 leaves it dead. */
+                if (tk != 1)
+                    memcpy(s->mhc_str_b, mhc_strb + (size_t)bi * dim, dim * sizeof(float));
                 sensenova_layer(m, s, l, start_pos + bi, &streams_active);
+                if (tk != 2)
+                    memcpy(mhc_strb + (size_t)bi * dim, s->mhc_str_b, dim * sizeof(float));
                 memcpy(x_batch + (size_t)bi * dim, s->x, dim * sizeof(float));
             }
             steer_hook(l, x_batch, n_tokens, dim, start_pos);
@@ -6011,6 +6191,12 @@ float *model_forward_prefill_range(model_t *m, const int *tokens, int n_tokens, 
             viz_push_batch(l, start_pos, x_batch, n_tokens, dim);
 #endif
             BENCH_LAYER_END(l, 1);
+            if (_PICOLM_DBG_RUNTIME && (l < 3 || l == c->n_layers - 1
+                                        || getenv("PICOLM_SSM_DBG")[0] == '2')) {
+                int lt = n_tokens - 1;
+                fprintf(stderr, "[CPU PFX l=%d] bx_last[:4]={%.6f,%.6f,%.6f,%.6f}\n", l, x_batch[(size_t)lt*dim], x_batch[(size_t)lt*dim+1], x_batch[(size_t)lt*dim+2], x_batch[(size_t)lt*dim+3]);
+                fprintf(stderr, "[CPU PFX l=%d] bx_tok0 [:4]={%.6f,%.6f,%.6f,%.6f}\n", l, x_batch[0], x_batch[1], x_batch[2], x_batch[3]);
+            }
             continue;
         }
 
@@ -6051,14 +6237,17 @@ float *model_forward_prefill_range(model_t *m, const int *tokens, int n_tokens, 
         }
 
         PP_BEGIN();
-        /* LayerNorm for GPT-2/StableLM, RMSNorm for others (parallelized over tokens) */
+        /* LayerNorm for GPT-2/StableLM, RMSNorm for others (parallelized over tokens)
+         * SenseNova mHC attention layers: norm source is the routed branch
+         * (mhc_branch), not the residual stream x_batch. */
         if (c->is_gpt2 || c->is_stablelm) {
             for (bi = 0; bi < n_tokens; bi++) {
                 layernorm(xb_batch + bi * dim, x_batch + bi * dim,
                           s->attn_norm_w[l], s->attn_norm_b[l], dim, c->rms_norm_eps);
             }
         } else {
-            batch_rmsnorm_ctx_t rctx = { xb_batch, x_batch, s->attn_norm_w[l], dim, c->rms_norm_eps };
+            batch_rmsnorm_ctx_t rctx = { xb_batch, mhc_attn ? mhc_branch : x_batch,
+                                         s->attn_norm_w[l], dim, c->rms_norm_eps };
             tensor_parallel_for(n_tokens, batch_rmsnorm_task, &rctx);
         }
         /* Save normalized input for parallel residual FFN */
@@ -6451,8 +6640,28 @@ float *model_forward_prefill_range(model_t *m, const int *tokens, int n_tokens, 
         }
                 tensor_set_repacked(NULL);
 
-        /* Residual: x += attn_out (deferred for parallel residual) */
-        if (!c->use_parallel_residual) {
+        /* Residual: x += attn_out (deferred for parallel residual).
+         * SenseNova mHC attention layers: the attention output y (xb2_batch)
+         * is NOT added -- it is routed into the two streams (merge 1), then
+         * router 2 forms the FFN branch from the updated streams. gates1
+         * (attn router) are replaced in mhc_routl by gates2 (FFN router). */
+        if (mhc_attn) {
+            {
+                mhc_merge_ctx_t mc = { x_batch, mhc_strb, xb2_batch, mhc_routl, dim, 0 };
+                tensor_parallel_for(n_tokens, mhc_merge_task, &mc);
+            }
+            for (bi = 0; bi < n_tokens; bi++) {
+                memcpy(mhc_concat + (size_t)bi * 2 * dim, x_batch + (size_t)bi * dim, dim4);
+                memcpy(mhc_concat + (size_t)bi * 2 * dim + dim, mhc_strb + (size_t)bi * dim, dim4);
+            }
+            tensor_set_repacked(NULL);
+            matmul_batch(mhc_routl, mhc_concat, n_tokens, lw->mhc_ffn_w, 2 * dim, 8, GGUF_TYPE_F32);
+            {
+                mhc_route_ctx_t rc = { mhc_branch, mhc_routl, x_batch, mhc_strb,
+                                       mhc_routl, (const float *)lw->mhc_ffn_b, dim };
+                tensor_parallel_for(n_tokens, mhc_route_task, &rc);
+            }
+        } else if (!c->use_parallel_residual) {
             batch_add_ctx_t ac = { x_batch, xb2_batch, dim };
             tensor_parallel_for(n_tokens, batch_add_task, &ac);
         }
@@ -6474,9 +6683,11 @@ float *model_forward_prefill_range(model_t *m, const int *tokens, int n_tokens, 
                 for (int d2 = 0; d2 < dim; d2++) a[d2] += b[d2];
             }
         } else {
-            /* FFN RMSNorm (skip for parallel residual: uses saved normalized input) */
+            /* FFN RMSNorm (skip for parallel residual: uses saved normalized input).
+             * SenseNova mHC: norm source is the FFN router's branch. */
             if (!c->use_parallel_residual) {
-                batch_rmsnorm_ctx_t fc = { xb_batch, x_batch, s->post_attn_norm_w[l], dim, c->rms_norm_eps };
+                batch_rmsnorm_ctx_t fc = { xb_batch, mhc_attn ? mhc_branch : x_batch,
+                                           s->post_attn_norm_w[l], dim, c->rms_norm_eps };
                 tensor_parallel_for(n_tokens, batch_rmsnorm_task, &fc);
             }
 
@@ -6525,8 +6736,16 @@ float *model_forward_prefill_range(model_t *m, const int *tokens, int n_tokens, 
             } else {
                 matmul_batch(xb2_batch, hb_batch, n_tokens, lw->ffn_down, n_ffn, dim, lw->type_ffn_down);
                 tensor_set_repacked(NULL);
-                /* Residual: x += ffn_out */
-                { batch_add_ctx_t fa = { x_batch, xb2_batch, dim }; tensor_parallel_for(n_tokens, batch_add_task, &fa); }
+                /* Residual: x += ffn_out. SenseNova mHC: routed merge into
+                 * both streams instead; kind-2 (exit) blocks then fold the
+                 * average of the two streams into x_batch. */
+                if (mhc_attn) {
+                    mhc_merge_ctx_t mc = { x_batch, mhc_strb, xb2_batch, mhc_routl, dim, mhc_exit };
+                    tensor_parallel_for(n_tokens, mhc_merge_task, &mc);
+                } else {
+                    batch_add_ctx_t fa = { x_batch, xb2_batch, dim };
+                    tensor_parallel_for(n_tokens, batch_add_task, &fa);
+                }
             }
         }
         steer_hook(l, x_batch, n_tokens, dim, start_pos);
@@ -6537,9 +6756,11 @@ float *model_forward_prefill_range(model_t *m, const int *tokens, int n_tokens, 
 #ifdef PICOLM_VIZ
         viz_push_batch(l, start_pos, x_batch, n_tokens, dim);
 #endif
-        if (_PICOLM_DBG_RUNTIME && (l < 3 || l == c->n_layers - 1)) {
+        if (_PICOLM_DBG_RUNTIME && (l < 3 || l == c->n_layers - 1
+                                    || getenv("PICOLM_SSM_DBG")[0] == '2')) {
             int lt = n_tokens - 1;
             fprintf(stderr, "[CPU PFX l=%d] bx_last[:4]={%.6f,%.6f,%.6f,%.6f}\n", l, x_batch[lt*dim], x_batch[lt*dim+1], x_batch[lt*dim+2], x_batch[lt*dim+3]);
+            fprintf(stderr, "[CPU PFX l=%d] bx_tok0 [:4]={%.6f,%.6f,%.6f,%.6f}\n", l, x_batch[0], x_batch[1], x_batch[2], x_batch[3]);
         }
         BENCH_LAYER_END(l, 1);
     }
