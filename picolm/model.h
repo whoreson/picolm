@@ -231,6 +231,13 @@ typedef struct {
     void *ssm_conv1d;          /* SSM: [d_conv x conv_dim] f32 */
     void *ssm_alpha;           /* SSM: [dim x dt_rank] f32 or quantized */
     void *ssm_beta;            /* SSM: [dim x dt_rank] f32 or quantized */
+    /* SenseNova-Loop mHC router weights: F32, present only on mHC layers
+     * (mhc_layer_kinds[l] != 0). Loop-aliased layers (28..51) share the
+     * same host tensors as 4..27 -- the upload dedups by host pointer. */
+    void *mhc_attn_w;          /* [2*n_embd, 8] F32 router weights (attn sublayer) */
+    void *mhc_attn_b;          /* [8] F32 router bias */
+    void *mhc_ffn_w;           /* [2*n_embd, 8] F32 router weights (FFN sublayer) */
+    void *mhc_ffn_b;           /* [8] F32 router bias */
 } gpu_layer_weights_t;
 
 typedef struct {

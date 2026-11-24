@@ -1953,6 +1953,7 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
             int q_dim = c->n_heads * c->head_dim;
             int kv_dim = c->n_kv_heads * c->head_dim;
             int uploaded = 0, attempted = 0;
+            const int mhc_dim = c->n_embd;   /* mHC router rows are [2*n_embd, 8] */
             /* PICOLM_NGL: number of GPU layers (like llama.cpp -ngl, 0 or -1 = all) */
             int ngl = c->n_layers;
             { const char *ngl_env = getenv("PICOLM_NGL");
@@ -2083,6 +2084,68 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                                 lw->ssm_out, lw->type_ssm_out, c->ssm_d_inner, c->n_embd, device)) uploaded++;
                     }
                 }
+                /* SenseNova-Loop mHC router weights: tiny F32 tensors, only
+                 * on mHC layers (kind != 0). The loop-aliased layers 28..51
+                 * share host pointers with 4..27 (model_gguf.c copies the
+                 * layer_weights_t), so dedup by host pointer to avoid
+                 * uploading the same [2*dim, 8] matrix twice per pair. */
+                if (c->is_sensenova_loop && c->mhc_layer_kinds[l] != 0) {
+                    /* mhc_attn_w: [2*n_embd, 8] F32 -- row k packs
+                     * [a_weights(n_embd), b_weights(n_embd)] for logit k.
+                     * Dedup by host pointer: loop-aliased layers share
+                     * layer_weights_t contents, so an earlier layer with the
+                     * same host pointer already holds the device copy. */
+                    if (lw->mhc_attn_w) {
+                        attempted++;
+                        void *dev = NULL;
+                        for (int p = 0; p < l && !dev; p++) {
+                            if (m->weights.layers[p].mhc_attn_w == lw->mhc_attn_w &&
+                                m->gpu.layers[p].mhc_attn_w)
+                                dev = m->gpu.layers[p].mhc_attn_w;
+                        }
+                        if (dev) { gl->mhc_attn_w = dev; uploaded++; }
+                        else if (picolm_gpu_tensor_upload(&gl->mhc_attn_w,
+                                lw->mhc_attn_w, GGUF_TYPE_F32, 2 * mhc_dim, 8, device)) uploaded++;
+                    }
+                    if (lw->mhc_attn_b) {
+                        attempted++;
+                        float *dev = NULL;
+                        for (int p = 0; p < l && !dev; p++) {
+                            if (m->weights.layers[p].mhc_attn_b == lw->mhc_attn_b &&
+                                m->gpu.layers[p].mhc_attn_b)
+                                dev = (float *)m->gpu.layers[p].mhc_attn_b;
+                        }
+                        if (dev) { gl->mhc_attn_b = dev; uploaded++; }
+                        else gl->mhc_attn_b = picolm_gpu_upload_f32(
+                            (const float *)lw->mhc_attn_b, 8, device);
+                        if (gl->mhc_attn_b) uploaded++;
+                    }
+                    if (lw->mhc_ffn_w) {
+                        attempted++;
+                        void *dev = NULL;
+                        for (int p = 0; p < l && !dev; p++) {
+                            if (m->weights.layers[p].mhc_ffn_w == lw->mhc_ffn_w &&
+                                m->gpu.layers[p].mhc_ffn_w)
+                                dev = m->gpu.layers[p].mhc_ffn_w;
+                        }
+                        if (dev) { gl->mhc_ffn_w = dev; uploaded++; }
+                        else if (picolm_gpu_tensor_upload(&gl->mhc_ffn_w,
+                                lw->mhc_ffn_w, GGUF_TYPE_F32, 2 * mhc_dim, 8, device)) uploaded++;
+                    }
+                    if (lw->mhc_ffn_b) {
+                        attempted++;
+                        float *dev = NULL;
+                        for (int p = 0; p < l && !dev; p++) {
+                            if (m->weights.layers[p].mhc_ffn_b == lw->mhc_ffn_b &&
+                                m->gpu.layers[p].mhc_ffn_b)
+                                dev = (float *)m->gpu.layers[p].mhc_ffn_b;
+                        }
+                        if (dev) { gl->mhc_ffn_b = dev; uploaded++; }
+                        else gl->mhc_ffn_b = picolm_gpu_upload_f32(
+                            (const float *)lw->mhc_ffn_b, 8, device);
+                        if (gl->mhc_ffn_b) uploaded++;
+                    }
+                }
             }
 
             /* Bridge per-layer GPU tensor pointers to the global SSM arrays.
@@ -2140,6 +2203,15 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                      * Spark support; the weights are still uploaded so that work
                      * can start from a warm cache. */
                     if (c->is_spark25) { eligible = 0; el_reason = 9; }
+                    /* SenseNova-Loop: the mHC 2-stream router (per-layer
+                     * [2*n_embd,8] F32 GEMM + 20-iteration sinkhorn normalize
+                     * + 2-stream merge) and the looped weight-reuse blocks
+                     * (28..51 aliasing 4..27) have no GPU forward kernels.
+                     * Running model_forward_gpu would compute a plain
+                     * Qwen3.5-SSM network without the routing and emit
+                     * fluent-looking garbage. Veto; the router weights are
+                     * still uploaded so kernel work starts from a warm cache. */
+                    if (c->is_sensenova_loop) { eligible = 0; el_reason = 10; }
                     /* PICOLM_NGL with a partial layer count is NOT supported by
                      * the GPU pipeline. n_gpu_layers only limits how many layers
                      * get uploaded; model_forward_gpu()/_prefill_gpu_ubatch()
@@ -2497,6 +2569,8 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                         else if (el_reason == 2) reason = "KV cache not F16 (GPU attention requires F16 std430)";
                         else if (el_reason == 9) reason = "Spark-X2.5 not implemented by the GPU decode pipeline "
                                                         "(no head-wise attn gate / per-layer SWA rope dim)";
+                        else if (el_reason == 10) reason = "SenseNova-Loop mHC routing has no GPU kernels "
+                                                           "(weights uploaded, forward pass pending)";
                         else if (el_reason == 11) reason = "PICOLM_NGL is a partial layer count and the GPU "
                                                          "pipeline has no hybrid CPU/GPU layer split "
                                                          "(unset PICOLM_NGL to use the GPU)";
