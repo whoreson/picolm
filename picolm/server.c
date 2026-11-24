@@ -2644,6 +2644,51 @@ static const char *GR_THINK_C  = "\x3C\x2F\x74\x68\x69\x6E\x6B\x3E";     /* thin
 static const char *GR_TOOL_O   = "\x3C\x74\x6F\x6F\x6C\x5F\x72\x65\x73\x70\x6F\x6E\x73\x65\x3E"; /* tool_response open (100272) */
 static const char *GR_TOOL_C   = "\x3C\x2F\x74\x6F\x6F\x6C\x5F\x72\x65\x73\x70\x6F\x6E\x73\x65\x3E"; /* tool_response close (100273) */
 
+/* ------------------------------------------------------------- */
+/* Growable chat-template buffer.  Used by all three *_chat_build()
+ * functions to eliminate the unchecked-strcat + rough-estimate pattern
+ * that overflowed on long conversations with tool calls (overflow.txt). */
+/* ------------------------------------------------------------- */
+typedef struct { char *buf; size_t len; size_t cap; } chat_buf_t;
+
+static void cb_init(chat_buf_t *b) {
+    b->cap = 1024; b->buf = (char *)malloc(b->cap); b->len = 0;
+    if (b->buf) b->buf[0] = '\0';
+}
+static char *cb_release(chat_buf_t *b) {
+    if (b->buf) b->buf[b->len] = '\0';
+    char *r = b->buf; b->buf = NULL; b->len = b->cap = 0;
+    return r;
+}
+/* Ensure at least *extra* bytes are free.  Returns 0 on OOM. */
+static int cb_reserve(chat_buf_t *b, size_t extra) {
+    if (b->cap - b->len >= extra) return 1;
+    size_t nc = b->cap * 2;
+    if (nc - b->len < extra) nc = b->len + extra + 256;
+    char *nb = (char *)realloc(b->buf, nc);
+    if (!nb) return 0;
+    b->buf = nb; b->cap = nc;
+    return 1;
+}
+static int cb_append(chat_buf_t *b, const char *s) {
+    size_t sl = strlen(s);
+    if (!cb_reserve(b, sl + 1)) return 0;
+    memcpy(b->buf + b->len, s, sl + 1); b->len += sl;
+    return 1;
+}
+static int cb_append_n(chat_buf_t *b, const char *s, size_t n) {
+    if (!cb_reserve(b, n + 1)) return 0;
+    memcpy(b->buf + b->len, s, n); b->buf[b->len + n] = '\0'; b->len += n;
+    return 1;
+}
+/* Append with leading/trailing whitespace stripped (jinja trim). */
+static int cb_append_trimmed(chat_buf_t *b, const char *s) {
+    while (*s && (unsigned char)*s <= ' ') s++;
+    size_t len = strlen(s);
+    while (len > 0 && (unsigned char)s[len - 1] <= ' ') len--;
+    return cb_append_n(b, s, len);
+}
+
 /* Build a Qwen chatml prompt from chat messages. Matches the CLI's -pf
  * template, which is verified correct for Qwen instruct models: a system
  * block, one block per message (content directly followed by the closing
@@ -2652,10 +2697,9 @@ static const char *GR_TOOL_C   = "\x3C\x2F\x74\x6F\x6F\x6C\x5F\x72\x65\x73\x70\x
 static char *qwen_chatml_build(cJSON *messages, const char *system_template) {
     int n = cJSON_GetArraySize(messages);
 
-    /* first pass: total length + first system content + last role */
+    /* first pass: find first system content & last role */
     const char *sys_content = NULL;
     const char *last_role = NULL;
-    size_t total = 0;
     for (int i = 0; i < n; i++) {
         cJSON *msg = cJSON_GetArrayItem(messages, i);
         cJSON *role = cJSON_GetObjectItem(msg, "role");
@@ -2666,18 +2710,16 @@ static char *qwen_chatml_build(cJSON *messages, const char *system_template) {
         if (!rs || !cs) continue;
         if (strcmp(rs, "system") == 0 && !sys_content) sys_content = cs;
         last_role = rs;
-        total += strlen(rs) + strlen(cs) + 16;
     }
     if (!sys_content) sys_content = "A chat between a curious user and an assistant.";
 
-    char *buf = (char *)malloc(total + strlen(sys_content) + 256 + 1);
-    if (!buf) return NULL;
-    buf[0] = '\0';
+    chat_buf_t b; cb_init(&b);
+    if (!b.buf) return NULL;
 
     /* system block: {tag}system\n{sys}\n{tag}\n */
-    strcat(buf, QW_IM_START); strcat(buf, "system\n");
-    strcat(buf, sys_content); strcat(buf, "\n");
-    strcat(buf, QW_IM_END); strcat(buf, "\n");
+    cb_append(&b, QW_IM_START); cb_append(&b, "system\n");
+    cb_append(&b, sys_content); cb_append(&b, "\n");
+    cb_append(&b, QW_IM_END); cb_append(&b, "\n");
 
     /* each non-system message: {tag}{role}\n{content}{tag}\n */
     for (int i = 0; i < n; i++) {
@@ -2689,21 +2731,21 @@ static char *qwen_chatml_build(cJSON *messages, const char *system_template) {
         const char *cs = cJSON_GetStringValue(content);
         if (!rs || !cs) continue;
         if (strcmp(rs, "system") == 0) continue;
-        strcat(buf, QW_IM_START); strcat(buf, rs); strcat(buf, "\n");
-        strcat(buf, cs);
-        strcat(buf, QW_IM_END); strcat(buf, "\n");
+        cb_append(&b, QW_IM_START); cb_append(&b, rs); cb_append(&b, "\n");
+        cb_append(&b, cs);
+        cb_append(&b, QW_IM_END); cb_append(&b, "\n");
     }
 
     /* generation prompt (skip if the client already ended on an assistant
      * turn): open assistant + a CLOSED think block => direct answer */
     if (!(last_role && strcmp(last_role, "assistant") == 0)) {
-        strcat(buf, QW_IM_START); strcat(buf, "assistant\n");
-        strcat(buf, QW_THINK_O); strcat(buf, "\n");
-        strcat(buf, "\n");
-        strcat(buf, QW_THINK_C); strcat(buf, "\n");
-        strcat(buf, "\n");
+        cb_append(&b, QW_IM_START); cb_append(&b, "assistant\n");
+        cb_append(&b, QW_THINK_O); cb_append(&b, "\n");
+        cb_append(&b, "\n");
+        cb_append(&b, QW_THINK_C); cb_append(&b, "\n");
+        cb_append(&b, "\n");
     }
-    return buf;
+    return cb_release(&b);
 }
 
 /* Byte-string search helpers for the granite template. */
@@ -2723,15 +2765,6 @@ static const char *gr_memrfind(const char *hay, size_t len, const char *needle) 
     }
     return NULL;
 }
-/* Append s to buf with leading/trailing whitespace stripped (jinja trim). */
-static void gr_append_trimmed(char *buf, const char *s) {
-    while (*s && (unsigned char)*s <= ' ') s++;
-    size_t len = strlen(s);
-    while (len > 0 && (unsigned char)s[len - 1] <= ' ') len--;
-    char *dst = buf + strlen(buf);
-    memcpy(dst, s, len);
-    dst[len] = '\0';
-}
 
 /* Granite 4.x chatml: same im-start/im-end tag family as Qwen (reuses the
  * QW_* constants). Mirrors the GGUF tokenizer.chat_template (granite-docling
@@ -2746,7 +2779,6 @@ static char *granite_chatml_build(cJSON *messages, const char *system_template) 
     int n = cJSON_GetArraySize(messages);
     const char *last_role = NULL;
     int last_user_idx = -1;
-    size_t total = 0;
     for (int i = 0; i < n; i++) {
         cJSON *msg = cJSON_GetArrayItem(messages, i);
         cJSON *role = cJSON_GetObjectItem(msg, "role");
@@ -2757,11 +2789,10 @@ static char *granite_chatml_build(cJSON *messages, const char *system_template) 
         if (!rs || !cs) continue;
         last_role = rs;
         if (strcmp(rs, "user") == 0) last_user_idx = i;
-        total += strlen(rs) + strlen(cs) + 64;
     }
-    char *buf = (char *)malloc(total + 256 + 1);
-    if (!buf) return NULL;
-    buf[0] = '\0';
+
+    chat_buf_t b; cb_init(&b);
+    if (!b.buf) return NULL;
 
     int i = 0;
     while (i < n) {
@@ -2772,17 +2803,17 @@ static char *granite_chatml_build(cJSON *messages, const char *system_template) 
         const char *cs = (role && content) ? cJSON_GetStringValue(content) : NULL;
         if (!rs || !cs) { i++; continue; }
         if (strcmp(rs, "system") == 0) {
-            strcat(buf, QW_IM_START); strcat(buf, "system\n");
-            strcat(buf, cs);
-            strcat(buf, QW_IM_END); strcat(buf, "\n");
+            cb_append(&b, QW_IM_START); cb_append(&b, "system\n");
+            cb_append(&b, cs);
+            cb_append(&b, QW_IM_END); cb_append(&b, "\n");
             i++;
         } else if (strcmp(rs, "user") == 0) {
-            strcat(buf, QW_IM_START); strcat(buf, "user\n");
-            strcat(buf, cs);
-            strcat(buf, QW_IM_END); strcat(buf, "\n");
+            cb_append(&b, QW_IM_START); cb_append(&b, "user\n");
+            cb_append(&b, cs);
+            cb_append(&b, QW_IM_END); cb_append(&b, "\n");
             i++;
         } else if (strcmp(rs, "assistant") == 0) {
-            strcat(buf, QW_IM_START); strcat(buf, "assistant\n");
+            cb_append(&b, QW_IM_START); cb_append(&b, "assistant\n");
             size_t clen = strlen(cs);
             size_t ol = strlen(GR_THINK_O), cln = strlen(GR_THINK_C);
             const char *po = gr_memfind(cs, clen, GR_THINK_O);
@@ -2827,15 +2858,15 @@ static char *granite_chatml_build(cJSON *messages, const char *system_template) 
                     }
                 }
             }
-            gr_append_trimmed(buf, out_s);
+            cb_append_trimmed(&b, out_s);
             free(tmp);
             free(pre);
-            strcat(buf, QW_IM_END); strcat(buf, "\n");
+            cb_append(&b, QW_IM_END); cb_append(&b, "\n");
             i++;
         } else if (strcmp(rs, "tool") == 0) {
             /* consecutive tool messages share one user block, wrapped in
              * tool_response tags (the template's tool branch) */
-            strcat(buf, QW_IM_START); strcat(buf, "user\n");
+            cb_append(&b, QW_IM_START); cb_append(&b, "user\n");
             int j = i;
             while (j < n) {
                 cJSON *m2 = cJSON_GetArrayItem(messages, j);
@@ -2844,17 +2875,17 @@ static char *granite_chatml_build(cJSON *messages, const char *system_template) 
                 const char *rs2 = (r2 && c2) ? cJSON_GetStringValue(r2) : NULL;
                 const char *cs2 = (r2 && c2) ? cJSON_GetStringValue(c2) : NULL;
                 if (!rs2 || !cs2 || strcmp(rs2, "tool") != 0) break;
-                strcat(buf, GR_TOOL_O); strcat(buf, "\n");
-                strcat(buf, cs2);
-                strcat(buf, "\n"); strcat(buf, GR_TOOL_C); strcat(buf, "\n");
+                cb_append(&b, GR_TOOL_O); cb_append(&b, "\n");
+                cb_append(&b, cs2);
+                cb_append(&b, "\n"); cb_append(&b, GR_TOOL_C); cb_append(&b, "\n");
                 j++;
             }
-            strcat(buf, QW_IM_END); strcat(buf, "\n");
+            cb_append(&b, QW_IM_END); cb_append(&b, "\n");
             i = j;
         } else {
-            strcat(buf, QW_IM_START); strcat(buf, rs); strcat(buf, "\n");
-            strcat(buf, cs);
-            strcat(buf, QW_IM_END); strcat(buf, "\n");
+            cb_append(&b, QW_IM_START); cb_append(&b, rs); cb_append(&b, "\n");
+            cb_append(&b, cs);
+            cb_append(&b, QW_IM_END); cb_append(&b, "\n");
             i++;
         }
     }
@@ -2863,10 +2894,10 @@ static char *granite_chatml_build(cJSON *messages, const char *system_template) 
      * im_start + "assistant\n" + think-open + newline -- the model thinks
      * first, then answers after think-close. */
     if (!(last_role && strcmp(last_role, "assistant") == 0)) {
-        strcat(buf, QW_IM_START); strcat(buf, "assistant\n");
-        strcat(buf, GR_THINK_O); strcat(buf, "\n");
+        cb_append(&b, QW_IM_START); cb_append(&b, "assistant\n");
+        cb_append(&b, GR_THINK_O); cb_append(&b, "\n");
     }
-    return buf;
+    return cb_release(&b);
 }
 
 /* Mistral 3 / Ministral 3 text chat format (from the model's
@@ -2890,7 +2921,6 @@ static const char *MISTRAL3_DEFAULT_SYS =
 static char *mistral3_chat_build(cJSON *messages, const char *system_template) {
     int n = cJSON_GetArraySize(messages);
     const char *sys_content = system_template;
-    size_t total = strlen(MISTRAL3_DEFAULT_SYS) + 64;
     for (int i = 0; i < n; i++) {
         cJSON *msg = cJSON_GetArrayItem(messages, i);
         cJSON *role = cJSON_GetObjectItem(msg, "role");
@@ -2900,18 +2930,16 @@ static char *mistral3_chat_build(cJSON *messages, const char *system_template) {
         const char *cs = cJSON_GetStringValue(content);
         if (!rs || !cs) continue;
         if (strcmp(rs, "system") == 0 && !sys_content) sys_content = cs;
-        total += strlen(rs) + strlen(cs) + 48;
     }
     if (!sys_content) sys_content = MISTRAL3_DEFAULT_SYS;
 
-    char *buf = (char *)malloc(total + 1);
-    if (!buf) return NULL;
-    buf[0] = '\0';
+    chat_buf_t b; cb_init(&b);
+    if (!b.buf) return NULL;
 
-    strcat(buf, "<s>");
-    strcat(buf, "[SYSTEM_PROMPT]");
-    strcat(buf, sys_content);
-    strcat(buf, "[/SYSTEM_PROMPT]");
+    cb_append(&b, "<s>");
+    cb_append(&b, "[SYSTEM_PROMPT]");
+    cb_append(&b, sys_content);
+    cb_append(&b, "[/SYSTEM_PROMPT]");
 
     for (int i = 0; i < n; i++) {
         cJSON *msg = cJSON_GetArrayItem(messages, i);
@@ -2923,16 +2951,16 @@ static char *mistral3_chat_build(cJSON *messages, const char *system_template) {
         if (!rs || !cs) continue;
         if (strcmp(rs, "system") == 0) continue; /* already emitted */
         if (strcmp(rs, "user") == 0) {
-            strcat(buf, "[INST]"); strcat(buf, cs); strcat(buf, "[/INST]");
+            cb_append(&b, "[INST]"); cb_append(&b, cs); cb_append(&b, "[/INST]");
         } else if (strcmp(rs, "assistant") == 0) {
-            strcat(buf, cs); strcat(buf, "</s>");
+            cb_append(&b, cs); cb_append(&b, "</s>");
         } else if (strcmp(rs, "tool") == 0) {
-            strcat(buf, "[TOOL_RESULTS]"); strcat(buf, cs); strcat(buf, "[/TOOL_RESULTS]");
+            cb_append(&b, "[TOOL_RESULTS]"); cb_append(&b, cs); cb_append(&b, "[/TOOL_RESULTS]");
         } else {
-            strcat(buf, "[SYSTEM_PROMPT]"); strcat(buf, cs); strcat(buf, "[/SYSTEM_PROMPT]");
+            cb_append(&b, "[SYSTEM_PROMPT]"); cb_append(&b, cs); cb_append(&b, "[/SYSTEM_PROMPT]");
         }
     }
-    return buf;
+    return cb_release(&b);
 }
 
 /* Convert chat messages to a prompt string.

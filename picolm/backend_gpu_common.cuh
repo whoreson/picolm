@@ -172,7 +172,13 @@ typedef hipEvent_t gpuEvent_t;
 /* hipcc host pass: __AMDGCN_WAVEFRONT_SIZE is device-only (HIP defines
  * __CUDA_ARCH__ in the device pass; ROCm 7.x also defines
  * __HIP_DEVICE_COMPILE__/__AMDGCN__ in the host pass, so neither is a
- * usable guard). gfx90x targets have 64-wide wavefronts. */
+ * usable guard). gfx90x targets have 64-wide wavefronts.
+ *
+ * TODO(WARP_SIZE_RDNA): this is hardcoded to 64 (CDNA/gfx9). RDNA GPUs
+ * (gfx103x, gfx11xx) have 32-wide wavefronts; the SSM kernels that use
+ * GPU_WARP_SIZE in their host-side launch config will overallocate
+ * threads on those targets. Fix requires a runtime wavefront query or
+ * compile-time -D for RDNA targets. */
 #define GPU_WARP_SIZE 64
 #endif
 #else
