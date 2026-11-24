@@ -665,7 +665,7 @@ static struct _server_state {
     picolm_checkpoint_t *checkpoints;     /* linked list head (sorted by n_tokens) */
     int max_checkpoints;                  /* --checkpoint-max (default: 0=disabled) */
     int checkpoint_interval;              /* --checkpoint-every-nt (default: 256) */
-    int checkpoint_interval_gen;          /* --checkpoint-every-nt-gen (default: 64) */
+    int checkpoint_interval_gen;          /* --checkpoint-every-nt-gen (default: 0=off) */
     int checkpoint_tail_offset;           /* --checkpoint-tail-offset (default: 1) */
     int checkpoint_rolling_interval;      /* --checkpoint-rolling-interval (default: 10000 ms) */
     size_t checkpoint_snapshot_size;      /* cached snapshot size from model */
@@ -819,7 +819,10 @@ static void checkpoint_print_list(const char *label) {
  * eviction loop in checkpoint_save(). */
 static int checkpoint_evict_one(void) {
     int n = checkpoint_count();
-    if (n <= 2) return 0; /* Never remove if 2 or fewer */
+    if (n <= 2) {
+        fprintf(stderr, "  [ssm checkpoint] eviction declined: only %d checkpoint(s), need 3+\n", n);
+        return 0;
+    }
 
     /* Collect checkpoint positions and protection flags */
     int *tokens = alloca((size_t)n * sizeof(int));
@@ -876,7 +879,11 @@ static int checkpoint_evict_one(void) {
         }
     }
 
-    if (best_idx < 0) return 0;   /* every interior candidate is protected */
+    if (best_idx < 0) {
+        fprintf(stderr, "  [ssm checkpoint] eviction declined: n=%d, no evictable interior candidates (first=%d last=%d)\n",
+                n, tokens[0], tokens[n - 1]);
+        return 0;
+    }
 
     fprintf(stderr, "  [ssm checkpoint] erasing checkpoint at index %d (n_tokens=%d), "
             "variance after removal = %.1f\n",
@@ -945,8 +952,8 @@ static void checkpoint_save(int n_tokens) {
      * the process is 100% CPU and 0% GPU, which is exactly the hang seen at
      * ~7.5-8k context with --checkpoint-max 16. Bound it by the initial count:
      * each successful eviction removes one, so that many attempts is enough,
-     * and if we run out of candidates we accept going over the limit for one
-     * insert rather than hanging. */
+     * and if we run out of candidates we drop the new checkpoint rather than
+     * going over the limit. */
     {
         int evictable = checkpoint_count() - 1;   /* never spin on the same list forever */
         while (checkpoint_count() >= srv.max_checkpoints && evictable-- > 0) {
@@ -954,6 +961,15 @@ static void checkpoint_save(int n_tokens) {
             checkpoint_evict_one();
             if (checkpoint_count() >= before) break;   /* declined: stop, do not spin */
         }
+    }
+
+    /* Hard guard: if eviction couldn't make room, drop this checkpoint rather
+     * than exceeding the limit. This can happen when every interior candidate
+     * is protected, or when n<=2 and we're already at max. */
+    if (checkpoint_count() >= srv.max_checkpoints) {
+        fprintf(stderr, "  [ssm checkpoint] DROPPED: at capacity (%d/%d), eviction declined\n",
+                checkpoint_count(), srv.max_checkpoints);
+        return;
     }
 
     double t_create_start = get_time_ms();
@@ -1056,6 +1072,17 @@ static void checkpoint_rolling_update(int n_tokens) {
     srv.rolling_checkpoint_last_ms = now;
     double creation_ms = get_time_ms() - t_create_start;
     fprintf(stderr, "  [ssm rolling checkpoint] updated (n_tokens=%d, %.1f ms)\n", n_tokens, creation_ms);
+}
+
+/* Clear protection flags on all checkpoints.
+ * Protection is a per-request concept: the tail is protected during decode so
+ * eviction doesn't discard it.  Between requests the flag must be cleared,
+ * otherwise after many turns every interior slot becomes protected and eviction
+ * can no longer make progress (the "no evictable interior candidates" dead end). */
+static void checkpoint_clear_all_protection(void) {
+    for (picolm_checkpoint_t *cp = srv.checkpoints; cp; cp = cp->next) {
+        cp->is_protected = 0;
+    }
 }
 
 /* Mark the latest checkpoint in the linked list as protected (tail checkpoint).
@@ -1428,6 +1455,7 @@ static float *prefill_with_checkpoints(SOCKET sock, model_t *model,
      * checkpoint past 'start_pos' describes an abandoned trajectory. Erase it
      * now instead of keeping it in memory until the context regrows past it. */
     if (model_has_recurrent_state(model) && srv.max_checkpoints > 0 && srv.checkpoints) {
+        checkpoint_clear_all_protection();
         checkpoint_prune_after(start_pos);
     }
 
@@ -3396,7 +3424,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         if (srv.rolling_checkpoint_data && model_has_recurrent_state(model)) {
             checkpoint_protect_tail();
             srv.rolling_checkpoint_active = 1;
-            srv.rolling_checkpoint_last_ms = 0; /* force first update */
+            srv.rolling_checkpoint_last_ms = get_time_ms(); /* first update after interval */
         }
         /* KV_WRITTEN: number of generated tokens actually EVALUATED this
          * request, i.e. the number of KV rows written past the prompt. The
@@ -3681,7 +3709,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             if (srv.rolling_checkpoint_data && model_has_recurrent_state(model)) {
                 checkpoint_protect_tail();
                 srv.rolling_checkpoint_active = 1;
-                srv.rolling_checkpoint_last_ms = 0; /* force first update */
+                srv.rolling_checkpoint_last_ms = get_time_ms(); /* first update after interval */
             }
             if (n_prefill_ns <= 0) {
                 int token = ptokens[n_prompt - 1];
@@ -4173,7 +4201,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         if (srv.rolling_checkpoint_data && model_has_recurrent_state(model)) {
             checkpoint_protect_tail();
             srv.rolling_checkpoint_active = 1;
-            srv.rolling_checkpoint_last_ms = 0; /* force first update */
+            srv.rolling_checkpoint_last_ms = get_time_ms(); /* first update after interval */
         }
         if (n_prefill <= 0) {
             token = ptokens[n_prompt - 1];
@@ -4406,7 +4434,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         if (srv.rolling_checkpoint_data && model_has_recurrent_state(model)) {
             checkpoint_protect_tail();
             srv.rolling_checkpoint_active = 1;
-            srv.rolling_checkpoint_last_ms = 0; /* force first update */
+            srv.rolling_checkpoint_last_ms = get_time_ms(); /* first update after interval */
         }
         if (n_prefill_ns2 <= 0) {
             token = ptokens[n_prompt - 1];

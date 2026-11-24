@@ -365,7 +365,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "\nSSM checkpoint options (Qwen3.5/3.6 only, no-op for other models):\n");
     fprintf(stderr, "  --checkpoint-max <N>        Max checkpoints to keep (default: 3 in --server, 0 otherwise)\n");
     fprintf(stderr, "  --checkpoint-every-nt <N>   Checkpoint every N tokens during prefill (default: 256)\n");
-    fprintf(stderr, "  --checkpoint-every-nt-gen <N> Checkpoint every N tokens during generation (default: 64)\n");
+    fprintf(stderr, "  --checkpoint-every-nt-gen <N> Checkpoint every N tokens during generation (default: 0=off)\n");
     fprintf(stderr, "  --checkpoint-tail-offset <N> Checkpoint N tokens before end of prompt (default: 5)\n");
     fprintf(stderr, "  --checkpoint-rolling-interval <ms> Rolling checkpoint interval during decode (default: 10000)\n");
     fprintf(stderr, "  --ssm-serial      Use serial per-token SSM prefill (default is batched)\n");
@@ -1439,6 +1439,12 @@ static int cli_checkpoint_save(model_t *model, int checkpoint_max, int n_tokens)
           }
           cli_checkpoints = old->next;
           free(old->data); free(old); n_cp--; } }
+    /* Hard guard: if eviction couldn't make room, drop this checkpoint */
+    { int n_cp = 0; for (cli_checkpoint_t *c = cli_checkpoints; c; c = c->next) n_cp++;
+      if (n_cp >= checkpoint_max) {
+          fprintf(stderr, "  [ssm checkpoint] DROPPED: at capacity (%d/%d), eviction blocked\n",
+                  n_cp, checkpoint_max);
+          return 0; } }
     cli_checkpoint_t *cp = (cli_checkpoint_t *)calloc(1, sizeof(*cp));
     if (!cp) return 0;
     cp->n_tokens = n_tokens;
@@ -1560,7 +1566,7 @@ int main(int argc, char **argv) {
     /* SSM checkpoint options */
     int    checkpoint_max = 3;          /* default 3 in --server mode, overridden to 0 otherwise */
     int    checkpoint_interval = 256;
-    int    checkpoint_interval_gen = 64;
+    int    checkpoint_interval_gen = 0;
     int    checkpoint_tail_offset = 1;  /* 1: ensures checkpoint at n_prompt-1 for stepback */
     int    checkpoint_rolling_interval = 10000; /* 10s rolling checkpoint during decode */
     int    prefill_ubatch = 0;          /* --prefill-ubatch N: chunk CLI prefill into N-token ubatches.
@@ -3141,7 +3147,7 @@ int main(int argc, char **argv) {
     if (cli_rolling_checkpoint_data && model_has_recurrent_state(&model)) {
         cli_checkpoint_protect_tail();
         cli_rolling_checkpoint_active = 1;
-        cli_rolling_checkpoint_last_ms = 0; /* force first update */
+        cli_rolling_checkpoint_last_ms = get_time_ms(); /* first update after interval */
     }
 
     for (; pos < total_steps; pos++) {
