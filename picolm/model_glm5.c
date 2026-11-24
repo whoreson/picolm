@@ -1179,13 +1179,12 @@ static int glm5_pfa_enabled(void) {
     return cached;
 }
 
-/* PICOLM_GLM5_PFA_VEXP=1: score tiles reduce with a shuffle tree instead of 16 reduce_add calls, and
- * the softmax uses a vector max, a vector expf (<= 1 ULP vs libm) and a vector sum. Not bit-identical
- * to the scalar path (summation order, expf rounding); AVX-512 only. */
+/* PICOLM_GLM5_PFA_VEXP=0: disable vectorized PFA softmax (shuffle-tree reduce + vec expf).
+ * ON by default on AVX-512; not bit-identical to the scalar path (summation order, expf rounding). */
 static int glm5_pfa_vexp_enabled(void) {
     static int cached = -1;
 #if defined(PICOLM_AVX512)
-    if (cached < 0) { const char *e = getenv("PICOLM_GLM5_PFA_VEXP"); cached = (e && atoi(e) > 0) ? 1 : 0; }
+    if (cached < 0) { const char *e = getenv("PICOLM_GLM5_PFA_VEXP"); cached = !(e && atoi(e) == 0); }
 #else
     cached = 0;
 #endif
@@ -4472,12 +4471,12 @@ static int glm5_kda_layer_par(const model_t *m, const glm5_layer_weights_t *gw, 
  *   phase C  (tiny):                       roll the carried conv state forward by n_tokens
  *   phase R  (parallel over heads):        per head, tokens in order: state update, RMSNorm, gate
  * Every value is computed with the same expressions as before, only on different threads, so the
- * result is bit-identical to glm5_kda_layer_par (tests/test_glm5_kda_split.c). Falls back to it
- * when the debug dumps are on; PICOLM_GLM5_KDA_SPLIT=0 forces the fallback. */
+/* PICOLM_GLM5_KDA_VEXP=0: disable vectorized KDA expf.
+ * ON by default on AVX-512/AVX2; not bit-identical to scalar path. */
 static int glm5_kda_vexp_enabled(void) {
     static int cached = -1;
 #if defined(PICOLM_AVX512) || defined(PICOLM_AVX2)
-    if (cached < 0) { const char *e = getenv("PICOLM_GLM5_KDA_VEXP"); cached = (e && atoi(e) > 0) ? 1 : 0; }
+    if (cached < 0) { const char *e = getenv("PICOLM_GLM5_KDA_VEXP"); cached = !(e && atoi(e) == 0); }
 #else
     cached = 0;
 #endif
