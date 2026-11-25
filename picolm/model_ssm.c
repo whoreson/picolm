@@ -6994,10 +6994,20 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
             }
         }
         if (n_attn_ord > 0) {
-            picolm_gpu_kv_flush_to_cpu(s->key_cache, s->val_cache,
-                                            n_attn_ord, c->max_seq_len, start_pos + n_tokens,
-                                            s->kv_row_size_k, s->kv_row_size_v,
-                                            gpu_dev);
+            /* Bring the host mirror up to date. The backend owns the watermark and copies only
+             * [valid, start_pos+n_tokens): the old code copied [0, start_pos+n_tokens) on EVERY
+             * call, an O(context) D2H per chunk (~460 MB at 7k depth for Qwen3.6-27B f16 KV).
+             * Every device KV write (decode, prefill, bulk upload) lowers the watermark in the
+             * backend, so a rewind-and-replay through any path is covered without inference here.
+             * PICOLM_KV_FULL_FLUSH=1 restores the old whole-prefix copy for A/B comparison. */
+            if (getenv("PICOLM_KV_FULL_FLUSH"))
+                picolm_gpu_kv_flush_to_cpu(s->key_cache, s->val_cache,
+                                           n_attn_ord, c->max_seq_len, start_pos + n_tokens,
+                                           s->kv_row_size_k, s->kv_row_size_v, gpu_dev);
+            else
+                picolm_gpu_kv_sync_host(s->key_cache, s->val_cache,
+                                        n_attn_ord, c->max_seq_len, start_pos + n_tokens,
+                                        s->kv_row_size_k, s->kv_row_size_v, gpu_dev);
         }
     }
 

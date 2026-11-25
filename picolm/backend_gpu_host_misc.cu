@@ -1,6 +1,7 @@
 // backend_gpu_host_misc.cu - KV cache, pipeline, attention, rmsnorm, rope, residual, misc
 #include "backend_gpu_kernels.cuh"
 #include "backend_gpu_kvquant.cuh"
+#include "backend_kv_watermark.h"
 
 /* PICOLM_GPU_PROF hooks, defined at the bottom of this file. */
 extern "C" int  picolm_gpu_prof_slot(const char *name);
@@ -51,6 +52,12 @@ static uint16_t *g_kv_k_dev[PICOLM_GPU_MAX_DEVICES];
 static uint16_t *g_kv_v_dev[PICOLM_GPU_MAX_DEVICES];
 static size_t g_kv_k_cap[PICOLM_GPU_MAX_DEVICES];
 static size_t g_kv_v_cap[PICOLM_GPU_MAX_DEVICES];
+/* Host-mirror watermark (see backend_kv_watermark.h): the host KV mirror is a faithful copy of the
+ * device cache for positions [0, g_kv_host_valid[d]). Every writer below lowers it. */
+static int g_kv_host_valid[PICOLM_GPU_MAX_DEVICES];
+static inline void kv_note_write(int device, int first_pos) {
+    if (device >= 0 && device < PICOLM_GPU_MAX_DEVICES) kvwm_note_write(&g_kv_host_valid[device], first_pos);
+}
 static float *g_verify_buf_dev[PICOLM_GPU_MAX_DEVICES];
 
 /* How the device KV cache rows are laid out. Default F16 (0) so that a caller
@@ -84,6 +91,7 @@ extern "C" int
 picolm_gpu_kv_alloc(size_t kv_k_bytes, size_t kv_v_bytes, int device) {
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!select_ctx(ctx)) return 0;
+    g_kv_host_valid[device] = 0;                      /* new or reused cache: the mirror proves nothing */
 
     /* Align to 256 bytes for coalesced access */
     kv_k_bytes = (kv_k_bytes + 255) & ~(size_t)255;
@@ -109,6 +117,7 @@ picolm_gpu_kv_alloc(size_t kv_k_bytes, size_t kv_v_bytes, int device) {
 extern "C" void
 picolm_gpu_kv_cache_clear(int device) {
     if (device < 0 || device >= PICOLM_GPU_MAX_DEVICES) return;
+    g_kv_host_valid[device] = 0;                      /* device is zeroed, the host mirror is not */
     if (g_kv_k_dev[device] && g_kv_k_cap[device])
         gpuMemset(g_kv_k_dev[device], 0, g_kv_k_cap[device]);
     if (g_kv_v_dev[device] && g_kv_v_cap[device])
@@ -120,6 +129,7 @@ picolm_gpu_kv_cache_clear(int device) {
 extern "C" void
 picolm_gpu_kv_free(void) {
     for (int i = 0; i < PICOLM_GPU_MAX_DEVICES; i++) {
+        g_kv_host_valid[i] = 0;
         if (g_kv_k_dev[i]) { gpuFree(g_kv_k_dev[i]); g_kv_k_dev[i] = NULL; g_kv_k_cap[i] = 0; }
         if (g_kv_v_dev[i]) { gpuFree(g_kv_v_dev[i]); g_kv_v_dev[i] = NULL; g_kv_v_cap[i] = 0; }
     }
@@ -614,6 +624,7 @@ picolm_gpu_kv_store_dev_batched_strided(int is_k, int layer_ordinal, int start_p
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!ctx || !select_ctx(ctx)) return 0;
     if (!g_kv_k_dev[device] || !g_kv_v_dev[device]) return 0;
+    kv_note_write(device, start_pos);                 /* covers store_dev and store_dev_batched */
 
     int kv_dim = n_kv_heads * head_dim;
     int kv_type = is_k ? g_kv_type_k[device] : g_kv_type_v[device];
@@ -707,6 +718,7 @@ picolm_gpu_kv_store_rows(int is_k, int layer_ordinal, int start_pos, int n_posit
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!ctx || !select_ctx(ctx)) return 0;
     if (!g_kv_k_dev[device] || !g_kv_v_dev[device]) return 0;
+    kv_note_write(device, start_pos);
 
     /* row_bytes must be the row size of the format this cache was allocated
      * for. F16 is n_kv_heads*head_dim*2; Q8_0/Q4_0 use the block layouts. The
@@ -752,6 +764,7 @@ picolm_gpu_kv_upload_layer(int is_k, int layer_ordinal, int n_positions,
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!ctx || !select_ctx(ctx)) return 0;
     if (!g_kv_k_dev[device] || !g_kv_v_dev[device]) return 0;
+    kv_note_write(device, 0);                         /* bulk upload rewrites positions [0, n_positions) */
 
     /* Row size comes from the CACHE's own layout, not from head_dim*2.
      *
@@ -2382,10 +2395,47 @@ picolm_gpu_kv_flush_to_cpu(uint8_t *cpu_k, uint8_t *cpu_v,
     if (n_pos < 1 || n_pos > max_seq) n_pos = max_seq;
     /* One strided copy per cache: n_attn_ord rows of n_pos * row_sz bytes,
      * max_seq * row_sz apart on both sides. */
-    return gpu_ok(gpuMemcpy2D(cpu_k, (size_t)max_seq * row_sz_k, g_kv_k_dev[device], (size_t)max_seq * row_sz_k,
+    const int flushed_ok = gpu_ok(gpuMemcpy2D(cpu_k, (size_t)max_seq * row_sz_k, g_kv_k_dev[device], (size_t)max_seq * row_sz_k,
                               (size_t)n_pos * row_sz_k, (size_t)n_attn_ord, gpuMemcpyDeviceToHost), "kv flush K D2H") &&
            gpu_ok(gpuMemcpy2D(cpu_v, (size_t)max_seq * row_sz_v, g_kv_v_dev[device], (size_t)max_seq * row_sz_v,
                               (size_t)n_pos * row_sz_v, (size_t)n_attn_ord, gpuMemcpyDeviceToHost), "kv flush V D2H");
+    if (flushed_ok) kvwm_commit(&g_kv_host_valid[device], n_pos);   /* [0, n_pos) is now faithful */
+    return flushed_ok;
+}
+
+/* Bring the host KV mirror up to date for positions [0, pos_to).
+ *
+ * Copies only [valid, pos_to), where `valid` is the backend-owned watermark: the host mirror is a
+ * faithful copy of the device for [0, valid), and every device KV writer lowers it to the first
+ * position it touches (kvwm_note_write). So rows written by GPU decode sit at or above `valid`
+ * and are picked up here, a rewind-then-replay through ANY path invalidates exactly what it
+ * changed, and nothing depends on the caller inferring that from its start_pos.
+ *
+ * pos_to is clamped to the cache size inside kvwm_plan_sync, and the watermark advances only
+ * after BOTH copies succeed, so a failed or partial copy is retried by the next call.
+ * The previous whole-prefix flush made every prefill chunk pay an O(context) D2H copy
+ * (64 KB per position for Qwen3.6-27B f16 KV: ~460 MB per call at 7k depth).
+ * Returns 1 if the mirror is current up to the (clamped) pos_to afterwards, 0 on failure. */
+extern "C" int
+picolm_gpu_kv_sync_host(uint8_t *cpu_k, uint8_t *cpu_v,
+    int n_attn_ord, int max_seq, int pos_to,
+    size_t row_sz_k, size_t row_sz_v, int device) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    if (!g_kv_k_dev[device] || !g_kv_v_dev[device]) return 0;
+    if (!cpu_k || !cpu_v) return 0;
+    int from = 0, to = 0;
+    if (!kvwm_plan_sync(g_kv_host_valid[device], pos_to, max_seq, &from, &to))
+        return 1;                                     /* host mirror already current up to pos_to */
+    const size_t off_k = (size_t)from * row_sz_k, off_v = (size_t)from * row_sz_v;
+    const size_t n = (size_t)(to - from);
+    if (!(gpu_ok(gpuMemcpy2D(cpu_k + off_k, (size_t)max_seq * row_sz_k, g_kv_k_dev[device] + off_k, (size_t)max_seq * row_sz_k,
+                             n * row_sz_k, (size_t)n_attn_ord, gpuMemcpyDeviceToHost), "kv sync K D2H") &&
+          gpu_ok(gpuMemcpy2D(cpu_v + off_v, (size_t)max_seq * row_sz_v, g_kv_v_dev[device] + off_v, (size_t)max_seq * row_sz_v,
+                             n * row_sz_v, (size_t)n_attn_ord, gpuMemcpyDeviceToHost), "kv sync V D2H")))
+        return 0;                                     /* watermark NOT advanced: the next call retries */
+    kvwm_commit(&g_kv_host_valid[device], to);
+    return 1;
 }
 
 /* Upload CPU KV cache to GPU KV cache (H2D).
@@ -2399,6 +2449,7 @@ picolm_gpu_kv_upload_from_cpu(const uint8_t *cpu_k, const uint8_t *cpu_v,
     if (!ctx || !select_ctx(ctx)) return 0;
     if (!g_kv_k_dev[device] || !g_kv_v_dev[device]) return 0;
     if (!cpu_k || !cpu_v) return 0;
+    kv_note_write(device, 0);                         /* conservative: whole-layer H2D */
     /* Copy full layers (all positions), not just the written positions.
      * CPU KV cache layout: [layer][max_seq_len][kv_dim]. Each layer is
      * contiguous. GPU KV cache has the same layout. Copy full layers to

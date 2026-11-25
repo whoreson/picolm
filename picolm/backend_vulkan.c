@@ -3629,6 +3629,14 @@ void picolm_gpu_kv_free(void) { picolm_gpu_kv_cache_clear(0); }
 // ---------------------------------------------------------------------------
 // KV CACHE FLUSH (GPU -> CPU)
 // ---------------------------------------------------------------------------
+int picolm_gpu_kv_sync_host(uint8_t *cpu_k, uint8_t *cpu_v,
+                            int n_attn_ord, int max_seq, int pos_to,
+                            size_t row_sz_k, size_t row_sz_v, int device) {
+    /* Vulkan: no watermark yet, flush the whole prefix (the behaviour before the incremental sync) */
+    if (pos_to > max_seq) pos_to = max_seq;
+    return picolm_gpu_kv_flush_to_cpu(cpu_k, cpu_v, n_attn_ord, max_seq, pos_to, row_sz_k, row_sz_v, device);
+}
+
 int picolm_gpu_kv_flush_to_cpu(uint8_t *cpu_k, uint8_t *cpu_v,
                                 int n_attn_ord, int max_seq,
                                 int n_pos, size_t row_sz_k, size_t row_sz_v,

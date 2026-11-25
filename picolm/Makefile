@@ -139,7 +139,7 @@ GPU_OBJS =
 
 # GPU host .cu sources (split into modular files)
 GPU_SRCS = backend_gpu_kernels.cu backend_gpu_host_core.cu backend_gpu_host_ssm.cu backend_gpu_host_misc.cu
-GPU_CUH  = backend_gpu_common.cuh backend_gpu_dequant.cuh backend_gpu_kernels.cuh backend_gpu_attn_fa3.cuh
+GPU_CUH  = backend_kv_watermark.h backend_gpu_common.cuh backend_gpu_dequant.cuh backend_gpu_kernels.cuh backend_gpu_attn_fa3.cuh
 
 PREFIX  ?= /usr/local
 MODEL_DIR ?= /opt/picolm/models
@@ -538,6 +538,13 @@ test-attn-hmma-gpu: tests/test_attn_hmma_gpu.cu backend_gpu_kernels-cuda.o
 	$(NVCC) $(CUDAFLAGS) $(CUDA_GENCODE) -DPICOLM_GPU=1 -o test_attn_hmma_gpu $^ -I.
 
 # GPU check: FA3 (register-resident O, head_dim 256) agrees with the scalar warpgrp kernel.
+# Randomised check of the GPU KV host-mirror watermark (backend_kv_watermark.h), the exact logic the
+# backend runs: prefill / decode / rewind / decode-replay / bulk upload / clear / overflow, host == device
+# after every sync. `./test_kv_watermark --old` runs the previous model-level logic and must FAIL.
+.PHONY: test-kv-watermark
+test-kv-watermark: tests/test_kv_watermark.c backend_kv_watermark.h
+	$(CC) -std=c99 -O2 -Wall -I. -o test_kv_watermark tests/test_kv_watermark.c
+
 # CPU emulation of the FA3 kernel: compiles the REAL backend_gpu_attn_fa3.cuh with the PTX
 # primitives (ldmatrix, mma.m16n8k16, cp.async, shuffles, barriers) emulated, runs it on one
 # OS thread per CUDA thread and checks it against a double-precision reference. No GPU needed.

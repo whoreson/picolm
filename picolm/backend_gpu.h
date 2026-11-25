@@ -452,6 +452,14 @@ int picolm_gpu_kv_store_dev_batched_strided(int is_k, int layer_ordinal, int sta
                                              const float *src_dev, int n_kv_heads, int head_dim,
                                              int max_seq_len, int device, int src_stride);
 
+/* Bring the host KV mirror up to date for positions [0, pos_to), copying only what the backend
+ * knows the mirror lacks (it owns a watermark that every device KV write lowers). Same host layout
+ * as picolm_gpu_kv_flush_to_cpu. pos_to is clamped to max_seq. Returns 1 if the mirror is current
+ * up to the clamped pos_to, 0 on failure (a later call retries). */
+int picolm_gpu_kv_sync_host(uint8_t *cpu_k, uint8_t *cpu_v,
+                            int n_attn_ord, int max_seq, int pos_to,
+                            size_t row_sz_k, size_t row_sz_v, int device);
+
 /* Flush GPU KV cache to CPU KV cache (for CPU decode readback). */
 int picolm_gpu_kv_flush_to_cpu(uint8_t *cpu_k, uint8_t *cpu_v,
                                 int n_attn_ord, int max_seq,
