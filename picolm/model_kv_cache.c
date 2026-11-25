@@ -658,4 +658,16 @@ int kvcache_load(model_t *m, const char *path, int **tokens_out) {
     return n_pos;
 }
 
+/* Count attention layers (for GPU KV cache sizing / flush). */
+int picolm_count_attn_layers(const model_t *m) {
+    int n = 0;
+    for (int i = 0; i < m->config.n_layers; i++) {
+        if (m->weights.layers[i].is_attn_layer) n++;
+    }
+    /* For pure-attention models without the SSM flag, all layers are
+     * attention layers, so n == n_layers.  If is_attn_layer is never
+     * set (old models without the flag), return n_layers as fallback. */
+    return n > 0 ? n : m->config.n_layers;
+}
+
 

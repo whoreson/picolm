@@ -996,6 +996,11 @@ int kvcache_save_ex(const model_t *m, const char *path, int n_pos, const int *to
  * (free by caller), or NULL if no tokens were saved. */
 int kvcache_load(model_t *m, const char *path, int **tokens_out);
 
+/* Count attention layers in the model. For SSM models only layers with
+ * is_attn_layer set are counted; for pure-attention models this equals
+ * n_layers. Used to determine how many layer-slots the GPU KV cache holds. */
+int picolm_count_attn_layers(const model_t *m);
+
 /* ---- SSM state checkpointing (Qwen3.5/3.6) ---- */
 
 /* Returns total bytes needed for a full SSM state snapshot (all SSM layers).

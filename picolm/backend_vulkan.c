@@ -3644,6 +3644,18 @@ int picolm_gpu_kv_flush_to_cpu(uint8_t *cpu_k, uint8_t *cpu_v,
     vkInvalidateMappedMemoryRanges(G.dev, 1, &inv);
     inv.memory = G.kv_v_mem; inv.size = G.kv_v_bytes;
     vkInvalidateMappedMemoryRanges(G.dev, 1, &inv);
+    /* TODO: this path casts the mapped memory to uint16_t* and iterates by
+     * element count, which is only correct for F16 KV cache.  Quantised KV
+     * types (q4_0, tq4, ...) have different element sizes and layouts.
+     * The CUDA/HIP backend uses raw byte-copy (gpuMemcpy2D) which is
+     * format-agnostic; this Vulkan path should do the same.
+     *
+     * Until then, warn when the row size doesn't match the F16 assumption. */
+    if (row_sz_k % sizeof(uint16_t) != 0 || row_sz_v % sizeof(uint16_t) != 0) {
+        fprintf(stderr, "WARNING: Vulkan KV flush does not support non-F16 KV cache types; "
+                "saved cache will be corrupt (row_sz_k=%zu row_sz_v=%zu)\n", row_sz_k, row_sz_v);
+        return 0;
+    }
     // Copy row-by-row
     size_t elems_per_row_k = row_sz_k / sizeof(uint16_t);
     size_t elems_per_row_v = row_sz_v / sizeof(uint16_t);

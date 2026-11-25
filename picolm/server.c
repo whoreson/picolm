@@ -1996,32 +1996,35 @@ static void handle_slots_post(SOCKET sock, const char *body) {
             return;
         }
 
-        /* Download GPU KV cache to CPU mirror before saving.
-         * GPU generation bypasses CPU s->key_cache/s->val_cache entirely,
-         * so kvcache_save would save all-zeros without this sync. */
+        /* Download the GPU KV cache to the host mirror before saving.
+         *
+         * kvcache_save() knows nothing about the GPU: it writes whatever the host mirror
+         * (s->key_cache/s->val_cache) holds, and GPU generation never writes the host mirror.
+         * This used to be gated on `kv_type_k == F16 && kv_type_v == F16`, so with a QUANTISED
+         * cache (-ctk q4_0 / tq4 ..., the only configuration in which a long context fits in
+         * 24 GB) nothing was downloaded and the slot file held zeros for everything the GPU had
+         * generated. /slot restore uploads for EVERY type, so restoring that file then
+         * overwrote the good device cache with them: correct SSM state against a destroyed KV
+         * cache, i.e. "the slot loads fine, then the output is garbage".
+         *
+         * Host and device layouts are byte-identical for every KV type (row size
+         * kv_row_size_k/v bytes per position, layer pitch max_seq_len rows), so no type gate
+         * is needed. Only the layers the DEVICE holds (gpu_kv_layers) may be read: asking for
+         * more reads past the end of the device cache on a partial-offload (NGL) split. */
 #ifdef PICOLM_GPU
-        if (srv.model.gpu.kv_active && srv.model.gpu.device >= 0 &&
-            srv.model.state.kv_type_k == KV_CACHE_F16 &&
-            srv.model.state.kv_type_v == KV_CACHE_F16) {
+        if (srv.model.gpu.kv_active && srv.model.gpu.device >= 0 && srv.kv_pos > 0) {
             model_t *model = &srv.model;
-            const model_config_t *c = &model->config;
-            int gpu_dev = model->gpu.device;
-            size_t pos_stride_k = model->state.kv_row_size_k;
-            size_t pos_stride_v = model->state.kv_row_size_v;
-            uint8_t *gpu_k = (uint8_t *)picolm_gpu_kv_k_dev(gpu_dev);
-            uint8_t *gpu_v = (uint8_t *)picolm_gpu_kv_v_dev(gpu_dev);
-            picolm_gpu_sync(gpu_dev);
-            for (int l = 0; l < c->n_layers; l++) {
-                if (!model->weights.layers[l].is_attn_layer) continue;
-                int ao = model->state.kv_layer_ordinal[l];
-                size_t layer_bytes_k = (size_t)srv.kv_pos * pos_stride_k;
-                size_t layer_bytes_v = (size_t)srv.kv_pos * pos_stride_v;
-                uint8_t *cpu_k = model->state.key_cache + (size_t)ao * c->max_seq_len * pos_stride_k;
-                uint8_t *cpu_v = model->state.val_cache + (size_t)ao * c->max_seq_len * pos_stride_v;
-                picolm_gpu_memcpy(cpu_k, gpu_k + (size_t)ao * c->max_seq_len * pos_stride_k,
-                    layer_bytes_k, -1, gpu_dev);
-                picolm_gpu_memcpy(cpu_v, gpu_v + (size_t)ao * c->max_seq_len * pos_stride_v,
-                    layer_bytes_v, -1, gpu_dev);
+            const int gpu_dev = model->gpu.device;
+            int n_attn_ord = model->gpu.gpu_kv_layers;
+            if (n_attn_ord <= 0) n_attn_ord = picolm_count_attn_layers(model);
+            if (!picolm_gpu_kv_flush_to_cpu(model->state.key_cache, model->state.val_cache,
+                                            n_attn_ord, model->config.max_seq_len, srv.kv_pos,
+                                            model->state.kv_row_size_k, model->state.kv_row_size_v,
+                                            gpu_dev)) {
+                http_send(sock, 500, "application/json",
+                    "{\"error\":{\"message\":\"Failed to download the GPU KV cache before saving; "
+                    "refusing to write a slot file that would be zeros\"}}");
+                return;
             }
         }
 #endif

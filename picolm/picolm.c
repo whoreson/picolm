@@ -3354,6 +3354,20 @@ int main(int argc, char **argv) {
               gen_so_far += tokenizer_encode(&tokenizer, gen_buf, all_tokens + gen_so_far, total_tokens - gen_so_far, 0);
           total_tokens = gen_so_far; }
 
+        /* kvcache_save() writes the HOST KV mirror, and GPU decode never updates it: download the
+         * device cache first (any KV type; only the layers the device holds), or the file contains
+         * zeros for everything generated on the GPU and restoring it destroys the session. */
+#ifdef PICOLM_GPU
+        if (model.gpu.kv_active && model.gpu.device >= 0 && total_tokens > 0) {
+            int n_attn_ord = model.gpu.gpu_kv_layers;
+            if (n_attn_ord <= 0) n_attn_ord = picolm_count_attn_layers(&model);
+            if (!picolm_gpu_kv_flush_to_cpu(model.state.key_cache, model.state.val_cache,
+                                            n_attn_ord, model.config.max_seq_len, total_tokens,
+                                            model.state.kv_row_size_k, model.state.kv_row_size_v,
+                                            model.gpu.device))
+                fprintf(stderr, "WARNING: could not download the GPU KV cache; the saved cache will be incomplete\n");
+        }
+#endif
         kvcache_save(&model, cache_file, total_tokens, all_tokens);
 
         /* Append checkpoints to the file (after main KV+SSM data).
