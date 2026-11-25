@@ -554,8 +554,23 @@ test-kv-watermark: tests/test_kv_watermark.c backend_kv_watermark.h
 # is only meaningful on a host with a real pthread/threading library. It is NOT
 # a PicoLM build dependency, so platforms in the DJGPP/old-gcc band never see it
 # (the shipped header below is only ever compiled by nvcc or this test).
-test-attn-fa3-emu: tests/fa3_emu.cpp backend_gpu_attn_fa3.cuh
-	$(CXX) -std=c++11 -O2 -pthread -DPICOLM_FA3_EMU -Wno-unknown-pragmas -I. -o fa3_emu tests/fa3_emu.cpp
+test-attn-fa3-emu: tests/fa3_emu.cpp tests/emu_prims.h backend_gpu_attn_fa3.cuh backend_gpu_mma.cuh
+	$(CXX) -std=c++11 -O2 -pthread -DPICOLM_FA3_EMU -Wno-unknown-pragmas -I. -Itests -o fa3_emu tests/fa3_emu.cpp
+
+# CPU emulation of the fp16 GEMM kernel (Q5_K / Q6_K / Q8_0): executes the real
+# backend_gpu_gemm_f16.cuh with the PTX primitives emulated and checks it against the project's own
+# CPU dequantisers (quant.c). The identity test requires every weight to match bit for bit.
+# Same constraints as the FA3 emulator above (C++11, threads; development target only).
+# `./gemm_emu quick` runs a fast subset; add -fsanitize=address to also catch out-of-bounds reads.
+.PHONY: test-gemm-f16-emu
+test-gemm-f16-emu: tests/gemm_emu.cpp tests/emu_prims.h backend_gpu_gemm_f16.cuh backend_gpu_mma.cuh quant.c quant.h
+	$(CC) -O1 -std=c11 -D_GNU_SOURCE -I. -c quant.c -o quant_ref_test.o
+	$(CXX) -std=c++11 -O2 -pthread -DPICOLM_FA3_EMU -Wno-unknown-pragmas -I. -Itests -o gemm_emu tests/gemm_emu.cpp quant_ref_test.o -lm
+
+# GPU check: fp16 GEMM vs the CPU oracle (quant.c) and vs the old int8 kernels, with timing.
+test-gemm-f16-gpu: tests/test_gemm_f16_gpu.cu backend_gpu_kernels-cuda.o quant.c quant.h
+	$(CC) -O2 -std=c11 -D_GNU_SOURCE -I. -c quant.c -o quant_ref_test.o
+	$(NVCC) $(CUDAFLAGS) $(CUDA_GENCODE) -DPICOLM_GPU=1 -o test_gemm_f16_gpu tests/test_gemm_f16_gpu.cu backend_gpu_kernels-cuda.o quant_ref_test.o -I.
 
 test-attn-fa3-gpu: tests/test_attn_fa3_gpu.cu backend_gpu_kernels-cuda.o
 	$(NVCC) $(CUDAFLAGS) $(CUDA_GENCODE) -DPICOLM_GPU=1 -o test_attn_fa3_gpu $^ -I.

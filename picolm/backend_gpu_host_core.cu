@@ -1657,6 +1657,31 @@ matmul_dev_impl(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
     int I = t->I, O = t->O;
     int ys = y_stride > 0 ? y_stride : O;
 
+    /* fp16 tensor-core GEMM with in-smem dequant (Q5_K / Q6_K / Q8_0) for prefill batches.
+     * No Q8_0 activation quantisation and no per-sub-block epilogue; see
+     * backend_gpu_gemm_f16.cuh. Opt in with PICOLM_F16_GEMM=1 until it has been validated
+     * on the target GPU (tests/test_gemm_f16_gpu), then invert this check.
+     * PICOLM_F16_GEMM_MIN_S sets the smallest batch it takes (default 32);
+     * PICOLM_GEMM_F16_TILE=BMxBN forces a tile shape. Falls through to the int8 kernels
+     * whenever the launcher declines (alignment, shape, shared memory). */
+    {
+        static int f16g = -1, f16g_min_s = 32;
+        if (f16g < 0) {
+            f16g = getenv("PICOLM_F16_GEMM") ? 1 : 0;
+            const char *m = getenv("PICOLM_F16_GEMM_MIN_S");
+            if (m && atoi(m) > 0) f16g_min_s = atoi(m);
+        }
+        if (f16g && ctx->has_imma && !picolm_gpu_no_imma() && S >= f16g_min_s) {
+            const int fmt = t->qtype == GGUF_TYPE_Q5_K ? 5 : t->qtype == GGUF_TYPE_Q6_K ? 6
+                          : t->qtype == GGUF_TYPE_Q8_0 ? 8 : 0;
+            if (fmt && picolm_gpu_gemm_f16_launch(ctx->stream, fmt, y_dev, x_dev, t->weights,
+                                                  S, I, O, (size_t)t->row_bytes, x_stride, y_stride)) {
+                gpu_dispatch_print("matmul_f16_gemm_dev");
+                return 1;
+            }
+        }
+    }
+
     if (t->qtype == GGUF_TYPE_Q8_0 && !picolm_gpu_force_f32()) {
         int n_blocks = I / 32;
         if (n_blocks < 1 || I % 32 != 0) return 0;

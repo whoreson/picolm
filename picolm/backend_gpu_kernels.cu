@@ -7517,6 +7517,109 @@ static int fa3_launch_t(gpuStream_t stream, float *out, const float *q,
 }
 #endif
 
+/* ================================================================
+ * fp16 tensor-core GEMM for Q5_K / Q6_K / Q8_0 weights (prefill).
+ * The kernel and its design notes live in backend_gpu_gemm_f16.cuh; this is its
+ * launcher. Tile sizes are picked per call from the grid shape (see below).
+ * ================================================================ */
+#include "backend_gpu_gemm_f16.cuh"
+
+#ifndef __HIP__
+template <int FMT, int BM, int BN>
+static int gemmf_launch_t(gpuStream_t stream, float *y, const float *x, const uint8_t *w,
+                          int S, int I, int O, size_t row_bytes, int xs, int ys) {
+    const size_t smem = gemmf_smem_bytes(FMT, BM, BN);
+    int dev = 0, optin = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+    if ((size_t)optin < smem) return 0;               /* does not fit on this GPU: caller falls back */
+    static size_t configured[16];                     /* per instantiation, per device */
+    if (dev >= 0 && dev < 16 && smem > configured[dev]) {
+        if (cudaFuncSetAttribute((const void *)picolm_gpu_gemm_f16_kernel<FMT, BM, BN>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem) != cudaSuccess) {
+            cudaGetLastError();
+            return 0;
+        }
+        configured[dev] = smem;
+    }
+    /* blockIdx.x walks token tiles, blockIdx.y weight row-blocks: the token tiles of one
+     * row-block are scheduled together, so the weights are read from DRAM once and the
+     * other tiles hit them in L2. */
+    dim3 grid((unsigned)((S + BN - 1) / BN), (unsigned)((O + BM - 1) / BM), 1);
+    picolm_gpu_gemm_f16_kernel<FMT, BM, BN><<<grid, GEMMF_THREADS, smem, stream>>>(
+        y, x, w, S, I, O, row_bytes, xs, ys);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+template <int FMT>
+static int gemmf_launch_fmt(int bm, int bn, gpuStream_t stream, float *y, const float *x, const uint8_t *w,
+                            int S, int I, int O, size_t rb, int xs, int ys) {
+    if (bm == 128 && bn == 128) return gemmf_launch_t<FMT, 128, 128>(stream, y, x, w, S, I, O, rb, xs, ys);
+    if (bm == 128 && bn == 64)  return gemmf_launch_t<FMT, 128, 64>(stream, y, x, w, S, I, O, rb, xs, ys);
+    if (bm == 64  && bn == 128) return gemmf_launch_t<FMT, 64, 128>(stream, y, x, w, S, I, O, rb, xs, ys);
+    if (bm == 64  && bn == 64)  return gemmf_launch_t<FMT, 64, 64>(stream, y, x, w, S, I, O, rb, xs, ys);
+    return gemmf_launch_t<FMT, 64, 32>(stream, y, x, w, S, I, O, rb, xs, ys);
+}
+
+/* Pick BM x BN. A block always does BM*BN*K work, so the time is about
+ * (number of waves) * BM * BN, and a partial last wave wastes the rest of the GPU:
+ * O=5120 with 128x128 tiles and S=512 is 40*4 = 160 blocks on 128 SMs = 2 waves for
+ * 1.25 waves of work. Smaller tiles issue more ldmatrix per mma, hence the weights.
+ * PICOLM_GEMM_F16_TILE=BMxBN (e.g. 128x64) overrides this for tuning on real hardware. */
+static void gemmf_pick_tile(int S, int O, int nsm, int *bm_out, int *bn_out) {
+    static int forced_bm = -1, forced_bn = -1;
+    if (forced_bm < 0) {
+        forced_bm = forced_bn = 0;
+        const char *e = getenv("PICOLM_GEMM_F16_TILE");
+        int a = 0, b = 0;
+        if (e && sscanf(e, "%dx%d", &a, &b) == 2 && (a == 64 || a == 128) && (b == 32 || b == 64 || b == 128)) {
+            forced_bm = a; forced_bn = b;
+        }
+    }
+    if (forced_bm) { *bm_out = forced_bm; *bn_out = forced_bn; return; }
+    static const int cand[5][2] = {{128, 128}, {128, 64}, {64, 128}, {64, 64}, {64, 32}};
+    static const double eff[5] = {1.00, 1.12, 1.12, 1.30, 1.55};   /* smaller tiles = more ldmatrix per mma */
+    double best = 1e300; int bi = 0;
+    for (int i = 0; i < 5; i++) {
+        const long blocks = (long)((S + cand[i][1] - 1) / cand[i][1]) * ((O + cand[i][0] - 1) / cand[i][0]);
+        const long waves = (blocks + nsm - 1) / nsm;
+        const double cost = (double)waves * cand[i][0] * cand[i][1] * eff[i];
+        if (cost < best) { best = cost; bi = i; }
+    }
+    *bm_out = cand[bi][0]; *bn_out = cand[bi][1];
+}
+#endif
+
+/* Returns 1 if launched, 0 if the shape / format / alignment is unsupported (caller falls back).
+ * fmt: 5 = Q5_K, 6 = Q6_K, 8 = Q8_0. */
+int picolm_gpu_gemm_f16_launch(gpuStream_t stream, int fmt, float *y, const float *x, const void *w,
+                               int S, int I, int O, size_t row_bytes, int x_stride, int y_stride) {
+#ifdef __HIP__
+    (void)stream; (void)fmt; (void)y; (void)x; (void)w; (void)S; (void)I; (void)O;
+    (void)row_bytes; (void)x_stride; (void)y_stride;
+    return 0;
+#else
+    if (S < 1 || O < 8 || (O & 1)) return 0;
+    if (fmt == GEMMF_Q5_K || fmt == GEMMF_Q6_K) { if (I % 256) return 0; }
+    else if (fmt == GEMMF_Q8_0) { if (I % 64) return 0; }
+    else return 0;
+    const int xs = x_stride > 0 ? x_stride : I, ys = y_stride > 0 ? y_stride : O;
+    if ((xs & 3) || (ys & 1)) return 0;               /* float4 activation loads, float2 stores */
+    if (((uintptr_t)x & 15) || ((uintptr_t)y & 7)) return 0;
+    if (fmt == GEMMF_Q5_K && (((uintptr_t)w & 15) || (row_bytes & 15))) return 0;   /* 16-byte cp.async */
+    if (fmt == GEMMF_Q8_0 && (((uintptr_t)w & 3) || (row_bytes & 3))) return 0;     /* 4-byte cp.async */
+    if (fmt == GEMMF_Q6_K && ((uintptr_t)w & 1)) return 0;
+    int dev = 0, nsm = 0, bm = 0, bn = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev);
+    gemmf_pick_tile(S, O, nsm > 0 ? nsm : 1, &bm, &bn);
+    const uint8_t *wp = (const uint8_t *)w;
+    if (fmt == GEMMF_Q5_K) return gemmf_launch_fmt<GEMMF_Q5_K>(bm, bn, stream, y, x, wp, S, I, O, row_bytes, xs, ys);
+    if (fmt == GEMMF_Q6_K) return gemmf_launch_fmt<GEMMF_Q6_K>(bm, bn, stream, y, x, wp, S, I, O, row_bytes, xs, ys);
+    return gemmf_launch_fmt<GEMMF_Q8_0>(bm, bn, stream, y, x, wp, S, I, O, row_bytes, xs, ys);
+#endif
+}
+
 /* Returns 1 if launched, 0 if this shape/format is unsupported (caller falls back). */
 int picolm_gpu_attention_prefill_fa3_launch(
         gpuStream_t stream, float *out, const float *q, const void *kv_k, const void *kv_v,

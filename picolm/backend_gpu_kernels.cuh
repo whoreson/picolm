@@ -385,6 +385,15 @@ int picolm_gpu_attention_prefill_fa3_launch(
         size_t k_pos_stride, size_t k_head_stride, size_t v_pos_stride, size_t v_head_stride,
         int n_swa, int kt, int vt);
 
+/* Prefill GEMM Y[s][o] = sum_k X[s][k] * W[o][k] for quantised weights, fp16 tensor cores with fp32
+ * accumulation (kernel + design notes in backend_gpu_gemm_f16.cuh). fmt: 5 = Q5_K, 6 = Q6_K,
+ * 8 = Q8_0. x is fp32 [S][I] (stride x_stride floats, 0 = I), y fp32 [S][O] (stride y_stride, 0 = O).
+ * Needs sm_80+. Returns 1 if it launched, 0 if the shape/format/alignment is unsupported or does
+ * not fit in shared memory, in which case the caller must use another kernel. NOT bit-identical to
+ * the int8 kernels (no activation quantisation: more accurate). */
+int picolm_gpu_gemm_f16_launch(gpuStream_t stream, int fmt, float *y, const float *x, const void *w,
+                               int S, int I, int O, size_t row_bytes, int x_stride, int y_stride);
+
 /* ---- SSM alpha/beta batched vec_dot kernel ----
  * Each thread block handles one head. Weights: column-major
  * [dim, n_heads], each column is a quantized row.
