@@ -193,7 +193,7 @@ static int pretok_next_glm4(const char *s, int n) {
  *
  * Implementation follows the regex order: digits first, then CJK, then
  * the complex ASCII/letter rule, then single digit. */
-static int pretok_next_spark25(const char *s, int n) {
+static int pretok_next_spark25_ex(const char *s, int n, int contractions) {
     int cp, adv;
     if (n <= 0) return 0;
     adv = utf8_next(s, n, &cp);
@@ -238,8 +238,9 @@ static int pretok_next_spark25(const char *s, int n) {
      *
      * Simplified: follow the DEFAULT path with CJK awareness. */
 
-    /* Contractions (case-insensitive) */
-    if (s[0] == '\'' && n >= 2) {
+    /* Contractions (case-insensitive). Spark-X2.5 only; DeepSeek V3's regex
+     * has no contraction alternative. */
+    if (contractions && s[0] == '\'' && n >= 2) {
         char c1 = s[1] | 32, c2 = (n >= 3) ? (s[2] | 32) : 0;
         if (c1 == 's' || c1 == 't' || c1 == 'm' || c1 == 'd') return 2;
         if ((c1 == 'r' && c2 == 'e') || (c1 == 'v' && c2 == 'e') ||
@@ -371,6 +372,15 @@ static int pretok_next_spark25(const char *s, int n) {
     }
 
     return adv; /* fallback: single codepoint */
+}
+
+/* Spark-X2.5 (contractions enabled) and DeepSeek V3 (`deepseek-v3`, which
+ * uses the same patterns minus the contraction alternative). */
+static int pretok_next_spark25(const char *s, int n) {
+    return pretok_next_spark25_ex(s, n, 1);
+}
+static int pretok_next_deepseek3(const char *s, int n) {
+    return pretok_next_spark25_ex(s, n, 0);
 }
 
 /* GPT-2 pretokenizer (tokenizer.ggml.pre == "gpt-2" and "granite-docling"
@@ -776,7 +786,8 @@ int qwen_tokenize_should_use(const model_t *m) {
      * Safetensors Qwen models also use this tokenizer (from_safetensors path). */
     return m->config.is_qwen || m->config.is_gpt2 || m->config.is_tekken ||
            m->config.is_gptneox || m->config.is_glm4_tok || m->config.is_spark25 ||
-           m->config.is_granite || m->from_safetensors;
+           m->config.is_granite || m->config.is_deepseek2 ||
+           m->from_safetensors;
 }
 
 /* Initialize the Qwen tokenizer from model data */
@@ -787,6 +798,7 @@ int qwen_tokenize_init(qwen_enc_t *enc, const model_t *m) {
                      : m->config.is_glm4_tok ? QWEN_PRETOK_GLM4
                      : m->config.is_spark25 ? QWEN_PRETOK_SPARK25
                      : m->config.is_granite ? QWEN_PRETOK_GPT2
+                     : m->config.is_deepseek2 ? QWEN_PRETOK_DEEPSEEK3
                      : QWEN_PRETOK_DEFAULT;
     /* granite-docling (and all families): type-3+4 tokens are whole tokens
      * in EVERY mode -- verified against llama.cpp b12300, whose /tokenize
@@ -961,6 +973,8 @@ int qwen_tokenize_encode(qwen_enc_t *enc, const char *text, int *out, int cap) {
                       ? pretok_next_glm4(text + q, end - q)
                       : (enc->pretok_type == QWEN_PRETOK_SPARK25)
                       ? pretok_next_spark25(text + q, end - q)
+                      : (enc->pretok_type == QWEN_PRETOK_DEEPSEEK3)
+                      ? pretok_next_deepseek3(text + q, end - q)
                       : (enc->pretok_type == QWEN_PRETOK_GPT2)
                       ? pretok_next_gpt2(text + q, end - q)
                       : pretok_next(text + q, end - q);
@@ -1006,8 +1020,13 @@ int qwen_tokenize_decode2(const qwen_enc_t *enc, int id, char *buf, int cap, int
             else if (cp < 0x800) {
                 buf[w++] = (char)(0xC0 | (cp >> 6));
                 buf[w++] = (char)(0x80 | (cp & 0x3F));
-            } else {
+            } else if (cp < 0x10000) {
                 buf[w++] = (char)(0xE0 | (cp >> 12));
+                buf[w++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                buf[w++] = (char)(0x80 | (cp & 0x3F));
+            } else {
+                buf[w++] = (char)(0xF0 | (cp >> 18));
+                buf[w++] = (char)(0x80 | ((cp >> 12) & 0x3F));
                 buf[w++] = (char)(0x80 | ((cp >> 6) & 0x3F));
                 buf[w++] = (char)(0x80 | (cp & 0x3F));
             }

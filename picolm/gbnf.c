@@ -662,6 +662,47 @@ static void accept_chr(const gbnf_rule *rules, const gbnf_element *const *stack,
  * per thread anyway. Each caller gets its own pair, which also removes the
  * shared-mutable-state hazard if two gbnf_t are ever advanced from different
  * threads. */
+/* Check whether a partial UTF-8 sequence (which could complete to any
+ * codepoint in [low, high]) could possibly satisfy the character rule
+ * at the top of the stack.  This is called when a token ends mid-UTF-8
+ * and we need to decide whether to keep it alive.
+ * Returns 1 if the range overlaps with the grammar, 0 otherwise. */
+static int match_partial_char_range(const gbnf_element *pos, uint32_t low, uint32_t high) {
+    int positive = (pos->type == GRETYPE_CHAR || pos->type == GRETYPE_CHAR_ANY);
+
+    if (pos->is_class_head) {
+        /* Bitmap-based char class: check if any bit in [low, high] is set.
+         * The bitmap only covers 0-255, so if low > 255 there is no overlap
+         * (a bitmap class can never match above-U+00FF characters). */
+        if (low > 255) return !positive;
+        uint32_t hi = high > 255 ? 255 : high;
+        for (uint32_t c = low; c <= hi; c++) {
+            if ((pos->bits[c >> 3] >> (c & 7)) & 1) return positive;
+        }
+        return !positive;
+    }
+
+    /* Walk the element list (char, range, alt, ...) */
+    int found = 0;
+    for (;;) {
+        if (pos[1].type == GRETYPE_CHAR_RNG_UPPER) {
+            /* Range [lo, hi]: overlap with [low, high]? */
+            uint32_t rlo = pos->value, rhi = pos[1].value;
+            if (rlo <= high && low <= rhi) found = 1;
+            pos += 2;
+        } else if (pos->type == GRETYPE_CHAR_ANY) {
+            found = 1;
+            pos += 1;
+        } else {
+            /* Exact char match */
+            if (low <= pos->value && pos->value <= high) found = 1;
+            pos += 1;
+        }
+        if (pos->type != GRETYPE_CHAR_ALT) break;
+    }
+    return (found == positive);
+}
+
 static int walk_bytes(const gbnf_rule *rules,
                       const gbnf_element *const *stack, int n,
                       const uint8_t *bytes, int n_bytes,
@@ -725,6 +766,38 @@ static int walk_bytes(const gbnf_rule *rules,
     }
 
     int ok = (cur->n > 0) && (p.n_remain >= 0);
+
+    /* When the token ends mid-UTF-8, verify that the partial sequence
+     * could possibly complete to a codepoint matching the grammar.
+     * Without this, a token like " \xf0\x9f" (space + 2 bytes of emoji)
+     * would be accepted because the space matches and the trailing
+     * partial bytes are never checked against the grammar. */
+    if (ok && p.n_remain > 0) {
+        /* Compute [low, high]: the range of codepoints this partial
+         * UTF-8 sequence could complete to. */
+        uint32_t low  = p.value << (p.n_remain * 6);
+        uint32_t high = low | ((1u << (p.n_remain * 6)) - 1);
+
+        /* Clamp low for overlong-encoding guards (same as llama.cpp) */
+        if (low == 0) {
+            if (p.n_remain == 2) low = 1 << 11;
+            else if (p.n_remain == 3) low = 1 << 16;
+        }
+
+        /* Check every live stack: at least one must be able to accept
+         * some codepoint in [low, high]. */
+        int any_ok = 0;
+        for (int s = 0; s < (int)cur->n && !any_ok; s++) {
+            const gbnf_element *top = cur->v[s].n > 0 ? cur->v[s].ptrs[cur->v[s].n - 1] : NULL;
+            if (!top) continue;
+            if (is_char_element(top)) {
+                if (match_partial_char_range(top, low, high))
+                    any_ok = 1;
+            }
+        }
+        if (!any_ok) ok = 0;
+    }
+
     *partial = p;
     if (ok && commit_stacks) *commit_stacks = *cur;
     return ok;
