@@ -51,6 +51,10 @@
 #include <stdlib.h>
 #include <stdio.h>
 
+/* Scores row stride for the PFA attention tail (ds2_pfa_scores/pv).
+ * One block of keys per pass; see ds2_scores_ctx. */
+#define DS2_PFA_BK 64
+
 #ifndef INFINITY
 #define INFINITY (1.0f/0.0f)
 #endif
@@ -415,8 +419,13 @@ static void ds2_mla_forward(const model_t *m, int layer,
     float *qr    = sc;  sc += QL;
     float *q     = sc;  sc += (size_t)NH * KHK;
     float *qabs  = sc;  sc += (size_t)NH * KVL;
-    float *kvr   = sc;  sc += LROW;
+    /* Canonical order (matches model_core.c allocation):
+     * qr, q, qabs, q_comb(NH*LROW), ctx(NH*KVL), scores(NH*DS2_PFA_BK),
+     * kvr(LROW), o_concat(NH*HV). */
+    float *q_comb = sc; sc += (size_t)NH * LROW;
     float *ctx   = sc;  sc += (size_t)NH * KVL;
+    float *scores = sc; sc += (size_t)NH * DS2_PFA_BK;
+    float *kvr   = sc;  sc += LROW;
     float *o_concat = sc;
     const int prof = (getenv("PICOLM_DS2_PROF") != NULL);
     double p0 = prof ? get_time_ms() : 0, p1, p2, p3, p4, p5, p6;
@@ -533,9 +542,7 @@ static void ds2_mla_forward(const model_t *m, int layer,
                     nfloats * 4.0 / 1e6 / ((t1 - t0) / 1e3), acc);
         }
         {
-            float *q_comb = s->ds2.scratch + (size_t)QL + (size_t)NH * KHK + (size_t)NH * KVL;
-            float *sc2 = q_comb + (size_t)NH * LROW;
-            ds2_scores_ctx(m, layer, s, q, qabs, q_comb, sc2, pos, ctx,
+            ds2_scores_ctx(m, layer, s, q, qabs, q_comb, scores, pos, ctx,
                            NH, KVL, ROPE, NOPE, KHK, LROW);
         }
 
@@ -910,8 +917,13 @@ static void ds2_mla_attention_forward(const model_t *m, int layer,
                                       int HVNH)
 {
     float *sc = s->ds2.scratch;
-    float *qabs = sc; sc += (size_t)NH * KVL;
-    float *ctx  = sc; sc += (size_t)NH * KVL;
+    /* Canonical order subset (decode's qr/q/kvr/o_concat slots are free
+     * during prefill): qabs(NH*KVL) + q_comb(NH*LROW) + ctx(NH*KVL)
+     * + scores(NH*DS2_PFA_BK). */
+    float *qabs   = sc; sc += (size_t)NH * KVL;
+    float *q_comb = sc; sc += (size_t)NH * LROW;
+    float *ctx    = sc; sc += (size_t)NH * KVL;
+    float *scores = sc; sc += (size_t)NH * DS2_PFA_BK;
     (void)sc;
 
     /* Absorb q_nope into latent: q_abs[h] = Wk_b[h] @ q_nope[h] */
@@ -939,10 +951,8 @@ static void ds2_mla_attention_forward(const model_t *m, int layer,
 
     /* Attention scoring + softmax + weighted sum over the shared cache:
      * PFA-style, all heads in one pass (see ds2_scores_ctx). */
-    ds2_scores_ctx(m, layer, s, q_in, qabs,
-                   sc + (size_t)NH * KVL * 2,
-                   sc + (size_t)NH * KVL * 2 + (size_t)NH * LROW,
-                   pos, ctx, NH, KVL, ROPE, NOPE, KHK, LROW);
+    ds2_scores_ctx(m, layer, s, q_in, qabs, q_comb, scores, pos, ctx,
+                   NH, KVL, ROPE, NOPE, KHK, LROW);
 
     /* V projection: o[h] = Wv_b[h] @ ctx[h] */
     {
@@ -1197,7 +1207,6 @@ float *model_forward_prefill_deepseek2(model_t *m, const int *tokens, int n_toke
 /* stride). AVX-512 with AVX2 and scalar fallbacks, same tiling as      */
 /* GLM5: 4 query rows x 4 key rows per iteration.                      */
 /* ------------------------------------------------------------------ */
-#define DS2_PFA_BK 64
 
 static inline __m512 ds2_pfa_hsum16(const __m512 a[16])
 {
@@ -1400,7 +1409,13 @@ static void ds2_pfa_pv(float *O, int R, const float *P, int nk,
 /* Combined scores + softmax + PV over ALL heads at once (MQA: the cache is
  * shared). q_in: [NH * KHK] (RoPE'd), qabs: [NH * KVL] (absorbed q).
  * q_comb [NH*LROW] and scores [NH*DS2_PFA_BK] are per-caller scratch.
- * Writes ctx [NH * KVL]. */
+ * Writes ctx [NH * KVL].
+ *
+ * Keys are processed in DS2_PFA_BK-sized blocks with an ONLINE softmax
+ * (running max m and sum l per head, GLM-5 PFA style): the scores buffer
+ * only ever holds one block (nk <= DS2_PFA_BK per row), so context length
+ * is unbounded by the scratch size. Final ctx = (sum_b sum_t e^{s_t-m} v_t)
+ * / l. */
 static void ds2_scores_ctx(const model_t *m, int layer, run_state_t *s,
                            const float *q_in, const float *qabs,
                            float *q_comb, float *scores,
@@ -1421,21 +1436,40 @@ static void ds2_scores_ctx(const model_t *m, int layer, run_state_t *s,
     for (int h = 0; h < NH && h < 128; h++) qp[h] = q_comb + (size_t)h * LROW;
 
     float *cache = s->ds2.mla_kv + (size_t)layer * s->ds2.mla_kv_layer_stride;
-    ds2_pfa_scores(qp, NH, cache, n_kv, LROW, LROW, scores, s->ds2.kq_scale);
 
-    /* row softmax (n_kv small; expf count = NH*n_kv) */
-    for (int h = 0; h < NH; h++) {
-        float *sr = scores + (size_t)h * DS2_PFA_BK;
-        float mx = -INFINITY;
-        for (int t = 0; t < n_kv; t++) if (sr[t] > mx) mx = sr[t];
-        float sum = 0.f;
-        for (int t = 0; t < n_kv; t++) { float e = expf(sr[t] - mx); sr[t] = e; sum += e; }
-        const float inv = 1.0f / sum;
-        for (int t = 0; t < n_kv; t++) sr[t] *= inv;
+    float run_max[128], run_sum[128];
+    for (int h = 0; h < NH && h < 128; h++) { run_max[h] = -INFINITY; run_sum[h] = 0.f; }
+    memset(ctx, 0, (size_t)NH * KVL * sizeof(float));
+
+    for (int kb0 = 0; kb0 < n_kv; kb0 += DS2_PFA_BK) {
+        const int nk = (n_kv - kb0 < DS2_PFA_BK) ? n_kv - kb0 : DS2_PFA_BK;
+        const float *kb = cache + (size_t)kb0 * LROW;
+        ds2_pfa_scores(qp, NH, kb, nk, LROW, LROW, scores, s->ds2.kq_scale);
+
+        /* online softmax update per head */
+        for (int h = 0; h < NH && h < 128; h++) {
+            float *sr = scores + (size_t)h * DS2_PFA_BK;
+            float mx = -INFINITY;
+            for (int t = 0; t < nk; t++) if (sr[t] > mx) mx = sr[t];
+            const float mnew = (mx > run_max[h]) ? mx : run_max[h];
+            const float alpha = expf(run_max[h] - mnew);   /* expf(-inf - finite)=0 on 1st block */
+            float *ch = ctx + (size_t)h * KVL;
+            for (int d = 0; d < KVL; d++) ch[d] *= alpha;
+            run_sum[h] *= alpha;
+            for (int t = 0; t < nk; t++) { float e = expf(sr[t] - mnew); sr[t] = e; run_sum[h] += e; }
+            run_max[h] = mnew;
+        }
+
+        /* ctx += P @ V  (V = latent part of this block's cache rows) */
+        ds2_pfa_pv(ctx, NH, scores, nk, kb + ROPE, LROW, KVL);
     }
 
-    memset(ctx, 0, (size_t)NH * KVL * sizeof(float));
-    ds2_pfa_pv(ctx, NH, scores, n_kv, cache + ROPE, LROW, KVL);
+    for (int h = 0; h < NH && h < 128; h++) {
+        if (!(run_sum[h] > 0.f)) run_sum[h] = 1.f;   /* guard */
+        const float inv = 1.0f / run_sum[h];
+        float *ch = ctx + (size_t)h * KVL;
+        for (int d = 0; d < KVL; d++) ch[d] *= inv;
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -1593,6 +1627,10 @@ float *model_forward_deepseek2(model_t *m, int token, int pos)
                     il, il < c->n_layer_dense_lead ? "dense" : "moe",
                     sqrtf(sa / D), sqrtf(sf / D), sqrtf(sx / D));
         }
+
+#ifdef PICOLM_VIZ
+        viz_push_row(il, pos, s->x, D);
+#endif
 
         BENCH_LAYER_END(il, 0);
         if (stop_layer >= 0 && il >= stop_layer) break;
