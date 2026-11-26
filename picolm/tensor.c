@@ -1798,6 +1798,14 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
         }
     }
 #endif
+    if (!out) {
+        static int null_out_warn;
+        if (!null_out_warn) {
+            fprintf(stderr, "WARN: matmul NULL out (n=%d d=%d qtype=%d)\n", n, d, qtype);
+            null_out_warn = 1;
+        }
+        return;
+    }
     const type_info_t *ti = typeinfo(qtype);
     size_t row_bytes = gguf_type_row_size(qtype, n);
     const char *wptr = (const char *)W;
@@ -3004,24 +3012,20 @@ typedef struct {
 /* Table-driven GEMM task wrapper: dispatches through type_info_t->fn_gemm with
  * correct per-thread ith/nth. Used by matmul_batch's GEMM_table path. */
 typedef struct { int nrows, ncols, k; const void *w, *a; float *out; size_t bs;
-                 type_gemm_fn fn; } gemm_table_ctx_t;
+                 type_gemm_fn fn; int nth; } gemm_table_ctx_t;
 
 /* Set by any thread whose fn_gemm call did real work. See gemm_table_task. */
 static volatile int gemm_table_any_ok;
 
 static void gemm_table_task(int idx, void *ctxp) {
     gemm_table_ctx_t *c = (gemm_table_ctx_t *)ctxp;
-    int nth = pool_total_threads(1);
-    /* Clamp the effective thread count to the work available.
-     *
-     * The kernels split columns as start_col = ncols*ith/nth, so when
-     * nth > ncols an integer division gives *every* thread an empty range --
-     * not just the surplus ones. With ncols=2 and nth=24 all 24 threads get
-     * [0,0) and the whole GEMM silently does nothing.
-     *
-     * Tensor ids past the new `nth` would otherwise still run, so they are
-     * turned into no-ops here rather than relying on the split. */
-    if (nth > c->ncols) nth = c->ncols;
+    /* nth is the DISPATCH size (set by the caller); the table fn_gemm kernels
+     * partition ROWS across ith/nth (kq_best fallback: r0=ith*gpt over nrows;
+     * iq6v_drive: groups=nrows/8; r4_gemm_generic: row groups; R8: row groups),
+     * so nth may exceed ncols. The old clamp to ncols throttled small-batch
+     * prefill GEMMs (e.g. DeepSeek dense layers, batch=6) to ncols threads. */
+    int nth = c->nth;
+    if (nth > c->nrows) nth = c->nrows;
     if (nth < 1) nth = 1;
     if (idx >= nth) return;
     int r = c->fn(c->nrows, c->ncols, c->k, c->w, c->a, c->out, c->bs, idx, nth);
@@ -3083,11 +3087,11 @@ static void gemm_table_check(int nrows, int ncols, int k) {
  * they resolve to the same kernel. Mixed pairs like Q2_K gate + Q4_K up are
  * common, and using fn1 for both sides silently runs the wrong dequantiser. */
 typedef struct { int nrows, ncols, k; const void *w1, *w2, *a; float *out1, *out2;
-                 size_t bs; type_gemm_fn fn1, fn2; } gemm_table_dual_ctx_t;
+                 size_t bs; type_gemm_fn fn1, fn2; int nth; } gemm_table_dual_ctx_t;
 
 static void gemm_table_dual_task(int idx, void *ctxp) {
     gemm_table_dual_ctx_t *c = (gemm_table_dual_ctx_t *)ctxp;
-    int nth = pool_total_threads(1);
+    int nth = c->nth;
     int r1 = c->fn1(c->nrows, c->ncols, c->k, c->w1, c->a, c->out1, c->bs, idx, nth);
     int r2 = c->fn2(c->nrows, c->ncols, c->k, c->w2, c->a, c->out2, c->bs, idx, nth);
     if ((r1 == 0 || r2 == 0) && idx == 0) {
@@ -3742,15 +3746,10 @@ void matmul_batch(float *out, const float *x, int n_batch,
      * R4 types (rows_per_block > 1) are allowed at n=1 as before: their
      * interleave already provides multiple rows per kernel call. */
     if (ti->fn_gemm && (n_batch >= 2 || (ti->rows_per_block > 1 && n_batch >= 1))) {
-        int nth = pool_total_threads(1);
-        /* Never wake more threads than there are columns to fill: the kernels
-         * partition ncols across nth with integer division, so nth > ncols
-         * leaves *every* thread with an empty range and the GEMM does nothing.
-         * (gemm_table_task clamps again for callers that arrive with a pool
-         * size rather than a dispatch size.) */
-        if (nth > n_batch) nth = n_batch;
+        /* Row-partitioned kernels: use the full pool (see gemm_table_task). */
+        int nth = n_threads;
         /* Use a task wrapper that passes the table's fn_gemm with correct ith */
-        gemm_table_ctx_t ctx = { d, n_batch, n, W, qb.qbuf, out, d, ti->fn_gemm };
+        gemm_table_ctx_t ctx = { d, n_batch, n, W, qb.qbuf, out, d, ti->fn_gemm, nth };
         gemm_table_any_ok = 0;
         tensor_parallel_for(nth, gemm_table_task, &ctx);
         gemm_table_check(d, n_batch, n);
@@ -4612,10 +4611,10 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
         if (!_sgemm_off3) {
             quant_buf_t qbd = quant_activations(qtype1, x, n_batch, n, NULL, 0);
             if (qbd.qbuf) {
-                int nth = pool_total_threads(1);
+                int nth = n_threads;   /* row-partitioned kernels: full pool */
                 gemm_table_dual_ctx_t gd = { d, n_batch, n, W1, W2, qbd.qbuf,
                                              out1, out2, (size_t)d,
-                                             ti1->fn_gemm, ti2->fn_gemm };
+                                             ti1->fn_gemm, ti2->fn_gemm, nth };
                 tensor_parallel_for(nth, gemm_table_dual_task, &gd);
                 free_quant_buf(&qbd, NULL);
                 DISPATCH2("GEMM_table_dual_fused");

@@ -43,6 +43,9 @@
 #include "tensor.h"
 #include "quant.h"
 #include "steer.h"
+#ifdef PICOLM_VIZ
+#include "viz.h"
+#endif
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
@@ -296,6 +299,11 @@ int ds2_init_rope(model_t *m)
 
 /* Per-layer wk_b/wv_b + row sizes, abstracting over "mmap'd split tensors"
  * and "heap-derived from attn_kv_b". */
+static void ds2_scores_ctx(const model_t *m, int layer, run_state_t *s,
+                           const float *q_in, const float *qabs,
+                           float *q_comb, float *scores,
+                           int pos, float *ctx,
+                           int NH, int KVL, int ROPE, int NOPE, int KHK, int LROW);
 static void ds2_kv_b_ptrs(const model_t *m, int layer,
                           const void **wk, gguf_type_t *wk_t, size_t *wk_head_sz,
                           const void **wv, gguf_type_t *wv_t, size_t *wv_head_sz)
@@ -409,7 +417,6 @@ static void ds2_mla_forward(const model_t *m, int layer,
     float *qabs  = sc;  sc += (size_t)NH * KVL;
     float *kvr   = sc;  sc += LROW;
     float *ctx   = sc;  sc += (size_t)NH * KVL;
-    float *scores = sc; sc += c->max_seq_len;
     float *o_concat = sc;
     const int prof = (getenv("PICOLM_DS2_PROF") != NULL);
     double p0 = prof ? get_time_ms() : 0, p1, p2, p3, p4, p5, p6;
@@ -451,26 +458,16 @@ static void ds2_mla_forward(const model_t *m, int layer,
         for (int i = 0; i < KVL; i++) kvr[i] *= inv * nw[i];
     }
 
-    /* ---- RoPE on q_rope (per head, last ROPE dims) and on k_pe ---- */
+    /* ---- RoPE on q_rope (per head, last ROPE dims) and on k_pe ----
+     * tensor.c's rope() (AVX-512/AVX/NEON, pairwise == rope_type 0). */
     {
         const int half = ROPE / 2;
         const float *cos_pos = s->ds2.rope_cos + (size_t)pos * half;
         const float *sin_pos = s->ds2.rope_sin + (size_t)pos * half;
-        /* rope_type 0 == pairwise (LLAMA_ROPE_TYPE_NORM): (v[2i], v[2i+1]). */
-        for (int h = 0; h < NH; h++) {
-            float *qp = q + (size_t)h * KHK + NOPE;
-            for (int i = 0; i < half; i++) {
-                float v0 = qp[i * 2], v1 = qp[i * 2 + 1];
-                qp[i * 2]     = v0 * cos_pos[i] - v1 * sin_pos[i];
-                qp[i * 2 + 1] = v0 * sin_pos[i] + v1 * cos_pos[i];
-            }
-        }
-        float *kp = kvr + KVL;   /* k_pe lives after the latent */
-        for (int i = 0; i < half; i++) {
-            float v0 = kp[i * 2], v1 = kp[i * 2 + 1];
-            kp[i * 2]     = v0 * cos_pos[i] - v1 * sin_pos[i];
-            kp[i * 2 + 1] = v0 * sin_pos[i] + v1 * cos_pos[i];
-        }
+        for (int h = 0; h < NH; h++)
+            rope(q + (size_t)h * KHK + NOPE, NULL, ROPE, 1, 0,
+                 cos_pos, sin_pos, 0, half);
+        rope(kvr + KVL, NULL, ROPE, 1, 0, cos_pos, sin_pos, 0, half);
     }
 
     /* ---- Store the cache row: [k_pe ; kv_latent] (rope FIRST) ---- */
@@ -483,6 +480,7 @@ static void ds2_mla_forward(const model_t *m, int layer,
 
     /* ---- Absorb q_nope into the latent space: q_abs[h] = Wk_b[h] @ q_nope ---- */
     p2 = prof ? get_time_ms() : 0;
+    int multi_ret = -1;
     {
         const void *wk; gguf_type_t wk_t; size_t wk_head_sz;
         const void *wv; gguf_type_t wv_t; size_t wv_head_sz;
@@ -499,7 +497,12 @@ static void ds2_mla_forward(const model_t *m, int layer,
                 jobs[h].d   = KVL;
                 jobs[h].qtype = wk_t;
             }
-            if (!nj || !tensor_matmul_multi(jobs, nj)) {
+            if (!nj || (multi_ret = tensor_matmul_multi(jobs, nj)) == 0) {
+                if (prof && !nj) {
+                    static int once = 0;
+                    if (!once) { once = 1;
+                        fprintf(stderr, "[ds2] absorb: nj=0 NH=%d\n", NH); }
+                }
                 for (int h = 0; h < NH; h++)
                     matmul(qabs + (size_t)h * KVL, q + (size_t)h * KHK,
                            (const uint8_t *)wk + (size_t)h * wk_head_sz,
@@ -507,52 +510,33 @@ static void ds2_mla_forward(const model_t *m, int layer,
             }
         }
 
-        /* ---- Attention over the compressed cache (MQA, 1 KV head) ---- */
+        /* ---- Attention over the compressed cache (MQA, 1 KV head) ----
+         * PFA-style: all 128 heads scored against the shared cache in one
+         * vectorized pass (port of glm5_pfa_scores/pfa_pv). */
         p3 = prof ? get_time_ms() : 0;
-        const float scale = s->ds2.kq_scale;
-        const int n_kv = pos + 1;
-        for (int h = 0; h < NH; h++) {
-            /* q_comb = [q_rope ; q_abs] -- rope first, matching the cache row.
-             * Build it into the ctx slot temporarily? No: score directly. */
-            const float *q_rope = q + (size_t)h * KHK + NOPE;
-            const float *q_abs  = qabs + (size_t)h * KVL;
-            for (int t = 0; t < n_kv; t++) {
-                const float *row = cache + (size_t)t * LROW;
-                float acc = 0.f;
-                /* rope part */
-                acc += vec_dot_f32_f32(row, q_rope, ROPE);
-                /* latent part */
-                acc += vec_dot_f32_f32(row + ROPE, q_abs, KVL);
-                scores[t] = acc * scale;
-            }
-            if (getenv("PICOLM_DS2_SCOREDBG") && layer == 0 && h == 0) {
-                float smn = scores[0], smx = scores[0]; double ssum = 0;
-                for (int t = 0; t < n_kv; t++) {
-                    if (scores[t] < smn) smn = scores[t];
-                    if (scores[t] > smx) smx = scores[t];
-                    ssum += (double)scores[t];
-                }
-                fprintf(stderr, "[ds2 score] pos=%d l0 h0 n_kv=%d min=%.4f max=%.4f spread=%.4f mean=%.4f\n",
-                        pos, n_kv, (double)smn, (double)smx, (double)(smx-smn), ssum/n_kv);
-            }
-            /* softmax + weighted sum over the LATENT part only (V = kv_c). */
-            float mx = -INFINITY;
-            for (int t = 0; t < n_kv; t++) if (scores[t] > mx) mx = scores[t];
-            float sum = 0.f;
-            for (int t = 0; t < n_kv; t++) {
-                float e = expf(scores[t] - mx);
-                scores[t] = e;
-                sum += e;
-            }
-            const float inv = 1.0f / sum;
-            float *ch = ctx + (size_t)h * KVL;
-            memset(ch, 0, (size_t)KVL * sizeof(float));
-            for (int t = 0; t < n_kv; t++) {
-                const float p = scores[t] * inv;
-                if (p < 1e-10f) continue;
-                const float *row = cache + (size_t)t * LROW + ROPE;
-                for (int d = 0; d < KVL; d++) ch[d] += p * row[d];
-            }
+        if (prof) {
+            static int once = 0;
+            if (!once) { once = 1;
+                fprintf(stderr, "[ds2] absorb multi_ret=%d\n", multi_ret); }
+        }
+        if (prof && layer == 0) {
+            /* raw read probe over the same wk buffer: isolates memory-side
+             * (NUMA/page/frequency) from dispatch/kernel cost */
+            double t0 = get_time_ms();
+            const float *wp = (const float *)wk;
+            size_t nfloats = ds2_wk_bytes(NH, NOPE, KVL) / sizeof(float);
+            float acc = 0.f;
+            for (size_t i = 0; i < nfloats; i += 16) acc += wp[i];
+            double t1 = get_time_ms();
+            fprintf(stderr, "[ds2 memprobe] read %.1f MB serial-strided: %.2f ms (%.2f GB/s) acc=%g\n",
+                    nfloats * 4.0 / 1e6, t1 - t0,
+                    nfloats * 4.0 / 1e6 / ((t1 - t0) / 1e3), acc);
+        }
+        {
+            float *q_comb = s->ds2.scratch + (size_t)QL + (size_t)NH * KHK + (size_t)NH * KVL;
+            float *sc2 = q_comb + (size_t)NH * LROW;
+            ds2_scores_ctx(m, layer, s, q, qabs, q_comb, sc2, pos, ctx,
+                           NH, KVL, ROPE, NOPE, KHK, LROW);
         }
 
         /* ---- V projection: o[h] = Wv_b[h] @ ctx[h] ---- */
@@ -874,10 +858,7 @@ static void ds2_dense_ffn(const model_t *m, const layer_weights_t *lw,
 
     matmul(s->hb,  cur, lw->ffn_gate, D, FF, lw->type_ffn_gate);
     matmul(s->hb2, cur, lw->ffn_up,   D, FF, lw->type_ffn_up);
-    for (int i = 0; i < FF; i++) {
-        const float g = s->hb[i];
-        s->hb[i] = (g / (1.0f + expf(-g))) * s->hb2[i];
-    }
+    silu_mul(s->hb, s->hb, s->hb2, FF);
     matmul(out, s->hb, lw->ffn_down, FF, D, lw->type_ffn_down);
 }
 
@@ -911,10 +892,10 @@ typedef struct {
 
 static void ds2_silu_mul_task(int idx, void *ctxp) {
     ds2_silu_mul_ctx_t *ctx = (ds2_silu_mul_ctx_t *)ctxp;
-    float *ga = ctx->a + (size_t)idx * ctx->dim;
-    const float *g  = ctx->a + (size_t)idx * ctx->dim;
-    const float *up = ctx->b + (size_t)idx * ctx->dim;
-    for (int i = 0; i < ctx->dim; i++) ga[i] = up[i] * (1.0f / (1.0f + expf(-g[i])));
+    silu_mul(ctx->a + (size_t)idx * ctx->dim,
+             ctx->a + (size_t)idx * ctx->dim,
+             ctx->b + (size_t)idx * ctx->dim,
+             ctx->dim);
 }
 
 /* Per-token MLA attention (absorbed) for the batched prefill. Takes the
@@ -931,8 +912,6 @@ static void ds2_mla_attention_forward(const model_t *m, int layer,
     float *sc = s->ds2.scratch;
     float *qabs = sc; sc += (size_t)NH * KVL;
     float *ctx  = sc; sc += (size_t)NH * KVL;
-    const int max_seq = m->config.max_seq_len;
-    float *scores = sc; sc += max_seq;
     (void)sc;
 
     /* Absorb q_nope into latent: q_abs[h] = Wk_b[h] @ q_nope[h] */
@@ -958,35 +937,12 @@ static void ds2_mla_attention_forward(const model_t *m, int layer,
         }
     }
 
-    /* Attention scoring + softmax + weighted sum + V projection */
-    const float scale = s->ds2.kq_scale;
-    const int n_kv = pos + 1;
-    float *cache = s->ds2.mla_kv + (size_t)layer * s->ds2.mla_kv_layer_stride;
-    for (int h = 0; h < NH; h++) {
-        const float *q_rope = q_in + (size_t)h * KHK + NOPE;
-        const float *q_abs_h = qabs + (size_t)h * KVL;
-        for (int tt = 0; tt < n_kv; tt++) {
-            const float *row = cache + (size_t)tt * LROW;
-            float acc = vec_dot_f32_f32(row, q_rope, ROPE)
-                      + vec_dot_f32_f32(row + ROPE, q_abs_h, KVL);
-            scores[tt] = acc * scale;
-        }
-        float mx = -INFINITY;
-        for (int tt = 0; tt < n_kv; tt++) if (scores[tt] > mx) mx = scores[tt];
-        float sum = 0.f;
-        for (int tt = 0; tt < n_kv; tt++) {
-            float e = expf(scores[tt] - mx); scores[tt] = e; sum += e;
-        }
-        const float inv = 1.0f / sum;
-        float *ch = ctx + (size_t)h * KVL;
-        memset(ch, 0, (size_t)KVL * sizeof(float));
-        for (int tt = 0; tt < n_kv; tt++) {
-            const float p = scores[tt] * inv;
-            if (p < 1e-10f) continue;
-            const float *row = cache + (size_t)tt * LROW + ROPE;
-            for (int d = 0; d < KVL; d++) ch[d] += p * row[d];
-        }
-    }
+    /* Attention scoring + softmax + weighted sum over the shared cache:
+     * PFA-style, all heads in one pass (see ds2_scores_ctx). */
+    ds2_scores_ctx(m, layer, s, q_in, qabs,
+                   sc + (size_t)NH * KVL * 2,
+                   sc + (size_t)NH * KVL * 2 + (size_t)NH * LROW,
+                   pos, ctx, NH, KVL, ROPE, NOPE, KHK, LROW);
 
     /* V projection: o[h] = Wv_b[h] @ ctx[h] */
     {
@@ -1114,12 +1070,8 @@ float *model_forward_prefill_deepseek2(model_t *m, const int *tokens, int n_toke
             for (int t = 0; t < n_tokens; t++) {
                 float *qt = q_batch + (size_t)t * (size_t)NH * KHK;
                 const float *qa = q_a_batch + (size_t)t * QL;
-                float ss = 0.f;
-                for (int i = 0; i < QL; i++) ss += qa[i] * qa[i];
-                const float inv = 1.0f / sqrtf(ss / QL + c->rms_norm_eps);
-                const float *nw = (const float *)gw->mla_q_a_norm;  /* F32 */
                 float *tmp = s->hb;   /* >= QL floats (n_ffn >= 1536) */
-                for (int i = 0; i < QL; i++) tmp[i] = qa[i] * inv * nw[i];
+                rmsnorm(tmp, qa, (const float *)gw->mla_q_a_norm, QL, c->rms_norm_eps);
                 matmul(qt, tmp, gw->mla_q_b, QL, NH * KHK, gw->type_mla_q_b);
             }
         } else {
@@ -1144,7 +1096,8 @@ float *model_forward_prefill_deepseek2(model_t *m, const int *tokens, int n_toke
             }
         }
 
-        /* RoPE on q_rope (per head, last ROPE dims, pairwise) and on k_pe */
+        /* RoPE on q_rope (per head, last ROPE dims, pairwise) and on k_pe
+         * via tensor.c's rope() (AVX-512/AVX/NEON). */
         {
             const int half = ROPE / 2;
             for (int t = 0; t < n_tokens; t++) {
@@ -1152,20 +1105,11 @@ float *model_forward_prefill_deepseek2(model_t *m, const int *tokens, int n_toke
                 const float *cos_pos = s->ds2.rope_cos + (size_t)pos * half;
                 const float *sin_pos = s->ds2.rope_sin + (size_t)pos * half;
                 float *qb = q_batch + (size_t)t * (size_t)NH * KHK;
-                for (int h = 0; h < NH; h++) {
-                    float *qp = qb + (size_t)h * KHK + NOPE;
-                    for (int i = 0; i < half; i++) {
-                        float v0 = qp[i * 2], v1 = qp[i * 2 + 1];
-                        qp[i * 2]     = v0 * cos_pos[i] - v1 * sin_pos[i];
-                        qp[i * 2 + 1] = v0 * sin_pos[i] + v1 * cos_pos[i];
-                    }
-                }
-                float *kp = kvr_batch + (size_t)t * LROW + KVL;
-                for (int i = 0; i < half; i++) {
-                    float v0 = kp[i * 2], v1 = kp[i * 2 + 1];
-                    kp[i * 2]     = v0 * cos_pos[i] - v1 * sin_pos[i];
-                    kp[i * 2 + 1] = v0 * sin_pos[i] + v1 * cos_pos[i];
-                }
+                for (int h = 0; h < NH; h++)
+                    rope(qb + (size_t)h * KHK + NOPE, NULL, ROPE, 1, 0,
+                         cos_pos, sin_pos, 0, half);
+                rope(kvr_batch + (size_t)t * LROW + KVL, NULL, ROPE, 1, 0,
+                     cos_pos, sin_pos, 0, half);
             }
         }
 
@@ -1244,6 +1188,254 @@ float *model_forward_prefill_deepseek2(model_t *m, const int *tokens, int n_toke
     }
     free(pf);
     return s->logits;
+}
+
+/* ------------------------------------------------------------------ */
+/* PFA-style attention tail (port of model_glm5.c's glm5_pfa_scores /  */
+/* glm5_pfa_pv, adapted for the ds2 cache: rows are LROW=576 wide,      */
+/* [k_pe(ROPE) ; kv(KVL)], so both kernels take an explicit row         */
+/* stride). AVX-512 with AVX2 and scalar fallbacks, same tiling as      */
+/* GLM5: 4 query rows x 4 key rows per iteration.                      */
+/* ------------------------------------------------------------------ */
+#define DS2_PFA_BK 64
+
+static inline __m512 ds2_pfa_hsum16(const __m512 a[16])
+{
+    __m512 t[8], u[4];
+    for (int i = 0; i < 8; i++)
+        t[i] = _mm512_add_ps(_mm512_unpacklo_ps(a[2*i], a[2*i+1]), _mm512_unpackhi_ps(a[2*i], a[2*i+1]));
+    for (int i = 0; i < 4; i++)
+        u[i] = _mm512_add_ps(_mm512_shuffle_ps(t[2*i], t[2*i+1], 0x44), _mm512_shuffle_ps(t[2*i], t[2*i+1], 0xEE));
+    __m128 v[4];
+    for (int i = 0; i < 4; i++) {
+        const __m256 hi = _mm256_castpd_ps(_mm512_extractf64x4_pd(_mm512_castps_pd(u[i]), 1));
+        const __m256 h  = _mm256_add_ps(_mm512_castps512_ps256(u[i]), hi);
+        v[i] = _mm_add_ps(_mm256_castps256_ps128(h), _mm256_extractf128_ps(h, 1));
+    }
+    __m512 r = _mm512_castps128_ps512(v[0]);
+    r = _mm512_insertf32x4(r, v[1], 1);
+    r = _mm512_insertf32x4(r, v[2], 2);
+    return _mm512_insertf32x4(r, v[3], 3);
+}
+
+static inline float ds2_hsum256(const __m256 v) {
+    __m128 s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 0x55));
+    return _mm_cvtss_f32(s);
+}
+
+/* S[r*DS2_PFA_BK + j] = dot(qp[r], kb[j*kstride]) * scale, over nk keys,
+ * KVD elements per dot. kb rows are kstride apart (ds2 cache: LROW). */
+static void ds2_pfa_scores(const float *const *qp, int R, const float *kb,
+                           int nk, int KVD, int kstride, float *S, float scale)
+{
+    int r = 0;
+#if defined(PICOLM_AVX512)
+    if ((KVD & 15) == 0) {
+        for (; r + 3 < R; r += 4) {
+            int j = 0;
+            for (; j + 3 < nk; j += 4) {
+                __m512 a00 = _mm512_setzero_ps(), a01 = a00, a02 = a00, a03 = a00,
+                       a10 = a00, a11 = a00, a12 = a00, a13 = a00,
+                       a20 = a00, a21 = a00, a22 = a00, a23 = a00,
+                       a30 = a00, a31 = a00, a32 = a00, a33 = a00;
+                const float *k0 = kb + (size_t)(j + 0) * kstride,
+                            *k1 = kb + (size_t)(j + 1) * kstride,
+                            *k2 = kb + (size_t)(j + 2) * kstride,
+                            *k3 = kb + (size_t)(j + 3) * kstride;
+                const float *q0 = qp[r], *q1 = qp[r + 1], *q2 = qp[r + 2], *q3 = qp[r + 3];
+                for (int d = 0; d < KVD; d += 16) {
+                    const __m512 v0 = _mm512_loadu_ps(k0 + d), v1 = _mm512_loadu_ps(k1 + d),
+                                 v2 = _mm512_loadu_ps(k2 + d), v3 = _mm512_loadu_ps(k3 + d);
+                    const __m512 w0 = _mm512_loadu_ps(q0 + d), w1 = _mm512_loadu_ps(q1 + d),
+                                 w2 = _mm512_loadu_ps(q2 + d), w3 = _mm512_loadu_ps(q3 + d);
+                    a00 = _mm512_fmadd_ps(v0, w0, a00); a01 = _mm512_fmadd_ps(v1, w0, a01);
+                    a02 = _mm512_fmadd_ps(v2, w0, a02); a03 = _mm512_fmadd_ps(v3, w0, a03);
+                    a10 = _mm512_fmadd_ps(v0, w1, a10); a11 = _mm512_fmadd_ps(v1, w1, a11);
+                    a12 = _mm512_fmadd_ps(v2, w1, a12); a13 = _mm512_fmadd_ps(v3, w1, a13);
+                    a20 = _mm512_fmadd_ps(v0, w2, a20); a21 = _mm512_fmadd_ps(v1, w2, a21);
+                    a22 = _mm512_fmadd_ps(v2, w2, a22); a23 = _mm512_fmadd_ps(v3, w2, a23);
+                    a30 = _mm512_fmadd_ps(v0, w3, a30); a31 = _mm512_fmadd_ps(v1, w3, a31);
+                    a32 = _mm512_fmadd_ps(v2, w3, a32); a33 = _mm512_fmadd_ps(v3, w3, a33);
+                }
+                const __m512 acc[16] = { a00, a01, a02, a03, a10, a11, a12, a13,
+                                         a20, a21, a22, a23, a30, a31, a32, a33 };
+                const __m512 sum = _mm512_mul_ps(ds2_pfa_hsum16(acc), _mm512_set1_ps(scale));
+                _mm_storeu_ps(S + (size_t)(r + 0) * DS2_PFA_BK + j, _mm512_extractf32x4_ps(sum, 0));
+                _mm_storeu_ps(S + (size_t)(r + 1) * DS2_PFA_BK + j, _mm512_extractf32x4_ps(sum, 1));
+                _mm_storeu_ps(S + (size_t)(r + 2) * DS2_PFA_BK + j, _mm512_extractf32x4_ps(sum, 2));
+                _mm_storeu_ps(S + (size_t)(r + 3) * DS2_PFA_BK + j, _mm512_extractf32x4_ps(sum, 3));
+            }
+            for (; j < nk; j++)
+                for (int i = 0; i < 4; i++)
+                    S[(size_t)(r + i) * DS2_PFA_BK + j] =
+                        vec_dot_f32_f32(kb + (size_t)j * kstride, qp[r + i], KVD) * scale;
+        }
+    }
+#elif defined(PICOLM_AVX2)
+    if ((KVD & 7) == 0) {
+        for (; r + 3 < R; r += 4) {
+            int j = 0;
+            for (; j + 3 < nk; j += 4) {
+                __m256 a00 = _mm256_setzero_ps(), a01 = a00, a02 = a00, a03 = a00,
+                       a10 = a00, a11 = a00, a12 = a00, a13 = a00,
+                       a20 = a00, a21 = a00, a22 = a00, a23 = a00,
+                       a30 = a00, a31 = a00, a32 = a00, a33 = a00;
+                const float *k0 = kb + (size_t)(j + 0) * kstride,
+                            *k1 = kb + (size_t)(j + 1) * kstride,
+                            *k2 = kb + (size_t)(j + 2) * kstride,
+                            *k3 = kb + (size_t)(j + 3) * kstride;
+                const float *q0 = qp[r], *q1 = qp[r + 1], *q2 = qp[r + 2], *q3 = qp[r + 3];
+                for (int d = 0; d < KVD; d += 8) {
+                    const __m256 v0 = _mm256_loadu_ps(k0 + d), v1 = _mm256_loadu_ps(k1 + d),
+                                 v2 = _mm256_loadu_ps(k2 + d), v3 = _mm256_loadu_ps(k3 + d);
+                    const __m256 w0 = _mm256_loadu_ps(q0 + d), w1 = _mm256_loadu_ps(q1 + d),
+                                 w2 = _mm256_loadu_ps(q2 + d), w3 = _mm256_loadu_ps(q3 + d);
+                    a00 = _mm256_fmadd_ps(v0, w0, a00); a01 = _mm256_fmadd_ps(v1, w0, a01);
+                    a02 = _mm256_fmadd_ps(v2, w0, a02); a03 = _mm256_fmadd_ps(v3, w0, a03);
+                    a10 = _mm256_fmadd_ps(v0, w1, a10); a11 = _mm256_fmadd_ps(v1, w1, a11);
+                    a12 = _mm256_fmadd_ps(v2, w1, a12); a13 = _mm256_fmadd_ps(v3, w1, a13);
+                    a20 = _mm256_fmadd_ps(v0, w2, a20); a21 = _mm256_fmadd_ps(v1, w2, a21);
+                    a22 = _mm256_fmadd_ps(v2, w2, a22); a23 = _mm256_fmadd_ps(v3, w2, a23);
+                    a30 = _mm256_fmadd_ps(v0, w3, a30); a31 = _mm256_fmadd_ps(v1, w3, a31);
+                    a32 = _mm256_fmadd_ps(v2, w3, a32); a33 = _mm256_fmadd_ps(v3, w3, a33);
+                }
+                float *s0 = S + (size_t)(r + 0) * DS2_PFA_BK + j, *s1 = S + (size_t)(r + 1) * DS2_PFA_BK + j;
+                float *s2 = S + (size_t)(r + 2) * DS2_PFA_BK + j, *s3 = S + (size_t)(r + 3) * DS2_PFA_BK + j;
+                s0[0] = ds2_hsum256(a00) * scale; s0[1] = ds2_hsum256(a01) * scale;
+                s0[2] = ds2_hsum256(a02) * scale; s0[3] = ds2_hsum256(a03) * scale;
+                s1[0] = ds2_hsum256(a10) * scale; s1[1] = ds2_hsum256(a11) * scale;
+                s1[2] = ds2_hsum256(a12) * scale; s1[3] = ds2_hsum256(a13) * scale;
+                s2[0] = ds2_hsum256(a20) * scale; s2[1] = ds2_hsum256(a21) * scale;
+                s2[2] = ds2_hsum256(a22) * scale; s2[3] = ds2_hsum256(a23) * scale;
+                s3[0] = ds2_hsum256(a30) * scale; s3[1] = ds2_hsum256(a31) * scale;
+                s3[2] = ds2_hsum256(a32) * scale; s3[3] = ds2_hsum256(a33) * scale;
+            }
+            for (; j < nk; j++)
+                for (int i = 0; i < 4; i++)
+                    S[(size_t)(r + i) * DS2_PFA_BK + j] =
+                        vec_dot_f32_f32(kb + (size_t)j * kstride, qp[r + i], KVD) * scale;
+        }
+    }
+#endif
+    for (; r < R; r++)
+        for (int j = 0; j < nk; j++)
+            S[(size_t)r * DS2_PFA_BK + j] =
+                vec_dot_f32_f32(kb + (size_t)j * kstride, qp[r], KVD) * scale;
+}
+
+/* O[r*KVL + d] = sum_j P[r*DS2_PFA_BK + j] * kb[j*kstride + d]  (O is zeroed) */
+static void ds2_pfa_pv(float *O, int R, const float *P, int nk,
+                       const float *kb, int kstride, int KVL)
+{
+    int r = 0;
+#if defined(PICOLM_AVX512)
+    if ((KVL & 63) == 0) {
+        for (; r + 3 < R; r += 4) {
+            for (int c0 = 0; c0 < KVL; c0 += 64) {
+                __m512 a[4][4];
+                for (int i = 0; i < 4; i++) {
+                    for (int u = 0; u < 4; u++)
+                        a[i][u] = _mm512_loadu_ps(O + (size_t)(r + i) * KVL + c0 + 16 * u);
+                }
+                for (int j = 0; j < nk; j++) {
+                    const float *kr = kb + (size_t)j * kstride + c0;
+                    const __m512 v0 = _mm512_loadu_ps(kr), v1 = _mm512_loadu_ps(kr + 16),
+                                 v2 = _mm512_loadu_ps(kr + 32), v3 = _mm512_loadu_ps(kr + 48);
+                    for (int i = 0; i < 4; i++) {
+                        const __m512 pb = _mm512_set1_ps(P[(size_t)(r + i) * DS2_PFA_BK + j]);
+                        a[i][0] = _mm512_fmadd_ps(pb, v0, a[i][0]);
+                        a[i][1] = _mm512_fmadd_ps(pb, v1, a[i][1]);
+                        a[i][2] = _mm512_fmadd_ps(pb, v2, a[i][2]);
+                        a[i][3] = _mm512_fmadd_ps(pb, v3, a[i][3]);
+                    }
+                }
+                for (int i = 0; i < 4; i++) {
+                    for (int u = 0; u < 4; u++)
+                        _mm512_storeu_ps(O + (size_t)(r + i) * KVL + c0 + 16 * u, a[i][u]);
+                }
+            }
+        }
+    }
+#elif defined(PICOLM_AVX2)
+    if ((KVL & 31) == 0) {
+        for (; r + 3 < R; r += 4) {
+            for (int c0 = 0; c0 < KVL; c0 += 32) {
+                __m256 a[4][4];
+                for (int i = 0; i < 4; i++) {
+                    for (int u = 0; u < 4; u++)
+                        a[i][u] = _mm256_loadu_ps(O + (size_t)(r + i) * KVL + c0 + 8 * u);
+                }
+                for (int j = 0; j < nk; j++) {
+                    const float *kr = kb + (size_t)j * kstride + c0;
+                    const __m256 v0 = _mm256_loadu_ps(kr), v1 = _mm256_loadu_ps(kr + 8),
+                                 v2 = _mm256_loadu_ps(kr + 16), v3 = _mm256_loadu_ps(kr + 24);
+                    for (int i = 0; i < 4; i++) {
+                        const __m256 pb = _mm256_set1_ps(P[(size_t)(r + i) * DS2_PFA_BK + j]);
+                        a[i][0] = _mm256_fmadd_ps(pb, v0, a[i][0]);
+                        a[i][1] = _mm256_fmadd_ps(pb, v1, a[i][1]);
+                        a[i][2] = _mm256_fmadd_ps(pb, v2, a[i][2]);
+                        a[i][3] = _mm256_fmadd_ps(pb, v3, a[i][3]);
+                    }
+                }
+                for (int i = 0; i < 4; i++) {
+                    for (int u = 0; u < 4; u++)
+                        _mm256_storeu_ps(O + (size_t)(r + i) * KVL + c0 + 8 * u, a[i][u]);
+                }
+            }
+        }
+    }
+#endif
+    for (; r < R; r++) {
+        float *o = O + (size_t)r * KVL;
+        for (int j = 0; j < nk; j++) {
+            const float w = P[(size_t)r * DS2_PFA_BK + j];
+            const float *kr = kb + (size_t)j * kstride;
+            for (int d = 0; d < KVL; d++) o[d] += w * kr[d];
+        }
+    }
+}
+
+/* Combined scores + softmax + PV over ALL heads at once (MQA: the cache is
+ * shared). q_in: [NH * KHK] (RoPE'd), qabs: [NH * KVL] (absorbed q).
+ * q_comb [NH*LROW] and scores [NH*DS2_PFA_BK] are per-caller scratch.
+ * Writes ctx [NH * KVL]. */
+static void ds2_scores_ctx(const model_t *m, int layer, run_state_t *s,
+                           const float *q_in, const float *qabs,
+                           float *q_comb, float *scores,
+                           int pos, float *ctx,
+                           int NH, int KVL, int ROPE, int NOPE, int KHK, int LROW)
+{
+    const int n_kv = pos + 1;
+
+    /* q_comb[h] = [q_rope(ROPE) ; q_abs(KVL)] -- rope first, matching cache. */
+    for (int h = 0; h < NH; h++) {
+        memcpy(q_comb + (size_t)h * LROW, q_in + (size_t)h * KHK + NOPE,
+               (size_t)ROPE * sizeof(float));
+        memcpy(q_comb + (size_t)h * LROW + ROPE, qabs + (size_t)h * KVL,
+               (size_t)KVL * sizeof(float));
+    }
+
+    const float *qp[128];
+    for (int h = 0; h < NH && h < 128; h++) qp[h] = q_comb + (size_t)h * LROW;
+
+    float *cache = s->ds2.mla_kv + (size_t)layer * s->ds2.mla_kv_layer_stride;
+    ds2_pfa_scores(qp, NH, cache, n_kv, LROW, LROW, scores, s->ds2.kq_scale);
+
+    /* row softmax (n_kv small; expf count = NH*n_kv) */
+    for (int h = 0; h < NH; h++) {
+        float *sr = scores + (size_t)h * DS2_PFA_BK;
+        float mx = -INFINITY;
+        for (int t = 0; t < n_kv; t++) if (sr[t] > mx) mx = sr[t];
+        float sum = 0.f;
+        for (int t = 0; t < n_kv; t++) { float e = expf(sr[t] - mx); sr[t] = e; sum += e; }
+        const float inv = 1.0f / sum;
+        for (int t = 0; t < n_kv; t++) sr[t] *= inv;
+    }
+
+    memset(ctx, 0, (size_t)NH * KVL * sizeof(float));
+    ds2_pfa_pv(ctx, NH, scores, n_kv, cache + ROPE, LROW, KVL);
 }
 
 /* ------------------------------------------------------------------ */

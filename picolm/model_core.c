@@ -1497,10 +1497,15 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
         s->ds2.rope_cos = dp; dp += (size_t)c->max_seq_len * (ROPE / 2);
         s->ds2.rope_sin = dp; dp += (size_t)c->max_seq_len * (ROPE / 2);
         s->ds2.kq_scale = 0.0f;
+        /* ds2_mla_forward scratch: qr(QL) + q(NH*KHK) + qabs(NH*KVL)
+         * + q_comb(NH*LROW) + ctx(NH*KVL) + scores(NH*DS2_PFA_BK)
+         * + kvr(LROW) + o_concat(NH*HV) */
         s->ds2.scratch = dp;  dp += (size_t)(c->glm5_q_lora
                                    + (size_t)NH * c->glm5_mla_head_dim
-                                   + 2 * (size_t)NH * KVL + LROW
-                                   + c->max_seq_len
+                                   + 2 * (size_t)NH * KVL
+                                   + (size_t)NH * LROW
+                                   + (size_t)NH * 64
+                                   + LROW
                                    + (size_t)NH * HV);
         p = dp;
         fprintf(stderr, "[carve ds2] mla_kv=%p cur=%p attn_out=%p moe_down=%p rope_cos=%p rope_sin=%p scratch=%p end=%p\n",
