@@ -12346,7 +12346,114 @@ float vec_dot_iq1_s_q8_k(const void *vx, const void *vy, int n) {
  * advances at three different rates; three attempts at the vectorised form
  * failed check_iq_gemv, so it is not shipped half-verified. The 2-bit types
  * (IQ2_XXS / IQ2_XS / IQ2_S) and IQ1_S are done -- see below. */
+/* AVX2 port of ik_llama.cpp's ggml_vec_dot_iq3_s_q8_K (verified against
+ * vec_dot_iq3_s_q8_k_scalar by check_iq_gemv). Same method as IQ3_XXS:
+ * iq3s_grid lookup with qh-shifted high bits, sign bytes applied to the Q8_K
+ * activations via shuffle+cmpeq (no ksigns table), maddubs int8 dot with
+ * per-sub-block scales (2*ls+1). */
+#if defined(__AVX2__)
+static float vec_dot_iq3_s_q8_k_avx2(const void *vx, const void *vy, int n) {
+    const block_iq3_s *x = (const block_iq3_s *)vx;
+    const block_q8_K *y = (const block_q8_K *)vy;
+    const int nb = n / QK_K;
+
+    static const uint8_t k_mask1[32] = {
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+        0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02,
+        0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03
+    };
+    static const uint8_t k_mask2[32] = {
+        0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80,
+        0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80,
+        0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80,
+        0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80,
+    };
+
+    const __m256i mask1 = _mm256_loadu_si256((const __m256i *)k_mask1);
+    const __m256i mask2 = _mm256_loadu_si256((const __m256i *)k_mask2);
+
+    const __m256i idx_shift = _mm256_set_epi32(1, 2, 3, 4, 5, 6, 7, 8);
+    const __m256i idx_mask  = _mm256_set1_epi32(256);
+
+    typedef union {
+        __m256i  vec[2];
+        uint32_t index[16];
+    } index_t;
+
+    index_t idx;
+
+    __m256 accumf = _mm256_setzero_ps();
+    for (int i = 0; i < nb; ++i) {
+        const float d = fp16_to_fp32_lookup(x[i].d) * y[i].d;
+        const uint8_t *restrict qs = x[i].qs;
+        const uint8_t *restrict qh = x[i].qh;
+        const uint16_t *restrict signs = (const uint16_t *)x[i].signs;
+        const int8_t *restrict q8 = y[i].qs;
+        __m256i sumi1 = _mm256_setzero_si256();
+        __m256i sumi2 = _mm256_setzero_si256();
+        for (int ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
+            const __m256i q8_1 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+            const __m256i q8_2 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+            const __m256i idx_l = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)qs)); qs += 16;
+            idx.vec[0] = _mm256_set1_epi32(qh[ib32 + 0]);
+            idx.vec[1] = _mm256_set1_epi32(qh[ib32 + 1]);
+            idx.vec[0] = _mm256_and_si256(_mm256_sllv_epi32(idx.vec[0], idx_shift), idx_mask);
+            idx.vec[1] = _mm256_and_si256(_mm256_sllv_epi32(idx.vec[1], idx_shift), idx_mask);
+            idx.vec[0] = _mm256_or_si256(idx.vec[0], _mm256_cvtepi16_epi32(_mm256_castsi256_si128(idx_l)));
+            idx.vec[1] = _mm256_or_si256(idx.vec[1], _mm256_cvtepi16_epi32(_mm256_extractf128_si256(idx_l, 1)));
+
+            const __m256i q2_1 = _mm256_set_epi32(
+                    iq3s_grid[idx.index[7]], iq3s_grid[idx.index[6]], iq3s_grid[idx.index[5]], iq3s_grid[idx.index[4]],
+                    iq3s_grid[idx.index[3]], iq3s_grid[idx.index[2]], iq3s_grid[idx.index[1]], iq3s_grid[idx.index[0]]
+            );
+            const __m256i q2_2 = _mm256_set_epi32(
+                    iq3s_grid[idx.index[15]], iq3s_grid[idx.index[14]], iq3s_grid[idx.index[13]], iq3s_grid[idx.index[12]],
+                    iq3s_grid[idx.index[11]], iq3s_grid[idx.index[10]], iq3s_grid[idx.index[ 9]], iq3s_grid[idx.index[ 8]]
+            );
+
+            __m256i aux256 = _mm256_set1_epi32(signs[0] | (signs[1] << 16));
+            aux256 = _mm256_and_si256(_mm256_shuffle_epi8(aux256, mask1), mask2);
+            const __m256i s2_1 = _mm256_cmpeq_epi8(aux256, mask2);
+            const __m256i q8s_1 = _mm256_sub_epi8(_mm256_xor_si256(s2_1, q8_1), s2_1);
+
+            aux256 = _mm256_set1_epi32(signs[2] | (signs[3] << 16));
+            aux256 = _mm256_and_si256(_mm256_shuffle_epi8(aux256, mask1), mask2);
+            const __m256i s2_2 = _mm256_cmpeq_epi8(aux256, mask2);
+            const __m256i q8s_2 = _mm256_sub_epi8(_mm256_xor_si256(s2_2, q8_2), s2_2);
+
+            signs += 4;
+
+            const __m256i dot1 = _mm256_maddubs_epi16(q2_1, q8s_1);
+            const __m256i dot2 = _mm256_maddubs_epi16(q2_2, q8s_2);
+            const uint16_t ls1 = x[i].scales[ib32 / 2] & 0xf;
+            const uint16_t ls2 = x[i].scales[ib32 / 2] >> 4;
+            const __m256i p1 = _mm256_madd_epi16(dot1, _mm256_set1_epi16(2 * ls1 + 1));
+            const __m256i p2 = _mm256_madd_epi16(dot2, _mm256_set1_epi16(2 * ls2 + 1));
+            sumi1 = _mm256_add_epi32(sumi1, p1);
+            sumi2 = _mm256_add_epi32(sumi2, p2);
+        }
+
+        accumf = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2)), accumf);
+    }
+
+    /* local horizontal sum: reuse iq3xxs_hsum (same AVX2 block region). */
+    return iq3xxs_hsum(accumf);
+}
+#endif /* __AVX2__ */
+
 float vec_dot_iq3_s_q8_k(const void *vx, const void *vy, int n) {
+#if defined(__AVX2__)
+    /* PICOLM_IQ3S_SCALAR=1: force the scalar path (A/B verification on real
+     * weights; the synthetic check_iq_gemv data may not exercise every
+     * index/sign corner the real tensor hits). */
+    static int force_scalar = -1;
+    if (force_scalar < 0) {
+        const char *e = getenv("PICOLM_IQ3S_SCALAR");
+        force_scalar = (e && *e && *e != '0');
+    }
+    if (!force_scalar && n % QK_K == 0) return vec_dot_iq3_s_q8_k_avx2(vx, vy, n);
+#endif
     return vec_dot_iq3_s_q8_k_scalar(vx, vy, n);
 }
 float vec_dot_iq2_s_q8_k(const void *vx, const void *vy, int n) {
