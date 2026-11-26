@@ -2083,8 +2083,8 @@ int main(int argc, char **argv) {
 #endif
     }
 
-    if (!prompt) {
-        fprintf(stderr, "No prompt provided. Use -p or pipe via stdin.\n");
+    if (!prompt && !raw_tokens_spec) {
+        fprintf(stderr, "No prompt provided. Use -p, --tokens, or pipe via stdin.\n");
         usage(argv[0]);
         return 1;
     }
@@ -2557,7 +2557,19 @@ int main(int argc, char **argv) {
     if (raw_tokens_spec) max_prompt_tokens += 4096;
     int *prompt_tokens = (int *)malloc((size_t)max_prompt_tokens * sizeof(int));
     int n_prompt;
-    if (use_qwen_tok) {
+    if (raw_tokens_spec) {
+        /* --tokens: bypass tokenizer entirely, parse raw IDs directly */
+        n_prompt = 0;
+        const char *p = raw_tokens_spec;
+        while (*p && n_prompt < max_prompt_tokens) {
+            char *endp = NULL;
+            long v = strtol(p, &endp, 10);
+            if (endp == p) { p++; continue; }
+            prompt_tokens[n_prompt++] = (int)v;
+            p = endp;
+        }
+        fprintf(stderr, "--tokens: %d raw token IDs loaded\n", n_prompt);
+    } else if (use_qwen_tok) {
         /* Respect tok_add_bos from GGUF metadata. Qwen3.5 models typically have
            add_bos=false, Qwen3.6 GGUFs may set it to 0 or 1. The server path
            doesn't prepend BOS for Qwen models, so CLI should match. */
@@ -2574,19 +2586,6 @@ int main(int argc, char **argv) {
         }
     } else {
         n_prompt = tokenizer_encode(&tokenizer, prompt, prompt_tokens, max_prompt_tokens, model.tok_add_bos);
-    }
-    /* --tokens overrides the tokenizer output with raw IDs (validation path) */
-    if (raw_tokens_spec) {
-        n_prompt = 0;
-        const char *p = raw_tokens_spec;
-        while (*p && n_prompt < max_prompt_tokens) {
-            char *endp = NULL;
-            long v = strtol(p, &endp, 10);
-            if (endp == p) { p++; continue; }
-            prompt_tokens[n_prompt++] = (int)v;
-            p = endp;
-        }
-        fprintf(stderr, "--tokens: %d raw token IDs loaded\n", n_prompt);
     }
     fprintf(stderr, "%0.1fms: tokenized %d tokens\n", (double)(clock() - t_start_token) / CLOCKS_PER_SEC * 1000.0, n_prompt);
 
