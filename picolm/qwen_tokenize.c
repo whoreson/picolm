@@ -900,14 +900,19 @@ int qwen_tokenize_init(qwen_enc_t *enc, const model_t *m) {
         }
     }
 
-    /* Parse special tokens from token_type (3=control, 4=user_defined) */
-    enc->n_spec = 0;
-    enc->spec = (int *)malloc(sizeof(int) * 512);
+    /* Parse special tokens from token_type (3=control, 4=user_defined).
+     * Allocate the exact count: the old fixed cap of 512 silently dropped
+     * the tail (e.g. DeepSeek V3 has 818, so <｜User｜>/<｜Assistant｜> at
+     * id 128803/128804 were never matched and got BPE'd to garbage). */
     if (m->tok_token_type_data) {
         const int32_t *ty = (const int32_t *)m->tok_token_type_data;
         uint64_t n = m->tok_n_token_type;
         if ((int)n > enc->vocab_size) n = (uint64_t)enc->vocab_size;
-        for (int id = 0; id < (int)n && enc->n_spec < 512; id++) {
+        int nspec = 0;
+        for (int id = 0; id < (int)n; id++)
+            if (ty[id] == 3 || ty[id] == 4) nspec++;
+        enc->spec = (int *)malloc(sizeof(int) * (size_t)(nspec + 2));
+        for (int id = 0; id < (int)n && enc->n_spec < nspec; id++) {
             if (ty[id] == 3 || ty[id] == 4) enc->spec[enc->n_spec++] = id;
         }
     }

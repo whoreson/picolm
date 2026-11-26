@@ -241,6 +241,21 @@ static const char *tmpl_tekken_suffix = "[/INST]";
 static const char *tmpl_glm_prefix = "[gMASK]<sop><|user|>\n";
 static const char *tmpl_glm_suffix = "<|assistant|>\n</think>\n";
 
+/* DeepSeek V3 (deepseek2) chat template, single user turn.
+ *
+ * Rendered from the GGUF tokenizer.chat_template jinja (verified with
+ * --list-kv): bos + <｜User｜> + content + <｜Assistant｜>; assistant turns
+ * end with <｜end▁of▁sentence｜>. The template appends <｜Assistant｜> right
+ * after the user content when the last message is a user turn (so the
+ * trailing add_generation_prompt branch is skipped). Tool-call markup is
+ * not rendered (PicoLM chat is plain text). The tokenizer must see these
+ * markers as whole special tokens (type 3/4 in tokenizer.ggml.token_type).
+ *
+ * NOTE: bos is emitted by the template itself; do NOT let the CLI add
+ * another BOS on top (see the is_deepseek2 exclusion in the encode path). */
+static const char *tmpl_deepseek_prefix = "<｜begin▁of▁sentence｜><｜User｜>";
+static const char *tmpl_deepseek_suffix = "<｜Assistant｜>";
+
 static const char *tmpl_alpaca_prefix =
     "Below is an instruction that describes a task. Write a response that appropriately completes the request.\r\n\r\n"
     "### Instruction:\r\n";
@@ -292,6 +307,9 @@ static char *apply_chat_template(const char *model_path, const model_t *model, c
     if (model && model->config.is_glm5) {
         prefix = tmpl_glm_prefix;
         suffix = tmpl_glm_suffix;
+    } else if (model && model->config.is_deepseek2) {
+        prefix = tmpl_deepseek_prefix;
+        suffix = tmpl_deepseek_suffix;
     } else if (model && model->config.is_spark25) {
         prefix = tmpl_spark_prefix;
         suffix = tmpl_spark_suffix;
@@ -1518,6 +1536,7 @@ int main(int argc, char **argv) {
     const char *model_path = NULL;
     char *prompt_buf = NULL;   /* malloc'd buffer for -p prompt (may be modified by unescape) */
     const char *prompt = NULL;
+    char *raw_tokens_spec = NULL; /* --tokens: comma/space-separated raw IDs */
     int prompt_flag_f = 0;     /* -pf: apply chat template */
     int    max_tokens = 256;
     /* Sampling parameters live in ONE struct shared with the server and the
@@ -1604,6 +1623,12 @@ int main(int argc, char **argv) {
 #endif
             unescape_prompt(prompt_buf);
             prompt = prompt_buf;
+        } else if (strcmp(argv[i], "--tokens") == 0 && i + 1 < argc) {
+            /* Raw prompt token IDs ("--tokens 1,3085,344,..."), bypassing the
+             * tokenizer. Validation use: feed the exact token sequence a
+             * reference implementation consumed, so tokenizer divergence
+             * cannot contaminate a logits comparison. */
+            raw_tokens_spec = strdup(argv[++i]);
         } else if (strcmp(argv[i], "--prompt-file") == 0 && i + 1 < argc) {
             /* Read the prompt from a file. Needed because a long-context
              * benchmark prompt (tens of KB) exceeds the Windows/MSYS argument
@@ -2526,7 +2551,10 @@ int main(int argc, char **argv) {
 
     /* Encode prompt */
     clock_t t_start_token = clock();
-    int max_prompt_tokens = (int)strlen(prompt) + 16;
+    int max_prompt_tokens = (int)(prompt ? strlen(prompt) : 0) + 16;
+    /* --tokens can carry far more IDs than a shell argument can hold chars
+     * (a 256-token reference prompt is fine, but be safe anyway) */
+    if (raw_tokens_spec) max_prompt_tokens += 4096;
     int *prompt_tokens = (int *)malloc((size_t)max_prompt_tokens * sizeof(int));
     int n_prompt;
     if (use_qwen_tok) {
@@ -2537,7 +2565,7 @@ int main(int argc, char **argv) {
         /* Granite: don't add BOS either (llama.cpp b12300 raw path emits
            the text as-is; no add_bos_token key in the GGUF) */
         if (model.tok_add_bos && tokenizer.bos_id != 11 && !model.config.is_gpt2
-            && !model.config.is_granite) {
+            && !model.config.is_granite && !model.config.is_deepseek2) {
             n_prompt = qwen_tokenize_encode(&qwen_enc, prompt, prompt_tokens + 1, max_prompt_tokens - 1);
             prompt_tokens[0] = (int)tokenizer.bos_id;
             n_prompt++;
@@ -2547,11 +2575,24 @@ int main(int argc, char **argv) {
     } else {
         n_prompt = tokenizer_encode(&tokenizer, prompt, prompt_tokens, max_prompt_tokens, model.tok_add_bos);
     }
+    /* --tokens overrides the tokenizer output with raw IDs (validation path) */
+    if (raw_tokens_spec) {
+        n_prompt = 0;
+        const char *p = raw_tokens_spec;
+        while (*p && n_prompt < max_prompt_tokens) {
+            char *endp = NULL;
+            long v = strtol(p, &endp, 10);
+            if (endp == p) { p++; continue; }
+            prompt_tokens[n_prompt++] = (int)v;
+            p = endp;
+        }
+        fprintf(stderr, "--tokens: %d raw token IDs loaded\n", n_prompt);
+    }
     fprintf(stderr, "%0.1fms: tokenized %d tokens\n", (double)(clock() - t_start_token) / CLOCKS_PER_SEC * 1000.0, n_prompt);
 
     /* Defensive: n_prompt == 0 with non-empty input usually means stale .o files
      * (e.g. after a clean was missed). Catch this early with a clear message. */
-    if (n_prompt == 0 && strlen(prompt) > 0) {
+    if (n_prompt == 0 && prompt && strlen(prompt) > 0 && !raw_tokens_spec) {
         fprintf(stderr, "ERROR: tokenizer produced 0 tokens for non-empty prompt.\n");
         fprintf(stderr, "       This usually means some .o files are stale (e.g. after\n");
         fprintf(stderr, "       editing tokenizer.c, model_gguf.c, or quant.h without\n");
@@ -3195,6 +3236,29 @@ int main(int argc, char **argv) {
             }
         }
         dump_logits_to_file(logits, model.config.vocab_size, pos);
+        {
+            const char *dp = getenv("PICOLM_DS2_DUMP_POS");
+            if (dp && *dp) {
+                int dump = 0;
+                size_t dplen = strlen(dp);
+                if (dplen && dp[dplen-1] == '-') dump = (pos >= atoi(dp));
+                else { const char *p = dp;
+                       while (*p) { if (*p==',') { p++; continue; }
+                           char *e=NULL; long v=strtol(p,&e,10);
+                           if (e==p) break;
+                           if ((long)pos==v) { dump=1; break; } p=e; } }
+                if (dump) {
+                    const int V = model.config.vocab_size;
+                    const char *path = getenv("PICOLM_DS2_DUMP_FILE");
+                    if (path) {
+                        FILE *f = fopen(path, "a");
+                        if (f) { fprintf(f, "pos=%d vocab=%d\n", pos, V);
+                                 for (int i = 0; i < V; i++) fprintf(f, "%d %.6f\n", i, logits[i]);
+                                 fclose(f); }
+                    }
+                }
+            }
+        }
         next = sampler_sample(&sampler, logits, model.config.vocab_size);
         if (getenv("PICOLM_DBG"))
         if (getenv("PICOLM_DBG")) {

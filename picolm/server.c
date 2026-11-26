@@ -3003,19 +3003,102 @@ static char *mistral3_chat_build(cJSON *messages, const char *system_template) {
     return cb_release(&b);
 }
 
+/* DeepSeek V3 (deepseek2) chat builder, from the GGUF tokenizer.chat_template:
+ *   {{ bos }} + system (multiple system messages joined with "\n\n")
+ *   user:      <｜User｜> + content + <｜Assistant｜>
+ *   assistant: content + <｜end▁of▁sentence｜>
+ *   add_generation_prompt: <｜Assistant｜> only when the last message is NOT
+ *   a user turn (the template's is_last_user / is_tool logic). Tool-call
+ *   roles are out of scope: 'tool' messages are rendered as user turns with
+ *   a marker so the model can respond to them.
+ * Bos comes from the template; the server encode path must not add another
+ * (see the is_deepseek2 exclusion below). */
+#define DS2_BOS  "<｜begin▁of▁sentence｜>"
+#define DS2_USER "<｜User｜>"
+#define DS2_ASST "<｜Assistant｜>"
+#define DS2_EOS  "<｜end▁of▁sentence｜>"
+
+static char *deepseek2_chat_build(cJSON *messages, const char *system_template) {
+    int n = cJSON_GetArraySize(messages);
+    /* Collect system content (template concatenates multiple system
+     * messages with "\n\n"; explicit system_template wins if set). */
+    chat_buf_t sys; cb_init(&sys);
+    for (int i = 0; i < n; i++) {
+        cJSON *msg = cJSON_GetArrayItem(messages, i);
+        cJSON *role = cJSON_GetObjectItem(msg, "role");
+        cJSON *content = cJSON_GetObjectItem(msg, "content");
+        if (!role || !content) continue;
+        const char *rs = cJSON_GetStringValue(role);
+        const char *cs = cJSON_GetStringValue(content);
+        if (!rs || !cs || strcmp(rs, "system") != 0) continue;
+        if (sys.len > 0) cb_append(&sys, "\n\n");
+        cb_append(&sys, cs);
+    }
+    if (system_template && *system_template) {
+        chat_buf_t t; cb_init(&t);
+        if (sys.len > 0) { cb_append(&t, sys.buf); cb_append(&t, "\n\n"); }
+        cb_append(&t, system_template);
+        free(sys.buf);
+        sys = t;
+    }
+
+    /* last non-system role, for the add_generation_prompt decision */
+    const char *last_role = NULL;
+    for (int i = n - 1; i >= 0; i--) {
+        cJSON *msg = cJSON_GetArrayItem(messages, i);
+        cJSON *role = cJSON_GetObjectItem(msg, "role");
+        if (role && cJSON_GetStringValue(role)) { last_role = cJSON_GetStringValue(role); break; }
+    }
+
+    chat_buf_t b; cb_init(&b);
+    if (!b.buf) { free(sys.buf); return NULL; }
+
+    cb_append(&b, DS2_BOS);
+    if (sys.len > 0) cb_append(&b, sys.buf);
+    free(sys.buf);
+
+    for (int i = 0; i < n; i++) {
+        cJSON *msg = cJSON_GetArrayItem(messages, i);
+        cJSON *role = cJSON_GetObjectItem(msg, "role");
+        cJSON *content = cJSON_GetObjectItem(msg, "content");
+        if (!role || !content) continue;
+        const char *rs = cJSON_GetStringValue(role);
+        const char *cs = cJSON_GetStringValue(content);
+        if (!rs) continue;
+        if (!cs) cs = "";
+        if (strcmp(rs, "system") == 0) continue;   /* already emitted */
+        if (strcmp(rs, "user") == 0 || strcmp(rs, "tool") == 0) {
+            cb_append(&b, DS2_USER); cb_append(&b, cs); cb_append(&b, DS2_ASST);
+        } else if (strcmp(rs, "assistant") == 0) {
+            cb_append(&b, cs); cb_append(&b, DS2_EOS);
+        } else {
+            cb_append(&b, DS2_USER); cb_append(&b, cs); cb_append(&b, DS2_ASST);
+        }
+    }
+
+    /* add_generation_prompt: only when the last turn is not a user turn
+     * (a user turn already carries the trailing <｜Assistant｜>). */
+    if (!(last_role && (strcmp(last_role, "user") == 0 || strcmp(last_role, "tool") == 0)))
+        cb_append(&b, DS2_ASST);
+    return cb_release(&b);
+}
+
 /* Convert chat messages to a prompt string.
  * Qwen models get the chatml template (verified correct for instruct Qwen);
  * Granite 4.x gets its im-start/im-end chatml; Mistral/Ministral 3 gets the
  * [INST] format; other models get the simple "### {role}\n{text}\n\n" template.
  * Returns a malloc'd string. */
 static char *chat_to_prompt(cJSON *messages, const char *system_template,
-                            int is_qwen, int is_granite, int is_mistral3) {
+                            int is_qwen, int is_granite, int is_mistral3,
+                            int is_deepseek2) {
     if (is_qwen)
         return qwen_chatml_build(messages, system_template);
     if (is_granite)
         return granite_chatml_build(messages, system_template);
     if (is_mistral3)
         return mistral3_chat_build(messages, system_template);
+    if (is_deepseek2)
+        return deepseek2_chat_build(messages, system_template);
     size_t total_len = 0;
     int n_msgs = cJSON_GetArraySize(messages);
 
@@ -3199,7 +3282,8 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
 
         chat_prompt = chat_to_prompt(messages, sys_template,
                                      model->config.is_qwen, model->config.is_granite,
-                                     model->config.is_mistral3);
+                                     model->config.is_mistral3,
+                                     model->config.is_deepseek2);
         fprintf(stderr, "[server] %.1fms: chat template built (%d chars)\n", get_time_ms() - t0, (int)strlen(chat_prompt));
         if (!chat_prompt) {
             http_send(sock, 400, "application/json", "{\"error\":{\"message\":\"Failed to build prompt\"}}");
@@ -3271,7 +3355,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
          * raw text as-is -- verified: /completion tokens_evaluated equals
          * the exact /tokenize count, and the jinja template has no BOS). */
         if (srv.model.tok_add_bos && srv.qwen_enc.bos_id != 11 &&
-            !model->config.is_granite) {
+            !model->config.is_granite && !model->config.is_deepseek2) {
             n_prompt = qwen_tokenize_encode(&srv.qwen_enc, prompt, ptokens + 1, max_pt - 1);
             ptokens[0] = srv.qwen_enc.bos_id;
             n_prompt++;
