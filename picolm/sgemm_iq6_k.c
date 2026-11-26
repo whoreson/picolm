@@ -1683,6 +1683,7 @@ int sgemm_iq3_k_r4_q8_k_r8v(int nrows, int ncols, int k, const void *vx, const v
 int sgemm_iq3_xxs_q8_k_r8v(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) { (void)nrows; (void)ncols; (void)k; (void)vx; (void)vy; (void)out; (void)bs; (void)ith; (void)nth; return 0; }
 int sgemm_iq3_s_q8_k_r8v(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) { (void)nrows; (void)ncols; (void)k; (void)vx; (void)vy; (void)out; (void)bs; (void)ith; (void)nth; return 0; }
 int sgemm_iq3_xxs_q8_k_r8t(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) { (void)nrows; (void)ncols; (void)k; (void)vx; (void)vy; (void)out; (void)bs; (void)ith; (void)nth; return 0; }
+int sgemm_iq3_s_q8_k_r8t(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) { (void)nrows; (void)ncols; (void)k; (void)vx; (void)vy; (void)out; (void)bs; (void)ith; (void)nth; return 0; }
 int sgemm_iq4_xs_q8_k_r8t(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) { (void)nrows; (void)ncols; (void)k; (void)vx; (void)vy; (void)out; (void)bs; (void)ith; (void)nth; return 0; }
 int sgemm_iq4_xs_q8_k_r8v(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) { (void)nrows; (void)ncols; (void)k; (void)vx; (void)vy; (void)out; (void)bs; (void)ith; (void)nth; return 0; }
 
