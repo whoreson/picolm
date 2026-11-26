@@ -1135,15 +1135,28 @@ float *model_forward_prefill_deepseek2(model_t *m, const int *tokens, int n_toke
 
     /* ---- Layer loop ---- */
     for (int il = 0; il < c->n_layers; il++) {
-        const layer_weights_t *lw = &w->layers[il];
-        const glm5_layer_weights_t *gw = &w->glm5[il];
+#ifdef PICOLM_VIZ
+        int l = viz_layer_permute(il);
+#else
+        int l = il;
+#endif
+        const layer_weights_t *lw = &w->layers[l];
+        const glm5_layer_weights_t *gw = &w->glm5[l];
         BENCH_LAYER_START();
 
         if (interrupt && *interrupt) { free(pf); return NULL; }
 
+#ifdef PICOLM_VIZ
+        if (viz_layer_skip(l)) {
+            /* Pass through: residual unchanged, no computation */
+            BENCH_LAYER_END(l, 1);
+            continue;
+        }
+#endif
+
         /* ---- Attention block ---- */
         { ds2_batch_rmsnorm_ctx_t rctx =
-              { xb_batch, x_batch, s->attn_norm_w[il], D, c->rms_norm_eps };
+              { xb_batch, x_batch, s->attn_norm_w[l], D, c->rms_norm_eps };
           tensor_parallel_for(n_tokens, ds2_batch_rmsnorm_task, &rctx); }
 
         /* Q projection: wq_a (D -> QL), batched; then per-token RMSNorm and
@@ -1203,7 +1216,7 @@ float *model_forward_prefill_deepseek2(model_t *m, const int *tokens, int n_toke
 
         /* Store cache rows for all tokens: [k_pe(ROPE); kv_latent(KVL)] */
         {
-            float *cache = s->ds2.mla_kv + (size_t)il * s->ds2.mla_kv_layer_stride;
+            float *cache = s->ds2.mla_kv + (size_t)l * s->ds2.mla_kv_layer_stride;
             for (int t = 0; t < n_tokens; t++) {
                 float *row = cache + (size_t)(start_pos + t) * LROW;
                 const float *kvr = kvr_batch + (size_t)t * LROW;
@@ -1220,7 +1233,7 @@ float *model_forward_prefill_deepseek2(model_t *m, const int *tokens, int n_toke
         {
             const void *wk; gguf_type_t wk_t; size_t wk_head_sz;
             const void *wv; gguf_type_t wv_t; size_t wv_head_sz;
-            ds2_kv_b_ptrs(m, il, &wk, &wk_t, &wk_head_sz, &wv, &wv_t, &wv_head_sz);
+            ds2_kv_b_ptrs(m, l, &wk, &wk_t, &wk_head_sz, &wv, &wv_t, &wv_head_sz);
 
             ds2_absorb_ctx_t actx = { n_tokens, NH, NOPE, KVL, KHK,
                                       wk, wk_t, wk_head_sz, q_batch, qabs_batch };
@@ -1228,7 +1241,7 @@ float *model_forward_prefill_deepseek2(model_t *m, const int *tokens, int n_toke
 
             for (int t = 0; t < n_tokens; t++) {
                 const int pos = start_pos + t;
-                ds2_scores_ctx(m, il, s,
+                ds2_scores_ctx(m, l, s,
                                q_batch + (size_t)t * NH * KHK,
                                qabs_batch + (size_t)t * NH * KVL,
                                /* per-token q_comb/scores from the decode
@@ -1261,10 +1274,10 @@ float *model_forward_prefill_deepseek2(model_t *m, const int *tokens, int n_toke
 
         /* ---- FFN block ---- */
         { ds2_batch_rmsnorm_ctx_t rctx =
-              { xb_batch, x_batch, s->post_attn_norm_w[il], D, c->rms_norm_eps };
+              { xb_batch, x_batch, s->post_attn_norm_w[l], D, c->rms_norm_eps };
           tensor_parallel_for(n_tokens, ds2_batch_rmsnorm_task, &rctx); }
 
-        if (il < c->n_layer_dense_lead) {
+        if (l < c->n_layer_dense_lead) {
             /* Dense SwiGLU, batched */
             matmul_dual_batch(hb_batch, hb2_batch, xb_batch, n_tokens,
                               lw->ffn_gate, lw->ffn_up, D, ffn_buf,
@@ -1277,7 +1290,7 @@ float *model_forward_prefill_deepseek2(model_t *m, const int *tokens, int n_toke
             /* MoE FFN: batched across tokens (glm5_moe_ffn_batch sorts by
              * expert so each expert's weights stream once for the whole
              * batch; routing semantics identical to glm5_moe_ffn). */
-            glm5_moe_ffn_batch(m, gw, lw, s, xb_batch, attn_batch, n_tokens, il);
+            glm5_moe_ffn_batch(m, gw, lw, s, xb_batch, attn_batch, n_tokens, l);
         }
 
         /* Residual add: x += ffn_out */
@@ -1287,11 +1300,11 @@ float *model_forward_prefill_deepseek2(model_t *m, const int *tokens, int n_toke
 
 #ifdef PICOLM_VIZ
         for (int t = 0; t < n_tokens; t++)
-            viz_push_row(il, start_pos + t, x_batch + (size_t)t * D, D);
+            viz_push_row(l, start_pos + t, x_batch + (size_t)t * D, D);
 #endif
-        steer_hook(il, x_batch, n_tokens, D, start_pos);
+        steer_hook(l, x_batch, n_tokens, D, start_pos);
 
-        BENCH_LAYER_END(il, 1);
+        BENCH_LAYER_END(l, 1);
     }
 
     /* Final: RMSNorm(output_norm) then the output head, last token only.
@@ -1718,31 +1731,48 @@ float *model_forward_deepseek2(model_t *m, int token, int pos)
     }
 
     for (int il = 0; il < c->n_layers; il++) {
-        const layer_weights_t *lw = &w->layers[il];
-        const glm5_layer_weights_t *gw = &w->glm5[il];
+#ifdef PICOLM_VIZ
+        int l = viz_layer_permute(il);
+#else
+        int l = il;
+#endif
+        const layer_weights_t *lw = &w->layers[l];
+        const glm5_layer_weights_t *gw = &w->glm5[l];
         BENCH_LAYER_START();
+
+        /* Layer skip: toggled by VNC mouse click, zero overhead when unused */
+#ifdef PICOLM_VIZ
+        if (viz_layer_skip(l)) {
+#ifdef PICOLM_VIZ
+            viz_push_row(l, pos, s->x, D);
+#endif
+            BENCH_LAYER_END(l, 0);
+            if (stop_layer >= 0 && il >= stop_layer) break;
+            continue;
+        }
+#endif
 
         /* ---- attention block ---- */
         const int prof = prof_on;
         double _ta = prof ? get_time_ms() : 0;
-        rmsnorm(cur, s->x, s->attn_norm_w[il], D, c->rms_norm_eps);
+        rmsnorm(cur, s->x, s->attn_norm_w[l], D, c->rms_norm_eps);
         if (getenv("PICOLM_DS2_NOATTN")) memset(attn_out, 0, (size_t)D * sizeof(float));
-        else ds2_mla_forward(m, il, s, cur, pos, attn_out);
+        else ds2_mla_forward(m, l, s, cur, pos, attn_out);
         double _tat = prof ? get_time_ms() : 0;
         if (getenv("PICOLM_DS2_XCHECK"))
-            ds2_xcheck_attn(m, il, s, cur, pos, attn_out);
-        ds2_layer_dump(m, il, pos, cur, attn_out, s);
+            ds2_xcheck_attn(m, l, s, cur, pos, attn_out);
+        ds2_layer_dump(m, l, pos, cur, attn_out, s);
         vec_add(s->x, attn_out, D);
 
         /* ---- FFN block ---- */
         double _tf = prof ? get_time_ms() : 0;
-        rmsnorm(cur, s->x, s->post_attn_norm_w[il], D, c->rms_norm_eps);
+        rmsnorm(cur, s->x, s->post_attn_norm_w[l], D, c->rms_norm_eps);
         if (getenv("PICOLM_DS2_NOFFN")) {
             memset(attn_out, 0, (size_t)D * sizeof(float));
-        } else if (il < c->n_layer_dense_lead) {
+        } else if (l < c->n_layer_dense_lead) {
             ds2_dense_ffn(m, lw, s, cur, attn_out);
         } else {
-            glm5_moe_ffn(m, gw, lw, s, cur, attn_out, il);
+            glm5_moe_ffn(m, gw, lw, s, cur, attn_out, l);
         }
         vec_add(s->x, attn_out, D);
 
@@ -1764,15 +1794,15 @@ float *model_forward_deepseek2(model_t *m, int token, int pos)
                 sx += s->x[i] * s->x[i];
             }
             fprintf(stderr, "[ds2] l%02d %s attn=%.5f ffn_cur=%.5f x=%.5f\n",
-                    il, il < c->n_layer_dense_lead ? "dense" : "moe",
+                    l, l < c->n_layer_dense_lead ? "dense" : "moe",
                     sqrtf(sa / D), sqrtf(sf / D), sqrtf(sx / D));
         }
 
 #ifdef PICOLM_VIZ
-        viz_push_row(il, pos, s->x, D);
+        viz_push_row(l, pos, s->x, D);
 #endif
 
-        BENCH_LAYER_END(il, 0);
+        BENCH_LAYER_END(l, 0);
         if (stop_layer >= 0 && il >= stop_layer) break;
     }
 

@@ -3685,11 +3685,25 @@ float *model_forward_glm5(model_t *m, int token, int pos)
     const int stop_layer = glm5_stop_layer();
     char lt[64], t[96];
     for (int il = 0; il < n_trunk; il++) {
-        const layer_weights_t *lw = &w->layers[il];
-        const glm5_layer_weights_t *gw = &w->glm5[il];
-        int mla_ord = c->glm5_layer_mla_ord[il];  /* -1 for KDA layers */
+#ifdef PICOLM_VIZ
+        int l = viz_layer_permute(il);
+#else
+        int l = il;
+#endif
+        const layer_weights_t *lw = &w->layers[l];
+        const glm5_layer_weights_t *gw = &w->glm5[l];
+        int mla_ord = c->glm5_layer_mla_ord[l];  /* -1 for KDA layers */
         BENCH_LAYER_START();
-        snprintf(lt, sizeof(lt), "l%02d", il);
+
+#ifdef PICOLM_VIZ
+        if (viz_layer_skip(l)) {
+            BENCH_LAYER_END(l, 0);
+            if (stop_layer >= 0 && l >= stop_layer) break;
+            continue;
+        }
+#endif
+
+        snprintf(lt, sizeof(lt), "l%02d", l);
 
         /* ---- attention block ---- */
         /* hc_res holds the current streams (input to hc_post) */
@@ -3698,7 +3712,7 @@ float *model_forward_glm5(model_t *m, int token, int pos)
         snprintf(t, sizeof(t), "%s.x_in", lt);
         glm5_stats(t, s->glm5.hc_x, S*D);
 
-        snprintf(g_hc_tag, sizeof(g_hc_tag), "%d", il);
+        snprintf(g_hc_tag, sizeof(g_hc_tag), "%d", l);
         glm5_hc_pre(m, gw, 1, s->glm5.hc_x, s->glm5.cur, post, comb, hc_scratch);
         snprintf(t, sizeof(t), "%s.hc_attn_pre", lt);
         glm5_stats(t, s->glm5.cur, D);
@@ -3709,7 +3723,7 @@ float *model_forward_glm5(model_t *m, int token, int pos)
         glm5_stats(t, comb, S*S);
 
         /* RMSNorm with the predequantized attn_norm weight */
-        rmsnorm(s->glm5.cur, s->glm5.cur, s->attn_norm_w[il], D, c->rms_norm_eps);
+        rmsnorm(s->glm5.cur, s->glm5.cur, s->attn_norm_w[l], D, c->rms_norm_eps);
         snprintf(t, sizeof(t), "%s.cur_normed", lt);
         glm5_stats(t, s->glm5.cur, D);
 
@@ -3725,7 +3739,7 @@ float *model_forward_glm5(model_t *m, int token, int pos)
             /* GP_MLA/GP_ATTN/GP_IDX are accounted for inside glm5_mla_forward;
              * subtract them back out so the remainder is pure projection cost. */
             double _i0 = g_gp.ms[GP_ATTN] + g_gp.ms[GP_MLA] + g_gp.ms[GP_IDX];
-            glm5_mla_forward(m, gw, lw, s, s->glm5.cur, pos, c->max_seq_len, il, mla_ord, attn_out, NULL);
+            glm5_mla_forward(m, gw, lw, s, s->glm5.cur, pos, c->max_seq_len, l, mla_ord, attn_out, NULL);
             if (glm5_prof_mode()) {
                 double _inner = (g_gp.ms[GP_ATTN] + g_gp.ms[GP_MLA] + g_gp.ms[GP_IDX]) - _i0;
                 double _wall = glm5_prof_now() - _t_attnblk;
@@ -3733,7 +3747,7 @@ float *model_forward_glm5(model_t *m, int token, int pos)
             }
             _t_attnblk = 0.0;
         } else {
-            glm5_kda_forward(m, gw, lw, s, s->glm5.cur, pos, il, attn_out);
+            glm5_kda_forward(m, gw, lw, s, s->glm5.cur, pos, l, attn_out);
         }
         if (_t_attnblk) glm5_prof_add(GP_KDA, _t_attnblk);
 
@@ -3741,7 +3755,7 @@ float *model_forward_glm5(model_t *m, int token, int pos)
         glm5_stats(t, attn_out, D);
         glm5_chk(t, attn_out, D, -1e4f, 1e4f);
         if (glm5_dbg_enabled())
-            fprintf(stderr, "GLM5 l%02d attn %s: a_rms=%.4f n_attn=%d\n", il,
+            fprintf(stderr, "GLM5 l%02d attn %s: a_rms=%.4f n_attn=%d\n", l,
                     mla_ord >= 0 ? "MLA" : "KDA", glm5_rms(attn_out, D), D);
 
         /* hc_post for attention */
@@ -3756,17 +3770,17 @@ float *model_forward_glm5(model_t *m, int token, int pos)
         glm5_stats(t, s->glm5.cur, D);
 
         /* RMSNorm with the predequantized ffn_norm (post_attn_norm) weight */
-        rmsnorm(s->glm5.cur, s->glm5.cur, s->post_attn_norm_w[il], D, c->rms_norm_eps);
+        rmsnorm(s->glm5.cur, s->glm5.cur, s->post_attn_norm_w[l], D, c->rms_norm_eps);
         snprintf(t, sizeof(t), "%s.ffn_cur_normed", lt);
         glm5_stats(t, s->glm5.cur, D);
 
         /* FFN or MoE */
         double _t_ffn = glm5_prof_mode() ? glm5_prof_now() : 0.0;
-        if (il < c->n_layer_dense_lead) {
+        if (l < c->n_layer_dense_lead) {
             /* dense FFN (layers 0..n_dense-1 are dense, rest are MoE) */
             glm5_dense_ffn(m, lw, s, s->glm5.cur, s->glm5.attn_out);
         } else {
-            glm5_moe_ffn(m, gw, lw, s, s->glm5.cur, s->glm5.attn_out, il);
+            glm5_moe_ffn(m, gw, lw, s, s->glm5.cur, s->glm5.attn_out, l);
         }
         if (_t_ffn) glm5_prof_add(GP_MOE, _t_ffn);
 
@@ -3779,14 +3793,14 @@ float *model_forward_glm5(model_t *m, int token, int pos)
         glm5_stats(t, s->glm5.hc_x, S*D);
         if (glm5_dbg_enabled())
             fprintf(stderr, "GLM5 l%02d ffn  %s: f_rms=%.4f x_rms=%.4f\n",
-                    il, il < c->n_layer_dense_lead ? "dense" : "moe",
+                    l, l < c->n_layer_dense_lead ? "dense" : "moe",
                     glm5_rms(s->glm5.attn_out, D), glm5_rms(s->glm5.hc_x, S*D));
 
-        BENCH_LAYER_END(il, 0);
+        BENCH_LAYER_END(l, 0);
 
-        if (stop_layer >= 0 && il >= stop_layer) {
+        if (stop_layer >= 0 && l >= stop_layer) {
             if (glm5_dbg_enabled())
-                fprintf(stderr, "GLM5: stopping after layer %d (PICOLM_STOP_LAYER)\n", il);
+                fprintf(stderr, "GLM5: stopping after layer %d (PICOLM_STOP_LAYER)\n", l);
             break;
         }
 
@@ -3800,7 +3814,7 @@ float *model_forward_glm5(model_t *m, int token, int pos)
                 for (int i = 0; i < S; i++) acc += s->glm5.hc_x[i*D + d];
                 s->glm5.cur[d] = acc * inv_s;
             }
-            viz_push_row(il, pos, s->glm5.cur, D);
+            viz_push_row(l, pos, s->glm5.cur, D);
         }
 #endif
     }
@@ -5068,10 +5082,24 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
         }
 
         for (int il = 0; il < n_trunk; il++) {
-            const layer_weights_t *lw = &w->layers[il];
-            const glm5_layer_weights_t *gw = &w->glm5[il];
-            int mla_ord = c->glm5_layer_mla_ord[il];
+#ifdef PICOLM_VIZ
+            int l = viz_layer_permute(il);
+#else
+            int l = il;
+#endif
+            const layer_weights_t *lw = &w->layers[l];
+            const glm5_layer_weights_t *gw = &w->glm5[l];
+            int mla_ord = c->glm5_layer_mla_ord[l];
             BENCH_LAYER_START();
+
+#ifdef PICOLM_VIZ
+            if (viz_layer_skip(l)) {
+                /* Pass through: hc_x unchanged */
+                BENCH_LAYER_END(l, 1);
+                continue;
+            }
+#endif
+
             PFP_BEGIN(tLayer);
             const int pfk = mla_ord >= 0 ? 1 : 0;
             /* ============ Attention block ============ */
@@ -5085,10 +5113,10 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
              * per-token stats. Setting it only inside the serial loop was the
              * chicken-and-egg that made prefill stats invisible. */
             if (glm5_stats_wanted() || getenv("PICOLM_DBG_DUMP_LAYER") || getenv("PICOLM_DBG_HCVEC"))
-                snprintf(g_hc_tag, sizeof(g_hc_tag), "%d", il);
+                snprintf(g_hc_tag, sizeof(g_hc_tag), "%d", l);
             else
                 g_hc_tag[0] = '\0';   /* decode leaves its tag set: do not let it force the serial path */
-            if (!(glm5_pf_par() && pf_run_hcpre(m, gw, 1, n_tokens, hc_x_b, cur_b, hc_res_b, post_b, comb_b, s->attn_norm_w[il])))
+            if (!(glm5_pf_par() && pf_run_hcpre(m, gw, 1, n_tokens, hc_x_b, cur_b, hc_res_b, post_b, comb_b, s->attn_norm_w[l])))
             for (int t = 0; t < n_tokens; t++) {
                 float *hc_x_t = hc_x_b + (size_t)t*S*D;
                 float *cur_t  = cur_b + (size_t)t*D;
@@ -5098,7 +5126,7 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                 memcpy(res_t, hc_x_t, (size_t)S*D*sizeof(float));
                 if (t == 0 && glm5_stats_wanted()) {
                     char t2[96];
-                    snprintf(t2, sizeof(t2), "l%02d.x_in", il);
+                    snprintf(t2, sizeof(t2), "l%02d.x_in", l);
                     glm5_stats(t2, hc_x_t, S*D);
                 }
                 /* PICOLM_DBG_DUMP_TOK selects which token of the prefill batch is dumped (default 0).
@@ -5107,10 +5135,10 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                 if (t == glm5_dump_tok()) {
                     static int dl = -2;
                     if (dl == -2) { const char *e = getenv("PICOLM_DBG_DUMP_LAYER"); dl = e ? atoi(e) : -1; }
-                    if (dl == il) {
+                    if (dl == l) {
                         const char *dd = getenv("PICOLM_DUMP_DIR");
                         char fn[512];
-                        snprintf(fn, sizeof(fn), "%s/pic_l_in-%d.f32", dd ? dd : "/tmp/picd", il);
+                        snprintf(fn, sizeof(fn), "%s/pic_l_in-%d.f32", dd ? dd : "/tmp/picd", l);
                         FILE *fp = fopen(fn, "wb");
                         if (fp) { fwrite(hc_x_t, sizeof(float), (size_t)S*D, fp); fclose(fp); }
                     }
@@ -5119,31 +5147,31 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                 if (t == glm5_dump_tok()) {
                     static int wl = -2;
                     if (wl == -2) { const char *e = getenv("PICOLM_DBG_HCVEC"); wl = e ? atoi(e) : -1; }
-                    if (wl == il) {
+                    if (wl == l) {
                         const char *dd = getenv("PICOLM_DUMP_DIR");
                         char fn[512];
-                        snprintf(fn, sizeof(fn), "%s/attn_out-%d.f32", dd ? dd : "/tmp/picd", il);
+                        snprintf(fn, sizeof(fn), "%s/attn_out-%d.f32", dd ? dd : "/tmp/picd", l);
                         FILE *fp = fopen(fn, "wb");
                         if (fp) { fwrite(hc_x_t, sizeof(float), (size_t)S*D, fp); fclose(fp); }
-                        snprintf(fn, sizeof(fn), "%s/attn_comb-%d.f32", dd ? dd : "/tmp/picd", il);
+                        snprintf(fn, sizeof(fn), "%s/attn_comb-%d.f32", dd ? dd : "/tmp/picd", l);
                         fp = fopen(fn, "wb");
                         if (fp) { fwrite(comb_t, sizeof(float), (size_t)S*S, fp); fclose(fp); }
-                        snprintf(fn, sizeof(fn), "%s/attn_post-%d.f32", dd ? dd : "/tmp/picd", il);
+                        snprintf(fn, sizeof(fn), "%s/attn_post-%d.f32", dd ? dd : "/tmp/picd", l);
                         fp = fopen(fn, "wb");
                         if (fp) { fwrite(post_t, sizeof(float), (size_t)S, fp); fclose(fp); }
                     }
-                    if (wl == il)
+                    if (wl == l)
                         fprintf(stderr, "[hcvec L%d attn] pre=[%.6f %.6f %.6f %.6f] post=[%.6f %.6f %.6f %.6f] comb0=[%.6f %.6f %.6f %.6f]\n",
-                                il, hc_pre_dbg_pre[0], hc_pre_dbg_pre[1], hc_pre_dbg_pre[2], hc_pre_dbg_pre[3],
+                                l, hc_pre_dbg_pre[0], hc_pre_dbg_pre[1], hc_pre_dbg_pre[2], hc_pre_dbg_pre[3],
                                 post_t[0], post_t[1], post_t[2], post_t[3],
                                 comb_t[0], comb_t[1], comb_t[2], comb_t[3]);
                 }
-                rmsnorm(cur_t, cur_t, s->attn_norm_w[il], D, c->rms_norm_eps);
+                rmsnorm(cur_t, cur_t, s->attn_norm_w[l], D, c->rms_norm_eps);
                 if (t == 0) {
                     char t2[96];
-                    snprintf(t2, sizeof(t2), "l%02d.hc_attn_pre", il);
+                    snprintf(t2, sizeof(t2), "l%02d.hc_attn_pre", l);
                     glm5_stats(t2, cur_t, D);
-                    snprintf(t2, sizeof(t2), "l%02d.cur_normed", il);
+                    snprintf(t2, sizeof(t2), "l%02d.cur_normed", l);
                     glm5_stats(t2, cur_t, D);
                 }
             }
@@ -5323,7 +5351,7 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                                     };
                                     glm5_mla_forward(m, gw, lw, s, cur_b + (size_t)t*D,
                                                      start_pos + t, c->max_seq_len,
-                                                     il, mla_ord,
+                                                     l, mla_ord,
                                                      o_plane + (size_t)t*QD, &pre);
                                 }
                             }
@@ -5333,7 +5361,7 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                             for (int t = 0; t < n_tokens && (!interrupt || !*interrupt); t++)
                                 glm5_mla_forward(m, gw, lw, s, cur_b + (size_t)t*D,
                                                  start_pos + t, c->max_seq_len,
-                                                 il, mla_ord,
+                                                 l, mla_ord,
                                                  o_plane + (size_t)t*QD, NULL);
                         }
                     }
@@ -5366,10 +5394,10 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                  * tail's output projection is deferred so attn_output can be
                  * GEMM'd for all tokens at once below. */
                 PFP_BEGIN(tKT);
-                if (!(glm5_pf_par() && glm5_kda_layer_split(m, gw, s, il, n_tokens, q_b, k_b, v_b, gb_b, fb_b,
+                if (!(glm5_pf_par() && glm5_kda_layer_split(m, gw, s, l, n_tokens, q_b, k_b, v_b, gb_b, fb_b,
                                                           beta_b, conv_b, g_scr, head_b, beta_sh)))
                 for (int t = 0; t < n_tokens; t++) {
-                    glm5_kda_tail_par(m, gw, lw, s, il, start_pos + t,
+                    glm5_kda_tail_par(m, gw, lw, s, l, start_pos + t,
                                   q_b + (size_t)t*DI,
                                   k_b + (size_t)t*DI,
                                   v_b + (size_t)t*DI,
@@ -5388,10 +5416,10 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                 PFP_BEGIN(tKO);
                 {
                     const char *e = getenv("PICOLM_DBG_DUMPATTN");
-                    if (e && atoi(e) == il) {
+                    if (e && atoi(e) == l) {
                         const char *dd = getenv("PICOLM_DUMP_DIR");
                         char fn[512];
-                        snprintf(fn, sizeof(fn), "%s/attn_gated-%d.f32", dd ? dd : "/tmp/picd", il);
+                        snprintf(fn, sizeof(fn), "%s/attn_gated-%d.f32", dd ? dd : "/tmp/picd", l);
                         FILE *fp = fopen(fn, "wb");
                         if (fp) { fwrite(head_b, sizeof(float), (size_t)DI, fp); fclose(fp); }
                     }
@@ -5400,10 +5428,10 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                              lw->type_attn_output);
                 {
                     const char *e = getenv("PICOLM_DBG_DUMPATTN");
-                    if (e && atoi(e) == il) {
+                    if (e && atoi(e) == l) {
                         const char *dd = getenv("PICOLM_DUMP_DIR");
                         char fn[512];
-                        snprintf(fn, sizeof(fn), "%s/attn_out-%d.f32", dd ? dd : "/tmp/picd", il);
+                        snprintf(fn, sizeof(fn), "%s/attn_out-%d.f32", dd ? dd : "/tmp/picd", l);
                         FILE *fp = fopen(fn, "wb");
                         if (fp) { fwrite(attn_b, sizeof(float), (size_t)D, fp); fclose(fp); }
                     }
@@ -5425,10 +5453,10 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                 if (t == glm5_dump_tok()) {
                     static int wl = -2;
                     if (wl == -2) { const char *e = getenv("PICOLM_DBG_HCVEC"); wl = e ? atoi(e) : -1; }
-                    if (wl == il) {
+                    if (wl == l) {
                         const char *dd = getenv("PICOLM_DUMP_DIR");
                         char fn[512];
-                        snprintf(fn, sizeof(fn), "%s/xmid-%d.f32", dd ? dd : "/tmp/picd", il);
+                        snprintf(fn, sizeof(fn), "%s/xmid-%d.f32", dd ? dd : "/tmp/picd", l);
                         FILE *fp = fopen(fn, "wb");
                         if (fp) { fwrite(hc_x_t, sizeof(float), (size_t)S*D, fp); fclose(fp); }
                     }
@@ -5440,7 +5468,7 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
 
             /* Phase A': hc_pre(ffn) + RMSNorm per token (reuses post/comb planes) */
             PFP_BEGIN(tA2);
-            if (!(glm5_pf_par() && pf_run_hcpre(m, gw, 0, n_tokens, hc_x_b, cur_b, hc_res_b, post_b, comb_b, s->post_attn_norm_w[il])))
+            if (!(glm5_pf_par() && pf_run_hcpre(m, gw, 0, n_tokens, hc_x_b, cur_b, hc_res_b, post_b, comb_b, s->post_attn_norm_w[l])))
             for (int t = 0; t < n_tokens; t++) {
                 float *hc_x_t = hc_x_b + (size_t)t*S*D;
                 float *cur_t  = cur_b + (size_t)t*D;
@@ -5448,28 +5476,28 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                 float *post_t = post_b + (size_t)t*S;
                 float *comb_t = comb_b + (size_t)t*S*S;
                 memcpy(res_t, hc_x_t, (size_t)S*D*sizeof(float));
-                if (t == 0 && getenv("PICOLM_DBG_HCVEC") && atoi(getenv("PICOLM_DBG_HCVEC")) == il) {
+                if (t == 0 && getenv("PICOLM_DBG_HCVEC") && atoi(getenv("PICOLM_DBG_HCVEC")) == l) {
                     const char *dd = getenv("PICOLM_DUMP_DIR");
                     char fn[512];
-                    snprintf(fn, sizeof(fn), "%s/ffnpre_in-%d.f32", dd ? dd : "/tmp/picd", il);
+                    snprintf(fn, sizeof(fn), "%s/ffnpre_in-%d.f32", dd ? dd : "/tmp/picd", l);
                     FILE *fp = fopen(fn, "wb");
                     if (fp) { fwrite(hc_x_t, sizeof(float), (size_t)S*D, fp); fclose(fp); }
                 }
                 glm5_hc_pre(m, gw, 0, hc_x_t, cur_t, post_t, comb_t, s->glm5.hc_scratch);
-                if (t == 0 && getenv("PICOLM_DBG_HCVEC") && atoi(getenv("PICOLM_DBG_HCVEC")) == il) {
+                if (t == 0 && getenv("PICOLM_DBG_HCVEC") && atoi(getenv("PICOLM_DBG_HCVEC")) == l) {
                     const char *dd = getenv("PICOLM_DUMP_DIR");
                     char fn[512];
-                    snprintf(fn, sizeof(fn), "%s/ffnpre_cur-%d.f32", dd ? dd : "/tmp/picd", il);
+                    snprintf(fn, sizeof(fn), "%s/ffnpre_cur-%d.f32", dd ? dd : "/tmp/picd", l);
                     FILE *fp = fopen(fn, "wb");
                     if (fp) { fwrite(cur_t, sizeof(float), (size_t)D, fp); fclose(fp); }
                 }
-                rmsnorm(cur_t, cur_t, s->post_attn_norm_w[il], D, c->rms_norm_eps);
-                if (t == 0 && getenv("PICOLM_DBG_HCVEC") && atoi(getenv("PICOLM_DBG_HCVEC")) == il) {
+                rmsnorm(cur_t, cur_t, s->post_attn_norm_w[l], D, c->rms_norm_eps);
+                if (t == 0 && getenv("PICOLM_DBG_HCVEC") && atoi(getenv("PICOLM_DBG_HCVEC")) == l) {
                     const char *dd = getenv("PICOLM_DUMP_DIR");
                     char fn[512];
                     double ss=0; for(int q=0;q<D;q++) ss+=(double)cur_t[q]*cur_t[q];
-                    fprintf(stderr, "[ffnpre L%d] normed rms=%.6f\n", il, (float)sqrt(ss/D));
-                    snprintf(fn, sizeof(fn), "%s/ffn_norm-%d.f32", dd ? dd : "/tmp/picd", il);
+                    fprintf(stderr, "[ffnpre L%d] normed rms=%.6f\n", l, (float)sqrt(ss/D));
+                    snprintf(fn, sizeof(fn), "%s/ffn_norm-%d.f32", dd ? dd : "/tmp/picd", l);
                     FILE *fp = fopen(fn, "wb");
                     if (fp) { fwrite(cur_t, sizeof(float), (size_t)D, fp); fclose(fp); }
                 }
@@ -5488,22 +5516,22 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
              * NOT caused by this batching -- see the TODO above
              * glm5_moe_ffn_batch(). */
             PFP_BEGIN(tF);
-            if (il < c->n_layer_dense_lead) {
+            if (l < c->n_layer_dense_lead) {
                 if (!(glm5_dense_batch_enabled() && glm5_dense_ffn_batch(m, lw, cur_b, attn_b, n_tokens)))
                 for (int t = 0; t < n_tokens; t++)
                     glm5_dense_ffn(m, lw, s, cur_b + (size_t)t*D, attn_b + (size_t)t*D);
             } else if (n_tokens > 1 && !getenv("PICOLM_GLM5_MOE_PERTOKEN")) {
-                glm5_moe_ffn_batch(m, gw, lw, s, cur_b, attn_b, n_tokens, il);
+                glm5_moe_ffn_batch(m, gw, lw, s, cur_b, attn_b, n_tokens, l);
             } else {
                 for (int t = 0; t < n_tokens; t++)
-                    glm5_moe_ffn(m, gw, lw, s, cur_b + (size_t)t*D, attn_b + (size_t)t*D, il);
+                    glm5_moe_ffn(m, gw, lw, s, cur_b + (size_t)t*D, attn_b + (size_t)t*D, l);
             }
-            if (getenv("PICOLM_DBG_HCVEC") && atoi(getenv("PICOLM_DBG_HCVEC")) == il) {
+            if (getenv("PICOLM_DBG_HCVEC") && atoi(getenv("PICOLM_DBG_HCVEC")) == l) {
                 const char *dd = getenv("PICOLM_DUMP_DIR");
                 char fn[512];
                 double ss=0; for (int q=0;q<D;q++) ss+=(double)attn_b[q]*attn_b[q];
-                fprintf(stderr, "[ffnchk L%d] ffn_out rms=%.6f\n", il, (float)sqrt(ss/D));
-                snprintf(fn, sizeof(fn), "%s/ffn_out-%d.f32", dd ? dd : "/tmp/picd", il);
+                fprintf(stderr, "[ffnchk L%d] ffn_out rms=%.6f\n", l, (float)sqrt(ss/D));
+                snprintf(fn, sizeof(fn), "%s/ffn_out-%d.f32", dd ? dd : "/tmp/picd", l);
                 FILE *fp = fopen(fn, "wb");
                 if (fp) { fwrite(attn_b, sizeof(float), (size_t)D, fp); fclose(fp); }
             }
@@ -5521,16 +5549,16 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                 if (t == glm5_dump_tok()) {
                     static int wl2 = -2;
                     if (wl2 == -2) { const char *e = getenv("PICOLM_DBG_HCVEC"); wl2 = e ? atoi(e) : -1; }
-                    if (wl2 == il) {
+                    if (wl2 == l) {
                         const char *dd = getenv("PICOLM_DUMP_DIR");
                         char fn[512];
-                        snprintf(fn, sizeof(fn), "%s/ffn_attn-%d.f32", dd ? dd : "/tmp/picd", il);
+                        snprintf(fn, sizeof(fn), "%s/ffn_attn-%d.f32", dd ? dd : "/tmp/picd", l);
                         FILE *fp = fopen(fn, "wb");
                         if (fp) { fwrite(attn_t, sizeof(float), (size_t)D, fp); fclose(fp); }
-                        snprintf(fn, sizeof(fn), "%s/ffn_comb-%d.f32", dd ? dd : "/tmp/picd", il);
+                        snprintf(fn, sizeof(fn), "%s/ffn_comb-%d.f32", dd ? dd : "/tmp/picd", l);
                         fp = fopen(fn, "wb");
                         if (fp) { fwrite(comb_t, sizeof(float), (size_t)S*S, fp); fclose(fp); }
-                        snprintf(fn, sizeof(fn), "%s/ffn_post-%d.f32", dd ? dd : "/tmp/picd", il);
+                        snprintf(fn, sizeof(fn), "%s/ffn_post-%d.f32", dd ? dd : "/tmp/picd", l);
                         fp = fopen(fn, "wb");
                         if (fp) { fwrite(post_t, sizeof(float), (size_t)S, fp); fclose(fp); }
                     }
@@ -5554,17 +5582,17 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                         rb[d] = acc * inv_s;
                     }
                 }
-                viz_push_batch(il, start_pos, reduced_batch, n_tokens, D);
+                viz_push_batch(l, start_pos, reduced_batch, n_tokens, D);
             }
 #endif
-            if (stop_layer >= 0 && il >= stop_layer) {
-                BENCH_LAYER_END(il, 1);
+            if (stop_layer >= 0 && l >= stop_layer) {
+                BENCH_LAYER_END(l, 1);
                 if (glm5_dbg_enabled())
-                    fprintf(stderr, "GLM5 prefill: stopping after layer %d (PICOLM_STOP_LAYER)\n", il);
+                    fprintf(stderr, "GLM5 prefill: stopping after layer %d (PICOLM_STOP_LAYER)\n", l);
                 break;
             }
-            if (tLayer) { const double dl = glm5_prof_now() - tLayer; g_pf_ms[pfk][PF_LAYER] += dl; g_pf_cur[PF_LAYER] = dl; g_pf_layers[pfk]++; glm5_pfprof_layer_line(il, pfk); }
-            BENCH_LAYER_END(il, 1);
+            if (tLayer) { const double dl = glm5_prof_now() - tLayer; g_pf_ms[pfk][PF_LAYER] += dl; g_pf_cur[PF_LAYER] = dl; g_pf_layers[pfk]++; glm5_pfprof_layer_line(l, pfk); }
+            BENCH_LAYER_END(l, 1);
         }
 
         if (glm5_pfprof_on()) glm5_pfprof_print();

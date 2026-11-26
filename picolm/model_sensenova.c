@@ -345,8 +345,21 @@ float *model_forward_sensenova(model_t *m, int token, int pos) {
 
     /* 2. Layer loop (stream state carried across layers) */
     int streams_active = 0;
-    for (int l = 0; l < c->n_layers; l++) {
+    for (int il = 0; il < c->n_layers; il++) {
+#ifdef PICOLM_VIZ
+        int l = viz_layer_permute(il);
+#else
+        int l = il;
+#endif
         BENCH_LAYER_START();
+
+#ifdef PICOLM_VIZ
+        if (viz_layer_skip(l)) {
+            BENCH_LAYER_END(l, 0);
+            continue;
+        }
+#endif
+
         sensenova_layer(m, s, l, pos, &streams_active);
         BENCH_LAYER_END(l, 0);
     }

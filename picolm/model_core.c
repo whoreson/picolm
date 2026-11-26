@@ -2876,9 +2876,24 @@ static float *model_forward_gpt2(model_t *m, int token, int pos) {
     /* 2. Transformer layers */
     int n_active_layers = c->n_layers;
     for (int slot = 0; slot < n_active_layers; slot++) {
+#ifdef PICOLM_VIZ
+        int l = viz_layer_permute(slot);
+#else
         int l = slot;
+#endif
         layer_weights_t *lw = &w->layers[l];
         BENCH_LAYER_START();
+
+#ifdef PICOLM_VIZ
+        if (viz_layer_skip(l)) {
+#ifdef PICOLM_VIZ
+            viz_push_row(l, pos, s->x, dim);
+#endif
+            BENCH_LAYER_END(l, 0);
+            continue;
+        }
+#endif
+
         int ri = 2 + l * 9;
 
         /* ---- LayerNorm + Attention ---- */
@@ -3171,9 +3186,21 @@ static float *model_forward_gptneox(model_t *m, int token, int pos) {
     /* 2. Transformer layers */
     int n_active_layers = c->n_layers;
     for (int slot = 0; slot < n_active_layers; slot++) {
+#ifdef PICOLM_VIZ
+        int l = viz_layer_permute(slot);
+#else
         int l = slot;
+#endif
         layer_weights_t *lw = &w->layers[l];
         BENCH_LAYER_START();
+
+#ifdef PICOLM_VIZ
+        if (viz_layer_skip(l)) {
+            BENCH_LAYER_END(l, 0);
+            continue;
+        }
+#endif
+
         int ri = 2 + l * 9;
 
         /* ---- Parallel residual: both branches from same LayerNorm'd input ---- */
@@ -3402,9 +3429,21 @@ static float *model_forward_spark25(model_t *m, int token, int pos) {
     /* 2. Transformer layers */
     int n_active_layers = c->n_layers;
     for (int slot = 0; slot < n_active_layers; slot++) {
+#ifdef PICOLM_VIZ
+        int l = viz_layer_permute(slot);
+#else
         int l = slot;
+#endif
         layer_weights_t *lw = &w->layers[l];
         BENCH_LAYER_START();
+
+#ifdef PICOLM_VIZ
+        if (viz_layer_skip(l)) {
+            BENCH_LAYER_END(l, 0);
+            continue;
+        }
+#endif
+
         int ri = 2 + l * 9;
 
         /* ---- Attention block ---- */
@@ -4832,9 +4871,21 @@ static float *model_forward_prefill_gpt2(model_t *m, const int *tokens, int n_to
 
     int n_active_layers = c->n_layers;
     for (int slot = 0; slot < n_active_layers; slot++) {
+#ifdef PICOLM_VIZ
+        int l = viz_layer_permute(slot);
+#else
         int l = slot;
+#endif
         layer_weights_t *lw = &w->layers[l];
         BENCH_LAYER_START();
+
+#ifdef PICOLM_VIZ
+        if (viz_layer_skip(l)) {
+            BENCH_LAYER_END(l, 1);
+            continue;
+        }
+#endif
+
         if (NULL && l == 0) {
             fprintf(stderr, "[CPUL0DBG x_raw][:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
                 x_batch[0],x_batch[1],x_batch[2],x_batch[3],x_batch[4],x_batch[5],x_batch[6],x_batch[7]);
@@ -5366,9 +5417,20 @@ static float *model_forward_prefill_gptneox(model_t *m, const int *tokens, int n
 
     int n_active_layers = c->n_layers;
     for (int slot = 0; slot < n_active_layers; slot++) {
+#ifdef PICOLM_VIZ
+        int l = viz_layer_permute(slot);
+#else
         int l = slot;
+#endif
         layer_weights_t *lw = &w->layers[l];
         BENCH_LAYER_START();
+
+#ifdef PICOLM_VIZ
+        if (viz_layer_skip(l)) {
+            BENCH_LAYER_END(l, 1);
+            continue;
+        }
+#endif
 
         /* ---- Attention branch: LayerNorm ---- */
         for (int bi = 0; bi < n_tokens; bi++)
@@ -5651,9 +5713,21 @@ static float *model_forward_prefill_spark25(model_t *m, const int *tokens, int n
     PP_BEGIN();
     int n_active_layers = c->n_layers;
     for (int slot = 0; slot < n_active_layers; slot++) {
+#ifdef PICOLM_VIZ
+        int l = viz_layer_permute(slot);
+#else
         int l = slot;
+#endif
         layer_weights_t *lw = &w->layers[l];
         BENCH_LAYER_START();
+
+#ifdef PICOLM_VIZ
+        if (viz_layer_skip(l)) {
+            BENCH_LAYER_END(l, 1);
+            continue;
+        }
+#endif
+
         int ri = 2 + l * 9;
 
         /* ---- Attention block ---- */

@@ -213,8 +213,22 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
         int stop_after = -999;
         const char *stop_env = getenv("PICOLM_STOP_LAYER");
         if (stop_env) stop_after = atoi(stop_env);
-        for (int l = 0; l < c->n_layers; l++) {
+        for (int il = 0; il < c->n_layers; il++) {
+#ifdef PICOLM_VIZ
+            int l = viz_layer_permute(il);
+#else
+            int l = il;
+#endif
             BENCH_LAYER_START();
+
+#ifdef PICOLM_VIZ
+            if (viz_layer_skip(l)) {
+                viz_push_row(l, pos, s->gemma3n_altup_state + i_altup_act * dim, dim);
+                BENCH_LAYER_END(l, g_is_prefill);
+                continue;
+            }
+#endif
+
             if (pos == 0 && getenv("PICOLM_DBG")) {
                 for(int a=0;a<n_altup;a++){
                     double m=0; for(int i=0;i<dim;i++){double v=s->gemma3n_altup_state[a*dim+i]; m+=v*v;}

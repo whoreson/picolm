@@ -5409,7 +5409,12 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
      * offload n_gpu_layers == c->n_layers and this is unchanged. */
     int n_gpu_layers = gw->n_gpu_layers;
     if (n_gpu_layers <= 0 || n_gpu_layers > c->n_layers) n_gpu_layers = c->n_layers;
-    for (int l = 0; l < n_gpu_layers; l++) {
+    for (int il = 0; il < n_gpu_layers; il++) {
+#ifdef PICOLM_VIZ
+        int l = viz_layer_permute(il);
+#else
+        int l = il;
+#endif
         if (l > 0 && (l % batch_flush_interval) == 0) {
             picolm_gpu_batch_end(gpu_dev);
             picolm_gpu_batch_begin(gpu_dev);
@@ -5418,6 +5423,13 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
         layer_weights_t *lw = &w->layers[l];
         gl = &gw->layers[l];
         int did_cpu_ssm = 0;
+
+#ifdef PICOLM_VIZ
+        if (viz_layer_skip(l)) {
+            /* Pass through: pipe_x unchanged */
+            continue;
+        }
+#endif
 
         if (!c->has_ssm || lw->is_attn_layer) {
             /* A. RMSNorm/LayerNorm: pipe_xb = norm(pipe_x, attn_norm_w[l]) */
@@ -6072,7 +6084,12 @@ static int _prefill_gpu_ubatch(model_t *m, run_state_t *s, gpu_weights_t *gw,
      * inside model_forward_prefill_gpu's caller. Full offload => unchanged. */
     int n_gpu_layers = gw->n_gpu_layers;
     if (n_gpu_layers <= 0 || n_gpu_layers > c->n_layers) n_gpu_layers = c->n_layers;
-    for (int l = 0; l < n_gpu_layers; l++) {
+    for (int il = 0; il < n_gpu_layers; il++) {
+#ifdef PICOLM_VIZ
+        int l = viz_layer_permute(il);
+#else
+        int l = il;
+#endif
         if (l > 0 && (l % batch_flush_interval) == 0) {
             picolm_gpu_batch_end(gpu_dev);
             picolm_gpu_batch_begin(gpu_dev);
@@ -6080,6 +6097,13 @@ static int _prefill_gpu_ubatch(model_t *m, run_state_t *s, gpu_weights_t *gw,
         if (interrupt && *interrupt) return -1;
         { char _ts_label[64]; snprintf(_ts_label, 64, "LAYER_%d_START", l); picolm_gpu_ts_write(_ts_label); }
         picolm_gpu_set_dbg_layer(l);
+
+#ifdef PICOLM_VIZ
+        if (viz_layer_skip(l)) {
+            /* Pass through: bx unchanged */
+            continue;
+        }
+#endif
 
         double _ph0 = 0;
         layer_weights_t *lw = &w->layers[l];
