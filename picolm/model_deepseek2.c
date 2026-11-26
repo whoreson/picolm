@@ -89,24 +89,35 @@ static int    g_ds2_nlayers = 0;
  * at ~1.7% error per layer on the attention output and compounds over 61
  * layers (flattens logits); F16 keeps ~0.05% per element (2^-11) while still
  * halving the stream to 2.05 GB. The matmul path is vec_dot_f16_f32. */
-static int ds2_wkv_f16 = -1;   /* resolved from env once */
-static size_t ds2_wk_bytes(int NH, int NOPE, int KVL) {
-    if (ds2_wkv_f16 < 0) {
+/* Derived-matrix storage mode: f16 (default), q8_0, or f32.
+ *
+ * F32 = 4.1 GB/token; F16 = 2.05 GB (error ~0.05%/elem); Q8_0 = 1.08 GB
+ * with int8-MAC dots and ~0.4%/weight error.
+ *
+ * MEASURED on V3-0324 (24t): F16 = 2.0 tok/s, Q8_0 = 1.7-1.8 tok/s despite
+ * half the bytes -- the absorb/V mm_multi Q8_0 path loses to the F16
+ * generic vec_dot loop in-model. Q8_0 remains for memory-constrained use
+ * (identical greedy text). PICOLM_DS2_WKV=f16|q8_0|f32. */
+static int ds2_wkv_mode = -1;   /* 0=f32 1=f16 2=q8_0; resolved from env once */
+static int ds2_wkv_mode_resolve(void) {
+    if (ds2_wkv_mode < 0) {
         const char *e = getenv("PICOLM_DS2_WKV");
-        ds2_wkv_f16 = !(e && strcmp(e, "f32") == 0);
+        ds2_wkv_mode = (!e || !*e || !strcmp(e, "f16")) ? 1
+                     : !strcmp(e, "q8_0") ? 2 : 0;
     }
-    return (size_t)NH * KVL * (size_t)NOPE * (ds2_wkv_f16 ? 2 : 4);
+    return ds2_wkv_mode;
+}
+static size_t ds2_wk_bytes(int NH, int NOPE, int KVL) {
+    const size_t n = (size_t)NH * KVL * (size_t)NOPE;
+    return ds2_wkv_mode_resolve() == 2 ? n / 32 * 34 : n * (ds2_wkv_mode == 1 ? 2 : 4);
 }
 static size_t ds2_wv_bytes(int NH, int HV, int KVL) {
-    if (ds2_wkv_f16 < 0) {
-        const char *e = getenv("PICOLM_DS2_WKV");
-        ds2_wkv_f16 = !(e && strcmp(e, "f32") == 0);
-    }
-    return (size_t)NH * HV * (size_t)KVL * (ds2_wkv_f16 ? 2 : 4);
+    const size_t n = (size_t)NH * HV * (size_t)KVL;
+    return ds2_wkv_mode_resolve() == 2 ? n / 32 * 34 : n * (ds2_wkv_mode == 1 ? 2 : 4);
 }
 static gguf_type_t ds2_wkv_type(void) {
-    if (ds2_wkv_f16 < 0) ds2_wk_bytes(1, 1, 1);   /* resolve env */
-    return ds2_wkv_f16 ? GGUF_TYPE_F16 : GGUF_TYPE_F32;
+    const int m = ds2_wkv_mode_resolve();
+    return m == 2 ? GGUF_TYPE_Q8_0 : m == 1 ? GGUF_TYPE_F16 : GGUF_TYPE_F32;
 }
 
 /* Free any derived buffers (called from the model teardown if present). */
@@ -171,7 +182,8 @@ static int ds2_build_kv_b(int NH, int NOPE, int HV, int KVL,
     }
     free(wrow);
 
-    /* F16 storage: convert in place (forward order, 2-byte dst < 4-byte src). */
+    /* Convert in place per storage mode (Q8_0 dst 1.0625 B/val < F16 2 <
+     * F32 4, so forward-order in-place is safe for all modes). */
     if (ds2_wkv_type() == GGUF_TYPE_F16) {
         const size_t n1 = ds2_wk_bytes(NH, NOPE, KVL) / 2;
         uint16_t *d16 = (uint16_t *)wk;
@@ -181,6 +193,9 @@ static int ds2_build_kv_b(int NH, int NOPE, int HV, int KVL,
         uint16_t *v16 = (uint16_t *)wv;
         const float *v32 = (const float *)wv;
         for (size_t i = 0; i < n2; i++) v16[i] = fp32_to_fp16(v32[i]);
+    } else if (ds2_wkv_type() == GGUF_TYPE_Q8_0) {
+        quantize_row_q8_0((const float *)wk, wk, (int)((size_t)NH * KVL * NOPE));
+        quantize_row_q8_0((const float *)wv, wv, (int)((size_t)NH * HV * KVL));
     }
 
     *wk_out = wk; *wv_out = wv;
@@ -347,13 +362,22 @@ static void ds2_kv_b_ptrs(const model_t *m, int layer,
     const int KVL = c->glm5_kv_lora;
 
     if (g_ds2_wk && g_ds2_wk[layer]) {
-        const int el = (ds2_wkv_type() == GGUF_TYPE_F16) ? 2 : 4;
+        const gguf_type_t t = ds2_wkv_type();
+        size_t head, head_v;
+        switch (t) {
+            case GGUF_TYPE_Q8_0: head = (size_t)KVL * NOPE / 32 * 34;
+                                 head_v = (size_t)HV * KVL / 32 * 34; break;
+            case GGUF_TYPE_F16:  head = (size_t)KVL * NOPE * 2;
+                                 head_v = (size_t)HV * KVL * 2; break;
+            default:             head = (size_t)KVL * NOPE * 4;
+                                 head_v = (size_t)HV * KVL * 4; break;
+        }
         *wk = g_ds2_wk[layer];
-        *wk_t = ds2_wkv_type();
-        *wk_head_sz = (size_t)KVL * NOPE * el;
+        *wk_t = t;
+        *wk_head_sz = head;
         *wv = g_ds2_wv[layer];
-        *wv_t = ds2_wkv_type();
-        *wv_head_sz = (size_t)HV * KVL * el;
+        *wv_t = t;
+        *wv_head_sz = head_v;
         return;
     }
     /* Split GGUF tensors: attn_k_b ne={NOPE,KVL,NH}, attn_v_b ne={KVL,HV,NH}. */
