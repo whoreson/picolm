@@ -3564,9 +3564,11 @@ static int glm5_moe_ffn_batch_ep(const model_t *m, const glm5_layer_weights_t *g
 }
 
 /* Dispatcher: the expert-parallel path when enabled and applicable, else the reference. */
-static void glm5_moe_ffn_batch(const model_t *m, const glm5_layer_weights_t *gw,
-                               const layer_weights_t *lw, run_state_t *s,
-                               const float *cur_b, float *out_b, int n_tokens, int layer_idx)
+/* Batched MoE for prefill (exported: reused by the DeepSeek V3 prefill, same
+ * sigmoid routing; see model_internal.h). */
+void glm5_moe_ffn_batch(const model_t *m, const glm5_layer_weights_t *gw,
+                        const layer_weights_t *lw, run_state_t *s,
+                        const float *cur_b, float *out_b, int n_tokens, int layer_idx)
 {
     const int prof = glm5_moe_prof_on();
     if (prof && g_epp_calls == 0) atexit(glm5_moe_prof_print);

@@ -82,19 +82,31 @@ static void **g_ds2_wk = NULL;
 static void **g_ds2_wv = NULL;
 static int    g_ds2_nlayers = 0;
 
-/* Derived matrices are kept in F32.
+/* Derived matrices are kept in F16 (PICOLM_DS2_WKV=f32 for F32).
  *
- * Requantising them (Q8_0 was the first choice, to halve the memory) adds a
- * per-layer error of ~1.7% on the attention output; validated by
- * PICOLM_DS2_XCHECK, which compares the absorbed path against the
- * non-absorbed wkv_b reference. That is small per layer but it compounds over
- * all 61 layers and flattens the final logits, so the derivation is done
- * losslessly: 61 * (128*512 + 512*128) * 4 B = 4.1 GB. */
+ * These are streamed from RAM on every token (61 layers x 33.5 MB wk +
+ * 33.5 MB wv = 4.1 GB per token in F32). Q8_0 requantisation was measured
+ * at ~1.7% error per layer on the attention output and compounds over 61
+ * layers (flattens logits); F16 keeps ~0.05% per element (2^-11) while still
+ * halving the stream to 2.05 GB. The matmul path is vec_dot_f16_f32. */
+static int ds2_wkv_f16 = -1;   /* resolved from env once */
 static size_t ds2_wk_bytes(int NH, int NOPE, int KVL) {
-    return (size_t)NH * KVL * (size_t)NOPE * sizeof(float);
+    if (ds2_wkv_f16 < 0) {
+        const char *e = getenv("PICOLM_DS2_WKV");
+        ds2_wkv_f16 = !(e && strcmp(e, "f32") == 0);
+    }
+    return (size_t)NH * KVL * (size_t)NOPE * (ds2_wkv_f16 ? 2 : 4);
 }
 static size_t ds2_wv_bytes(int NH, int HV, int KVL) {
-    return (size_t)NH * HV * (size_t)KVL * sizeof(float);
+    if (ds2_wkv_f16 < 0) {
+        const char *e = getenv("PICOLM_DS2_WKV");
+        ds2_wkv_f16 = !(e && strcmp(e, "f32") == 0);
+    }
+    return (size_t)NH * HV * (size_t)KVL * (ds2_wkv_f16 ? 2 : 4);
+}
+static gguf_type_t ds2_wkv_type(void) {
+    if (ds2_wkv_f16 < 0) ds2_wk_bytes(1, 1, 1);   /* resolve env */
+    return ds2_wkv_f16 ? GGUF_TYPE_F16 : GGUF_TYPE_F32;
 }
 
 /* Free any derived buffers (called from the model teardown if present). */
@@ -121,12 +133,14 @@ static int ds2_build_kv_b(int NH, int NOPE, int HV, int KVL,
     const int per_head = NOPE + HV;
     const int ncol = NH * per_head;
 
-    void *wk = malloc(ds2_wk_bytes(NH, NOPE, KVL));
-    void *wv = malloc(ds2_wv_bytes(NH, HV, KVL));
+    /* Always build in F32, then convert in place when F16 storage is on:
+     * allocate the F32 size (4 B/elem) regardless of the storage type. */
+    void *wk = malloc((size_t)NH * KVL * NOPE * sizeof(float));
+    void *wv = malloc((size_t)NH * HV * KVL * sizeof(float));
     if (!wk || !wv) { free(wk); free(wv); return -1; }
 
-    memset(wk, 0, ds2_wk_bytes(NH, NOPE, KVL));
-    memset(wv, 0, ds2_wv_bytes(NH, HV, KVL));
+    memset(wk, 0, (size_t)NH * KVL * NOPE * sizeof(float));
+    memset(wv, 0, (size_t)NH * HV * KVL * sizeof(float));
 
     /* Dequantize ONE GGUF ROW AT A TIME. Each quantized row has KVL elements
      * (ne[0] contiguous); there are ncol = NH*per_head rows (ne[1]). The old
@@ -156,6 +170,19 @@ static int ds2_build_kv_b(int NH, int NOPE, int HV, int KVL,
         }
     }
     free(wrow);
+
+    /* F16 storage: convert in place (forward order, 2-byte dst < 4-byte src). */
+    if (ds2_wkv_type() == GGUF_TYPE_F16) {
+        const size_t n1 = ds2_wk_bytes(NH, NOPE, KVL) / 2;
+        uint16_t *d16 = (uint16_t *)wk;
+        const float *s32 = (const float *)wk;
+        for (size_t i = 0; i < n1; i++) d16[i] = fp32_to_fp16(s32[i]);
+        const size_t n2 = ds2_wv_bytes(NH, HV, KVL) / 2;
+        uint16_t *v16 = (uint16_t *)wv;
+        const float *v32 = (const float *)wv;
+        for (size_t i = 0; i < n2; i++) v16[i] = fp32_to_fp16(v32[i]);
+    }
+
     *wk_out = wk; *wv_out = wv;
     return 0;
 }
@@ -320,12 +347,13 @@ static void ds2_kv_b_ptrs(const model_t *m, int layer,
     const int KVL = c->glm5_kv_lora;
 
     if (g_ds2_wk && g_ds2_wk[layer]) {
+        const int el = (ds2_wkv_type() == GGUF_TYPE_F16) ? 2 : 4;
         *wk = g_ds2_wk[layer];
-        *wk_t = GGUF_TYPE_F32;
-        *wk_head_sz = (size_t)KVL * NOPE * sizeof(float);
+        *wk_t = ds2_wkv_type();
+        *wk_head_sz = (size_t)KVL * NOPE * el;
         *wv = g_ds2_wv[layer];
-        *wv_t = GGUF_TYPE_F32;
-        *wv_head_sz = (size_t)HV * KVL * sizeof(float);
+        *wv_t = ds2_wkv_type();
+        *wv_head_sz = (size_t)HV * KVL * el;
         return;
     }
     /* Split GGUF tensors: attn_k_b ne={NOPE,KVL,NH}, attn_v_b ne={KVL,HV,NH}. */
@@ -1166,12 +1194,10 @@ float *model_forward_prefill_deepseek2(model_t *m, const int *tokens, int n_toke
             matmul_batch(attn_batch, hb_batch, n_tokens, lw->ffn_down, ffn_buf, D,
                          lw->type_ffn_down);
         } else {
-            /* MoE FFN: per-token (variable expert selection) */
-            for (int t = 0; t < n_tokens; t++) {
-                memcpy(s->ds2.cur, xb_batch + (size_t)t * D, D * sizeof(float));
-                glm5_moe_ffn(m, gw, lw, s, s->ds2.cur, s->ds2.attn_out, il);
-                memcpy(attn_batch + (size_t)t * D, s->ds2.attn_out, D * sizeof(float));
-            }
+            /* MoE FFN: batched across tokens (glm5_moe_ffn_batch sorts by
+             * expert so each expert's weights stream once for the whole
+             * batch; routing semantics identical to glm5_moe_ffn). */
+            glm5_moe_ffn_batch(m, gw, lw, s, xb_batch, attn_batch, n_tokens, il);
         }
 
         /* Residual add: x += ffn_out */

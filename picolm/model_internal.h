@@ -122,6 +122,13 @@ extern void moe_forward_batch(model_t *m, run_state_t *s,
 extern void glm5_moe_ffn(const model_t *m, const glm5_layer_weights_t *gw,
                          const layer_weights_t *lw, run_state_t *s,
                          const float *cur, float *out, int layer_idx);
+/* Batched-prefill variant: identical routing semantics, but sorts tokens by
+ * selected expert so each expert's weights are streamed once instead of once
+ * per selecting token. cur_b/out_b are [n_tokens][n_embd]. */
+extern void glm5_moe_ffn_batch(const model_t *m, const glm5_layer_weights_t *gw,
+                               const layer_weights_t *lw, run_state_t *s,
+                               const float *cur_b, float *out_b, int n_tokens,
+                               int layer_idx);
 extern void glm5_moe_shared_expert(const model_t *m, const layer_weights_t *lw,
                                    run_state_t *s, const float *cur, float *out,
                                    int SFF);
