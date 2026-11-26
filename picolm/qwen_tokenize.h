@@ -16,6 +16,7 @@ enum {
     QWEN_PRETOK_GLM4    = 2, /* GLM-4 / GLM-5.3-Flash: DEFAULT with \p{N}{1,3} digits */
     QWEN_PRETOK_SPARK25 = 3, /* Spark-X2.5 pretokenizer */
     QWEN_PRETOK_GPT2    = 4, /* strict GPT-2 / granite-docling pretokenizer */
+    QWEN_PRETOK_DEEPSEEK3 = 5, /* DeepSeek V3: Spark2.5 patterns minus contractions */
 };
 
 typedef struct {

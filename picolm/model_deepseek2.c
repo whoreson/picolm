@@ -1208,6 +1208,7 @@ float *model_forward_prefill_deepseek2(model_t *m, const int *tokens, int n_toke
 /* GLM5: 4 query rows x 4 key rows per iteration.                      */
 /* ------------------------------------------------------------------ */
 
+#if defined(PICOLM_AVX512)
 static inline __m512 ds2_pfa_hsum16(const __m512 a[16])
 {
     __m512 t[8], u[4];
@@ -1226,13 +1227,16 @@ static inline __m512 ds2_pfa_hsum16(const __m512 a[16])
     r = _mm512_insertf32x4(r, v[2], 2);
     return _mm512_insertf32x4(r, v[3], 3);
 }
+#endif
 
+#if defined(PICOLM_AVX2)
 static inline float ds2_hsum256(const __m256 v) {
     __m128 s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
     s = _mm_add_ps(s, _mm_movehl_ps(s, s));
     s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 0x55));
     return _mm_cvtss_f32(s);
 }
+#endif
 
 /* S[r*DS2_PFA_BK + j] = dot(qp[r], kb[j*kstride]) * scale, over nk keys,
  * KVD elements per dot. kb rows are kstride apart (ds2 cache: LROW). */

@@ -51,6 +51,10 @@ static int glm5_dbg_enabled(void) {
     return cached;
 }
 
+/* PICOLM_DBG_MOE_OUT=1: per-expert SwiGLU diagnostics when any gate/up
+ * value exceeds ±5, and routed-output outlier reports (see glm5_moe_ffn). */
+static int moe_dbg_on = -1;
+
 /* Verbose per-kernel dumps (KDA projections, decay/beta stats). Separate from
  * PICOLM_DBG_GLM5 so the per-layer summary stays readable. */
 static int glm5_dbg2_enabled(void) {
@@ -2781,9 +2785,9 @@ static void glm5_dense_ffn(const model_t *m, const layer_weights_t *lw,
 
 /* GLM-5 shared expert: ungated SwiGLU, added to `out` (no routing weight).
  * Split out so the batched MoE can reuse it verbatim. */
-static void glm5_moe_shared_expert(const model_t *m, const layer_weights_t *lw,
-                                   run_state_t *s, const float *cur, float *out,
-                                   int SFF)
+void glm5_moe_shared_expert(const model_t *m, const layer_weights_t *lw,
+                            run_state_t *s, const float *cur, float *out,
+                            int SFF)
 {
     const model_config_t *c = &m->config;
     const int D = c->n_embd;
@@ -2804,10 +2808,16 @@ static void glm5_moe_shared_expert(const model_t *m, const layer_weights_t *lw,
     for (int i = 0; i < D; i++) out[i] += s->glm5.moe_down[i];
 }
 
-static void glm5_moe_ffn(const model_t *m, const glm5_layer_weights_t *gw,
-                         const layer_weights_t *lw, run_state_t *s,
-                         const float *cur, float *out, int layer_idx)
+/* Non-static: reused verbatim by the DeepSeek V3 forward pass
+ * (model_deepseek2.c), whose routing semantics are identical. */
+void glm5_moe_ffn(const model_t *m, const glm5_layer_weights_t *gw,
+                  const layer_weights_t *lw, run_state_t *s,
+                  const float *cur, float *out, int layer_idx)
 {
+    if (moe_dbg_on < 0) {
+        const char *e = getenv("PICOLM_DBG_MOE_OUT");
+        moe_dbg_on = (e && *e && *e != '0');
+    }
     const model_config_t *c = &m->config;
     const int D = c->n_embd;
     const int NE = c->n_expert;
@@ -2959,18 +2969,32 @@ static void glm5_moe_ffn(const model_t *m, const glm5_layer_weights_t *gw,
         }
 
         /* SwiGLU (+ optional clamp) per expert, in place into gate_b[k]. */
+        const int moe_dbg = moe_dbg_on;
         for (int k = 0; k < AK; k++) {
             if (wts[k] == 0.f) continue;
             float *g_buf = gate_b + (size_t)k * FF;
             const float *u_buf = up_b + (size_t)k * FF;
+            float gmax = -INFINITY, gmin = INFINITY, umax = -INFINITY, umin = INFINITY;
             for (int i = 0; i < FF; i++) {
                 float g = g_buf[i];
                 float u = u_buf[i];
+                if (moe_dbg) {
+                    if (g > gmax) gmax = g;
+                    if (g < gmin) gmin = g;
+                    if (u > umax) umax = u;
+                    if (u < umin) umin = u;
+                }
                 if (clamp_v > 0.0f) {
                     g = fminf(g, clamp_v);
                     u = fminf(fmaxf(u, -clamp_v), clamp_v);
                 }
                 g_buf[i] = g / (1.0f + expf(-g)) * u;
+            }
+            if (moe_dbg && (gmax > 5.f || gmin < -5.f || umax > 5.f || umin < -5.f)) {
+                double ss = 0.f;
+                for (int i = 0; i < FF; i++) ss += (double)g_buf[i] * g_buf[i];
+                fprintf(stderr, "[moe glue] l%d k=%d e=%d w=%.4f glue_rms=%.4f g_max=%.4f g_min=%.4f u_max=%.4f u_min=%.4f\n",
+                        layer_idx, k, sel[k], wts[k], sqrt(ss / FF), gmax, gmin, umax, umin);
             }
         }
 
@@ -3001,6 +3025,26 @@ static void glm5_moe_ffn(const model_t *m, const glm5_layer_weights_t *gw,
 
     glm5_stats("x.moe.routed", out, D);
 
+    /* PICOLM_DBG_MOE_OUT=1: report large routed-expert contributions so the
+     * "expert explosion" (one SwiGLU outlier dominating the sum) can be
+     * localised per layer/position without drowning in per-layer noise. */
+    if (moe_dbg_on) {
+        float omax = 0.f;
+        int omi = -1;
+        for (int i = 0; i < D; i++) {
+            float a = fabsf(out[i]);
+            if (a > omax) { omax = a; omi = i; }
+        }
+        if (omax > 5.f) {
+            float orms = 0.f;
+            double ss = 0;
+            for (int i = 0; i < D; i++) ss += (double)out[i] * out[i];
+            orms = (float)sqrt(ss / D);
+            fprintf(stderr, "[moe out] l%d pos? out_max=%.2f at[%d] rms=%.4f\n",
+                    layer_idx, omax, omi, orms);
+        }
+    }
+
     /* shared expert (no sigmoid gate for GLM-5) */
     if (lw->ffn_gate_shexp) {
         glm5_moe_shared_expert(m, lw, s, cur, out, SFF);
@@ -3008,7 +3052,11 @@ static void glm5_moe_ffn(const model_t *m, const glm5_layer_weights_t *gw,
         glm5_stats(t, s->glm5.moe_down, D);
     }
     glm5_stats("x.moe.out", out, D);
-    glm5_chk("x.moe.out", out, D, -1e4f, 1e4f);
+    {
+        char tc[96];
+        snprintf(tc, sizeof tc, "x.moe.out-l%d", layer_idx);
+        glm5_chk(tc, out, D, -1e4f, 1e4f);
+    }
 }
 
 /* Batched MoE for prefill.
