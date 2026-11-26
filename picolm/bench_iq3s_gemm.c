@@ -66,8 +66,8 @@ static void run(int which, int m, int n, int k, int nth,
                 const block_iq3_s *W, const block_q8_K *Y, float *C) {
     ctx_t c = { which, m, n, k, nth, W, Y, C };
     if (nth == 1) { task(0, &c); return; }
-    /* emulate the pool: partition ith serially for the check */
-    for (int th = 0; th < nth; th++) task(th, &c);
+    if (nth > 1) { tensor_set_n_threads(nth); tensor_threadpool_init(nth); }
+    tensor_parallel_for(nth, task, &c);
 }
 
 static int havev_g(void);

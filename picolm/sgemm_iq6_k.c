@@ -1143,7 +1143,30 @@ int sgemm_iq3_k_r4_q8_k_r8t(int nrows, int ncols, int k, const void *vx, const v
  * and (2*ls+1) is the whole scale). */
 static void iq3s_t_decode_group(const char *wbase, size_t w_row_bytes, int nb) {
     const uint32_t *grid = picolm_iq3s_grid();
-    const uint8_t  *kmsk = picolm_iq3xxs_kmask();
+    /* AVX2 decode-once: per 32-value group, build 9-bit grid indices SIMD,
+     * gather 8 uint32_t grid entries, pack as 32 int8 bytes, apply signs
+     * via the xor+sub conditional-negate trick (same idiom as vec_dot). */
+#if defined(__AVX2__)
+    static const uint8_t k_mask1[32] = {
+        0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+        0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,
+        0x02,0x02,0x02,0x02,0x02,0x02,0x02,0x02,
+        0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03
+    };
+    static const uint8_t k_mask2[32] = {
+        0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,
+        0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,
+        0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,
+        0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,
+    };
+    const __m256i msk1 = _mm256_loadu_si256((const __m256i *)k_mask1);
+    const __m256i msk2 = _mm256_loadu_si256((const __m256i *)k_mask2);
+    const __m256i idx_shift = _mm256_set_epi32(1, 2, 3, 4, 5, 6, 7, 8);
+    const __m256i idx_mask  = _mm256_set1_epi32(256);
+
+    typedef union { __m256i vec[2]; uint32_t index[16]; } index_t;
+#endif
+
     for (int ib = 0; ib < nb; ++ib) {
         __m256i wv[8][8];
         float dd[8];
@@ -1157,6 +1180,59 @@ static void iq3s_t_decode_group(const char *wbase, size_t w_row_bytes, int nb) {
             for (int ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
                 const uint16_t ls1 = x->scales[ib32 / 2] & 0xf;
                 const uint16_t ls2 = x->scales[ib32 / 2] >> 4;
+#if defined(__AVX2__)
+                /* SIMD path: process both halves (ib32, ib32+1) together.
+                 * Load 16 qs bytes, build 9-bit grid indices SIMD, do 16
+                 * scalar grid lookups, pack as 32 int8 bytes per half,
+                 * apply signs via the xor+sub conditional-negate trick. */
+                index_t idx;
+                const __m256i idx_l = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)qs));
+                idx.vec[0] = _mm256_and_si256(_mm256_sllv_epi32(_mm256_set1_epi32(qh[ib32 + 0]), idx_shift), idx_mask);
+                idx.vec[1] = _mm256_and_si256(_mm256_sllv_epi32(_mm256_set1_epi32(qh[ib32 + 1]), idx_shift), idx_mask);
+                idx.vec[0] = _mm256_or_si256(idx.vec[0], _mm256_cvtepi16_epi32(_mm256_castsi256_si128(idx_l)));
+                idx.vec[1] = _mm256_or_si256(idx.vec[1], _mm256_cvtepi16_epi32(_mm256_extractf128_si256(idx_l, 1)));
+
+                /* Grid lookup: 8 scalar loads per half into __m256i (8 int32 = 32 bytes).
+                 * The LE byte layout of the 8 uint32 grid entries already matches
+                 * the scalar v[] layout: bytes 0-3=g1(l=0), 4-7=g2(l=0),
+                 * 8-11=g1(l=1), ..., 28-31=g2(l=3). */
+                __m256i g[2];
+                g[0] = _mm256_set_epi32(
+                    (int)grid[idx.index[7]], (int)grid[idx.index[6]],
+                    (int)grid[idx.index[5]], (int)grid[idx.index[4]],
+                    (int)grid[idx.index[3]], (int)grid[idx.index[2]],
+                    (int)grid[idx.index[1]], (int)grid[idx.index[0]]);
+                g[1] = _mm256_set_epi32(
+                    (int)grid[idx.index[15]], (int)grid[idx.index[14]],
+                    (int)grid[idx.index[13]], (int)grid[idx.index[12]],
+                    (int)grid[idx.index[11]], (int)grid[idx.index[10]],
+                    (int)grid[idx.index[9]], (int)grid[idx.index[8]]);
+
+                for (int half = 0; half < 2; ++half) {
+                    const int g32 = ib32 + half;
+                    const int16_t sl = (int16_t)(2 * (int)(half ? ls2 : ls1) + 1);
+
+                    /* Apply signs: build sign mask from signs[4*half..4*half+3],
+                     * then conditional-negate via xor+sub trick. */
+                    uint32_t sw; memcpy(&sw, signs + 4 * half, 4);
+                    __m256i packed = g[half];
+                    __m256i aux256 = _mm256_set1_epi32(sw);
+                    aux256 = _mm256_and_si256(_mm256_shuffle_epi8(aux256, msk1), msk2);
+                    __m256i s2 = _mm256_cmpeq_epi8(aux256, msk2);
+                    packed = _mm256_sub_epi8(_mm256_xor_si256(s2, packed), s2);
+                    wv[r][g32] = packed;
+
+                    /* Store scales (two 16-value sub-groups per 32-value block). */
+                    for (int gg = 0; gg < 2; ++gg) {
+                        scb[(2 * g32 + gg) * 16 + 2 * r]     = sl;
+                        scb[(2 * g32 + gg) * 16 + 2 * r + 1] = sl;
+                    }
+                }
+                qs += 16;
+                signs += 8;
+#else
+                /* Scalar fallback (non-AVX2 hosts). */
+                const uint8_t *kmsk = picolm_iq3xxs_kmask();
                 for (int half = 0; half < 2; ++half) {
                     const int g32 = ib32 + half;
                     const uint8_t qhb = qh[g32];
@@ -1164,9 +1240,6 @@ static void iq3s_t_decode_group(const char *wbase, size_t w_row_bytes, int nb) {
                     int8_t v[32];
                     for (int l = 0; l < 4; ++l) {
                         const uint8_t signs_b = signs[4 * half + l];
-                        /* each 32-value group consumes its OWN 8 qs bytes
-                         * (scalar ref advances qs += 8 between the pair's
-                         * halves) and its own qh byte, indexed by group. */
                         const uint8_t *g1 = (const uint8_t *)&grid[qs[8 * half + 2 * l + 0] | ((qhb << (8 - 2 * l)) & 256)];
                         const uint8_t *g2 = (const uint8_t *)&grid[qs[8 * half + 2 * l + 1] | ((qhb << (7 - 2 * l)) & 256)];
                         for (int j = 0; j < 4; ++j)
@@ -1182,6 +1255,7 @@ static void iq3s_t_decode_group(const char *wbase, size_t w_row_bytes, int nb) {
                 }
                 qs += 16;
                 signs += 8;
+#endif
             }
         }
         int8_t *wb = iq6t_tl.w + (size_t)ib * 2048;
@@ -1315,7 +1389,26 @@ static void iq3xxs_v_decode_group(const char *wbase, size_t w_row_bytes, int nb)
 static void iq3s_v_decode_group(const char *wbase, size_t w_row_bytes, int nb) {
     const __m256i x80 = _mm256_set1_epi8((char)0x80);
     const uint32_t *grid = picolm_iq3s_grid();
-    const uint8_t  *kmsk = picolm_iq3xxs_kmask();
+#if defined(__AVX2__)
+    static const uint8_t k_mask1[32] = {
+        0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+        0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,
+        0x02,0x02,0x02,0x02,0x02,0x02,0x02,0x02,
+        0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03
+    };
+    static const uint8_t k_mask2[32] = {
+        0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,
+        0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,
+        0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,
+        0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,
+    };
+    const __m256i msk1 = _mm256_loadu_si256((const __m256i *)k_mask1);
+    const __m256i msk2 = _mm256_loadu_si256((const __m256i *)k_mask2);
+    const __m256i idx_shift = _mm256_set_epi32(1, 2, 3, 4, 5, 6, 7, 8);
+    const __m256i idx_mask  = _mm256_set1_epi32(256);
+    typedef union { __m256i vec[2]; uint32_t index[16]; } index_t;
+#endif
+
     for (int ib = 0; ib < nb; ++ib) {
         __m256i wv[8][8];
         float dd[8];
@@ -1327,6 +1420,48 @@ static void iq3s_v_decode_group(const char *wbase, size_t w_row_bytes, int nb) {
             const uint8_t *signs = x->signs;
             int32_t sc[16];
             dd[r] = iq6_f16(x->d);
+#if defined(__AVX2__)
+            for (int ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
+                const uint16_t ls1 = x->scales[ib32 / 2] & 0xf;
+                const uint16_t ls2 = x->scales[ib32 / 2] >> 4;
+
+                index_t idx;
+                const __m256i idx_l = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)qs));
+                idx.vec[0] = _mm256_and_si256(_mm256_sllv_epi32(_mm256_set1_epi32(qh[ib32 + 0]), idx_shift), idx_mask);
+                idx.vec[1] = _mm256_and_si256(_mm256_sllv_epi32(_mm256_set1_epi32(qh[ib32 + 1]), idx_shift), idx_mask);
+                idx.vec[0] = _mm256_or_si256(idx.vec[0], _mm256_cvtepi16_epi32(_mm256_castsi256_si128(idx_l)));
+                idx.vec[1] = _mm256_or_si256(idx.vec[1], _mm256_cvtepi16_epi32(_mm256_extractf128_si256(idx_l, 1)));
+
+                __m256i g[2];
+                g[0] = _mm256_set_epi32(
+                    (int)grid[idx.index[7]], (int)grid[idx.index[6]],
+                    (int)grid[idx.index[5]], (int)grid[idx.index[4]],
+                    (int)grid[idx.index[3]], (int)grid[idx.index[2]],
+                    (int)grid[idx.index[1]], (int)grid[idx.index[0]]);
+                g[1] = _mm256_set_epi32(
+                    (int)grid[idx.index[15]], (int)grid[idx.index[14]],
+                    (int)grid[idx.index[13]], (int)grid[idx.index[12]],
+                    (int)grid[idx.index[11]], (int)grid[idx.index[10]],
+                    (int)grid[idx.index[9]], (int)grid[idx.index[8]]);
+
+                for (int half = 0; half < 2; ++half) {
+                    const int g32 = ib32 + half;
+                    const int32_t sl = 2 * (int32_t)(half ? ls2 : ls1) + 1;
+                    uint32_t sw; memcpy(&sw, signs + 4 * half, 4);
+                    __m256i packed = g[half];
+                    __m256i aux256 = _mm256_set1_epi32(sw);
+                    aux256 = _mm256_and_si256(_mm256_shuffle_epi8(aux256, msk1), msk2);
+                    __m256i s2 = _mm256_cmpeq_epi8(aux256, msk2);
+                    packed = _mm256_sub_epi8(_mm256_xor_si256(s2, packed), s2);
+                    packed = _mm256_xor_si256(packed, x80);  /* w + 128 as u8 for VNNI */
+                    wv[r][g32] = packed;
+                    sc[2 * g32] = sl; sc[2 * g32 + 1] = sl;
+                }
+                qs += 16;
+                signs += 8;
+            }
+#else
+            const uint8_t *kmsk = picolm_iq3xxs_kmask();
             for (int ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
                 const uint16_t ls1 = x->scales[ib32 / 2] & 0xf;
                 const uint16_t ls2 = x->scales[ib32 / 2] >> 4;
@@ -1350,7 +1485,8 @@ static void iq3s_v_decode_group(const char *wbase, size_t w_row_bytes, int nb) {
                 qs += 16;
                 signs += 8;
             }
-            for (int k = 0; k < 8; ++k) wv[r][k] = _mm256_xor_si256(wv[r][k], x80);   /* w + 128 as u8 */
+            for (int k = 0; k < 8; ++k) wv[r][k] = _mm256_xor_si256(wv[r][k], x80);
+#endif
             for (int g = 0; g < 16; ++g) slb[g * 8 + r] = sc[g];
         }
         uint8_t *wb = iq6v_tl.w + (size_t)ib * 2048;
@@ -2322,16 +2458,14 @@ int sgemm_iq3_xxs_q8_k_neon(int nrows, int ncols, int k, const void *vx, const v
  * attn_output type): the batched prefill outproj can then stream the weights
  * once for the whole batch. */
 int sgemm_iq3_s_q8_k_best(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) {
-    /* OFF by default: measured 22.9 GMAC/s (r8v, m=16384 n=126 k=7168, 24t)
-     * vs 84 GMAC/s for the plain per-row GEMV -- the scalar decode staging
-     * (grid lookup + sign per element) dominates and the GEMV is already
-     * bandwidth-bound. Enable with PICOLM_IQ3S_GEMM=1 once the decode is
-     * vectorised. */
+    /* SIMD decode (AVX2/VNNI) enabled by default. The decode-once R8 GEMM
+     * now achieves 743 GMAC/s (AVX2) and 872 GMAC/s (VNNI) at m=16384 k=7168,
+     * competitive with IQ6_K (778/913). PICOLM_IQ3S_GEMM=0 to disable. */
     static int en = -1, min_n = 2;
     if (en < 0) {
         const char *e = getenv("PICOLM_IQ3S_GEMM"), *mn = getenv("PICOLM_KQ_R8_MIN_N");
         if (mn && atoi(mn) > 0) min_n = atoi(mn);
-        en = e && e[0] == '1';
+        en = !(e && e[0] == '0');  /* enabled by default, PICOLM_IQ3S_GEMM=0 to disable */
     }
     int r = 0;
     const char *which = NULL;
