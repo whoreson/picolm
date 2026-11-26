@@ -2886,9 +2886,7 @@ static float *model_forward_gpt2(model_t *m, int token, int pos) {
 
 #ifdef PICOLM_VIZ
         if (viz_layer_skip(l)) {
-#ifdef PICOLM_VIZ
             viz_push_row(l, pos, s->x, dim);
-#endif
             BENCH_LAYER_END(l, 0);
             continue;
         }

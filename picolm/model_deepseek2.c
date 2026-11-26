@@ -1743,9 +1743,7 @@ float *model_forward_deepseek2(model_t *m, int token, int pos)
         /* Layer skip: toggled by VNC mouse click, zero overhead when unused */
 #ifdef PICOLM_VIZ
         if (viz_layer_skip(l)) {
-#ifdef PICOLM_VIZ
             viz_push_row(l, pos, s->x, D);
-#endif
             BENCH_LAYER_END(l, 0);
             if (stop_layer >= 0 && il >= stop_layer) break;
             continue;
