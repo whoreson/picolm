@@ -1127,13 +1127,15 @@ float *model_forward_prefill_deepseek2(model_t *m, const int *tokens, int n_toke
             tensor_set_repacked(NULL);
             matmul_batch(q_a_batch, xb_batch, n_tokens, gw->mla_q_a, D, QL,
                          gw->type_mla_q_a);
-            for (int t = 0; t < n_tokens; t++) {
-                float *qt = q_batch + (size_t)t * (size_t)NH * KHK;
-                const float *qa = q_a_batch + (size_t)t * QL;
-                float *tmp = s->hb;   /* >= QL floats (n_ffn >= 1536) */
-                rmsnorm(tmp, qa, (const float *)gw->mla_q_a_norm, QL, c->rms_norm_eps);
-                matmul(qt, tmp, gw->mla_q_b, QL, NH * KHK, gw->type_mla_q_b);
-            }
+            /* RMSNorm in place on the wq_a outputs, then ONE batched wq_b
+             * GEMM for the whole batch: the per-token [QL -> NH*KHK] GEMV
+             * re-streamed the 15 MB wq_b per token (T x 15 MB x 61 layers);
+             * the batched path streams it once. */
+            { ds2_batch_rmsnorm_ctx_t qnctx =
+                  { q_a_batch, q_a_batch, gw->mla_q_a_norm, QL, c->rms_norm_eps };
+              tensor_parallel_for(n_tokens, ds2_batch_rmsnorm_task, &qnctx); }
+            matmul_batch(q_batch, q_a_batch, n_tokens, gw->mla_q_b, QL,
+                         NH * KHK, gw->type_mla_q_b);
         } else {
             tensor_set_repacked(NULL);
             matmul_batch(q_batch, xb_batch, n_tokens, gw->mla_q, D, NH * KHK,
@@ -1220,10 +1222,10 @@ float *model_forward_prefill_deepseek2(model_t *m, const int *tokens, int n_toke
                                      wv, wv_t, wv_head_sz, ctx_batch, o_batch };
             tensor_parallel_for(NH, ds2_vproj_task, &vctx);
 
-            for (int t = 0; t < n_tokens; t++) {
-                matmul(attn_batch + (size_t)t * D, o_batch + (size_t)t * max_buf,
-                       lw->attn_output, HVNH, D, lw->type_attn_output);
-            }
+            /* outproj: ONE row-partitioned batch (W streamed once for the
+             * whole batch instead of once per token) */
+            matmul_batch(attn_batch, o_batch, n_tokens,
+                         lw->attn_output, HVNH, D, lw->type_attn_output);
         }
 
         /* Residual add: x += attn_out */
