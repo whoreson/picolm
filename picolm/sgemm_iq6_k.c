@@ -1134,6 +1134,67 @@ int sgemm_iq3_k_r4_q8_k_r8t(int nrows, int ncols, int k, const void *vx, const v
  * 8 rows x IQ6V_NC columns per tile; the int32 seeds (-128*bsum) are staged once per column
  * panel (64B per block and column).
  * ================================================================ */
+/* ---- IQ3_S: same scratch contract as IQ3_XXS ----
+ * Grid is the 512-entry iq3s_grid, index = qs byte | qh bit << 8; the sign
+ * bytes live in x->signs (4 bytes per 32-value group); scale nibble for
+ * group ib32 is scales[ib32/2] (low nibble for even groups, high for odd),
+ * value = d * (2*ls+1) * signed_grid. dd[r] = d (no 0.25 factor: unlike
+ * IQ3_XXS, the grid values are used unsigned with the sign flip applied,
+ * and (2*ls+1) is the whole scale). */
+static void iq3s_t_decode_group(const char *wbase, size_t w_row_bytes, int nb) {
+    const uint32_t *grid = picolm_iq3s_grid();
+    const uint8_t  *kmsk = picolm_iq3xxs_kmask();
+    for (int ib = 0; ib < nb; ++ib) {
+        __m256i wv[8][8];
+        float dd[8];
+        int16_t *scb = iq6t_tl.sc + (size_t)ib * 256;
+        for (int r = 0; r < 8; ++r) {
+            const block_iq3_s *x = (const block_iq3_s *)(wbase + (size_t)r * w_row_bytes) + ib;
+            const uint8_t *qs    = x->qs;
+            const uint8_t *qh    = x->qh;
+            const uint8_t *signs = x->signs;
+            dd[r] = iq6_f16(x->d);
+            for (int ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
+                const uint16_t ls1 = x->scales[ib32 / 2] & 0xf;
+                const uint16_t ls2 = x->scales[ib32 / 2] >> 4;
+                for (int half = 0; half < 2; ++half) {
+                    const int g32 = ib32 + half;
+                    const uint8_t qhb = qh[g32];
+                    const int16_t sl = (int16_t)(2 * (int)(half ? ls2 : ls1) + 1);
+                    int8_t v[32];
+                    for (int l = 0; l < 4; ++l) {
+                        const uint8_t signs_b = signs[4 * half + l];
+                        /* each 32-value group consumes its OWN 8 qs bytes
+                         * (scalar ref advances qs += 8 between the pair's
+                         * halves) and its own qh byte, indexed by group. */
+                        const uint8_t *g1 = (const uint8_t *)&grid[qs[8 * half + 2 * l + 0] | ((qhb << (8 - 2 * l)) & 256)];
+                        const uint8_t *g2 = (const uint8_t *)&grid[qs[8 * half + 2 * l + 1] | ((qhb << (7 - 2 * l)) & 256)];
+                        for (int j = 0; j < 4; ++j)
+                            v[8 * l + j]     = (int8_t)((signs_b & kmsk[j])     ? -(int)g1[j] : (int)g1[j]);
+                        for (int j = 0; j < 4; ++j)
+                            v[8 * l + j + 4] = (int8_t)((signs_b & kmsk[j + 4]) ? -(int)g2[j] : (int)g2[j]);
+                    }
+                    wv[r][g32] = _mm256_loadu_si256((const __m256i *)v);
+                    for (int gg = 0; gg < 2; ++gg) {
+                        scb[(2 * g32 + gg) * 16 + 2 * r]     = sl;
+                        scb[(2 * g32 + gg) * 16 + 2 * r + 1] = sl;
+                    }
+                }
+                qs += 16;
+                signs += 8;
+            }
+        }
+        int8_t *wb = iq6t_tl.w + (size_t)ib * 2048;
+        for (int k = 0; k < 8; ++k) {
+            __m256i rr[8], o[8];
+            for (int r = 0; r < 8; ++r) rr[r] = wv[r][k];
+            iq6t_transpose8(rr, o);
+            for (int j = 0; j < 8; ++j) _mm256_storeu_si256((__m256i *)(wb + (size_t)(8 * k + j) * 32), o[j]);
+        }
+        _mm256_storeu_ps(iq6t_tl.d + (size_t)ib * 8, _mm256_loadu_ps(dd));
+    }
+}
+
 #if defined(__AVX512VNNI__) && defined(__AVX512VL__)
 #define IQ6V_NC 8
 
@@ -1200,67 +1261,6 @@ static void iq4xs_v_decode_group(const char *wbase, size_t w_row_bytes, int nb) 
     }
 }
 
-
-/* ---- IQ3_S: same scratch contract as IQ3_XXS ----
- * Grid is the 512-entry iq3s_grid, index = qs byte | qh bit << 8; the sign
- * bytes live in x->signs (4 bytes per 32-value group); scale nibble for
- * group ib32 is scales[ib32/2] (low nibble for even groups, high for odd),
- * value = d * (2*ls+1) * signed_grid. dd[r] = d (no 0.25 factor: unlike
- * IQ3_XXS, the grid values are used unsigned with the sign flip applied,
- * and the (2*ls+1) is the whole scale). */
-static void iq3s_t_decode_group(const char *wbase, size_t w_row_bytes, int nb) {
-    const uint32_t *grid = picolm_iq3s_grid();
-    const uint8_t  *kmsk = picolm_iq3xxs_kmask();
-    for (int ib = 0; ib < nb; ++ib) {
-        __m256i wv[8][8];
-        float dd[8];
-        int16_t *scb = iq6t_tl.sc + (size_t)ib * 256;
-        for (int r = 0; r < 8; ++r) {
-            const block_iq3_s *x = (const block_iq3_s *)(wbase + (size_t)r * w_row_bytes) + ib;
-            const uint8_t *qs    = x->qs;
-            const uint8_t *qh    = x->qh;
-            const uint8_t *signs = x->signs;
-            dd[r] = iq6_f16(x->d);
-            for (int ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
-                const uint16_t ls1 = x->scales[ib32 / 2] & 0xf;
-                const uint16_t ls2 = x->scales[ib32 / 2] >> 4;
-                for (int half = 0; half < 2; ++half) {
-                    const int g32 = ib32 + half;
-                    const uint8_t qhb = qh[g32];
-                    const int16_t sl = (int16_t)(2 * (int)(half ? ls2 : ls1) + 1);
-                    int8_t v[32];
-                    for (int l = 0; l < 4; ++l) {
-                        const uint8_t signs_b = signs[4 * half + l];
-                        /* each 32-value group consumes its OWN 8 qs bytes
-                         * (scalar ref advances qs += 8 between the pair's
-                         * halves) and its own qh byte, indexed by group. */
-                        const uint8_t *g1 = (const uint8_t *)&grid[qs[8 * half + 2 * l + 0] | ((qhb << (8 - 2 * l)) & 256)];
-                        const uint8_t *g2 = (const uint8_t *)&grid[qs[8 * half + 2 * l + 1] | ((qhb << (7 - 2 * l)) & 256)];
-                        for (int j = 0; j < 4; ++j)
-                            v[8 * l + j]     = (int8_t)((signs_b & kmsk[j])     ? -(int)g1[j] : (int)g1[j]);
-                        for (int j = 0; j < 4; ++j)
-                            v[8 * l + j + 4] = (int8_t)((signs_b & kmsk[j + 4]) ? -(int)g2[j] : (int)g2[j]);
-                    }
-                    wv[r][g32] = _mm256_loadu_si256((const __m256i *)v);
-                    for (int gg = 0; gg < 2; ++gg) {
-                        scb[(2 * g32 + gg) * 16 + 2 * r]     = sl;
-                        scb[(2 * g32 + gg) * 16 + 2 * r + 1] = sl;
-                    }
-                }
-                qs += 16;
-                signs += 8;
-            }
-        }
-        int8_t *wb = iq6t_tl.w + (size_t)ib * 2048;
-        for (int k = 0; k < 8; ++k) {
-            __m256i rr[8], o[8];
-            for (int r = 0; r < 8; ++r) rr[r] = wv[r][k];
-            iq6t_transpose8(rr, o);
-            for (int j = 0; j < 8; ++j) _mm256_storeu_si256((__m256i *)(wb + (size_t)(8 * k + j) * 32), o[j]);
-        }
-        _mm256_storeu_ps(iq6t_tl.d + (size_t)ib * 8, _mm256_loadu_ps(dd));
-    }
-}
 
 static void iq3xxs_v_decode_group(const char *wbase, size_t w_row_bytes, int nb) {
     const __m256i x80 = _mm256_set1_epi8((char)0x80);
