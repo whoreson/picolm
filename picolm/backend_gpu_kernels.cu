@@ -5537,7 +5537,7 @@ picolm_gpu_attention_decode_split_kernel(
  *
  * G is the largest kv_mul the instance handles, DPL the dimensions per lane;
  * the host picks G in {1,2,4,8} and DPL in {2,4,8} (head_dim 64/128/256).
- * F16 KV cache, 32-lane warps (CUDA). Not bit-identical to the split kernel
+ * F16, Q8_0 or Q4_0 KV cache (kv_type), 32-lane warps (CUDA). Not bit-identical to the split kernel
  * (different summation order); decode attention is validated to a
  * tolerance, see above. */
 #define ADW_KU 4    /* keys per warp per step */
@@ -5561,7 +5561,7 @@ picolm_gpu_attention_decode_warp_kernel(
         int layer_ordinal, int pos,
         int n_heads, int n_kv_heads, int max_seq_len,
         size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes, size_t kv_head_stride_v_bytes,
-        int n_splits, int chunk_size, int n_swa)
+        int n_splits, int chunk_size, int n_swa, int kv_type)
 {
     const int head_dim = 32 * DPL;
     __shared__ float wm[4][G], wl[4][G];
@@ -5579,6 +5579,8 @@ picolm_gpu_attention_decode_warp_kernel(
     size_t layer_base = (size_t)layer_ordinal * max_seq_len * pos_stride;
     const __half *kb = (const __half *)kv_k + layer_base + (size_t)kv_h * (kv_head_stride_bytes / 2) + d0;
     const __half *vb = (const __half *)kv_v + layer_base + (size_t)kv_h * (kv_head_stride_v_bytes / 2) + d0;
+    size_t kbo = (size_t)layer_ordinal * max_seq_len * kv_pos_stride_bytes + (size_t)kv_h * kv_head_stride_bytes;
+    size_t vbo = (size_t)layer_ordinal * max_seq_len * kv_pos_stride_bytes + (size_t)kv_h * kv_head_stride_v_bytes;
 
     float scale = 1.0f / sqrtf((float)head_dim);
     float q[G][DPL], acc[G][DPL], m[G], l[G];
@@ -5597,8 +5599,17 @@ picolm_gpu_attention_decode_warp_kernel(
 #pragma unroll
         for (int u = 0; u < ADW_KU; u++) {
             int t = min(tb + 4 * u, t1 - 1);   /* a clamped duplicate is skipped below */
-            adw_load<DPL>(k[u], kb + (size_t)t * pos_stride);
-            adw_load<DPL>(v[u], vb + (size_t)t * pos_stride);
+            if (kv_type == 0) {
+                adw_load<DPL>(k[u], kb + (size_t)t * pos_stride);
+                adw_load<DPL>(v[u], vb + (size_t)t * pos_stride);
+            } else {   /* Q8_0 / Q4_0: a lane's DPL values sit in one 32-value block */
+                size_t ko = kbo + (size_t)t * kv_pos_stride_bytes, vo = vbo + (size_t)t * kv_pos_stride_bytes;
+#pragma unroll
+                for (int i = 0; i < DPL; i++) {
+                    k[u][i] = kv_row_dequant((const uint8_t *)kv_k, ko, kv_type, d0 + i);
+                    v[u][i] = kv_row_dequant((const uint8_t *)kv_v, vo, kv_type, d0 + i);
+                }
+            }
         }
 #pragma unroll
         for (int u = 0; u < ADW_KU; u++) {
@@ -5656,7 +5667,7 @@ int picolm_gpu_attention_decode_warp_launch(dim3 grid, gpuStream_t stream,
         const uint16_t *kv_k, const uint16_t *kv_v, int layer_ordinal, int pos,
         int n_heads, int n_kv_heads, int head_dim, int max_seq_len,
         size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes, size_t kv_head_stride_v_bytes,
-        int n_splits, int chunk_size, int n_swa) {
+        int n_splits, int chunk_size, int n_swa, int kv_type) {
     int kv_mul = n_heads / n_kv_heads;
     int g = kv_mul <= 1 ? 1 : kv_mul <= 2 ? 2 : kv_mul <= 4 ? 4 : kv_mul <= 8 ? 8 : 0;
 #define ADW_CASE(G, D) \
@@ -5664,7 +5675,7 @@ int picolm_gpu_attention_decode_warp_launch(dim3 grid, gpuStream_t stream,
         picolm_gpu_attention_decode_warp_kernel<G, D><<<grid, 128, 0, stream>>>( \
             partial_max, partial_sum, partial_acc, q_dev, kv_k, kv_v, layer_ordinal, pos, \
             n_heads, n_kv_heads, max_seq_len, kv_pos_stride_bytes, kv_head_stride_bytes, \
-            kv_head_stride_v_bytes, n_splits, chunk_size, n_swa); \
+            kv_head_stride_v_bytes, n_splits, chunk_size, n_swa, kv_type); \
         return 1; \
     }
     ADW_CASE(1, 2) ADW_CASE(1, 4) ADW_CASE(1, 8)
@@ -6065,7 +6076,7 @@ picolm_gpu_attention_prefill_kernel(
 
 /* ---- Volta tensor-core attention prefill (FlashAttention-2 style) ----
  *
- * For has_hmma (sm_70) GPUs, head_dim 128, F16 KV cache. One thread block
+ * For has_hmma (sm_70) GPUs, head_dim 128, F16/Q8_0/Q4_0 KV cache. One thread block
  * is one query head x 64 queries; each of the 4 warps owns 16 queries and
  * walks the KV positions in tiles of 32:
  *   S = Q K^T on the tensor cores (fp16 in, f32 out), scaled and masked
@@ -6098,7 +6109,7 @@ picolm_gpu_attention_prefill_hmma_kernel(
         int layer_ordinal, int start_pos, int n_tokens,
         int n_heads, int n_kv_heads, int max_seq_len,
         size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes, size_t kv_head_stride_v_bytes,
-        int n_swa)
+        int n_swa, int kv_type)
 {
     __shared__ __align__(16) __half q_sh[FAV_TQ][FAV_LDQ];
     __shared__ __align__(16) __half k_sh[FAV_TK][FAV_LDQ];
@@ -6113,6 +6124,8 @@ picolm_gpu_attention_prefill_hmma_kernel(
     const uint16_t *kbase = kv_k + layer_base + (size_t)kv_h * (kv_head_stride_bytes / 2);
     const uint16_t *vbase = kv_v + layer_base + (size_t)kv_h * (kv_head_stride_v_bytes / 2);
     size_t pos_stride = kv_pos_stride_bytes / 2;
+    size_t kbo = (size_t)layer_ordinal * max_seq_len * kv_pos_stride_bytes + (size_t)kv_h * kv_head_stride_bytes;
+    size_t vbo = (size_t)layer_ordinal * max_seq_len * kv_pos_stride_bytes + (size_t)kv_h * kv_head_stride_v_bytes;
 
     int qp = (lane >> 2) & 3;
     int r = (lane & 3) + 4 * (lane >> 4);                  /* A row / B col */
@@ -6143,9 +6156,16 @@ picolm_gpu_attention_prefill_hmma_kernel(
         for (int i = tid; i < FAV_TK * FAV_D / 8; i += 128) {
             int t = i / (FAV_D / 8), d = (i % (FAV_D / 8)) * 8;
             uint4 kq = make_uint4(0, 0, 0, 0), vq = kq;
-            if (t0 + t < kv_end) {
+            if (t0 + t < kv_end && kv_type == 0) {
                 kq = *(const uint4 *)(kbase + (size_t)(t0 + t) * pos_stride + d);
                 vq = *(const uint4 *)(vbase + (size_t)(t0 + t) * pos_stride + d);
+            } else if (t0 + t < kv_end) {   /* Q8_0 / Q4_0 */
+                size_t ko = kbo + (size_t)(t0 + t) * kv_pos_stride_bytes, vo = vbo + (size_t)(t0 + t) * kv_pos_stride_bytes;
+                __half *kh = (__half *)&kq, *vh = (__half *)&vq;
+                for (int e = 0; e < 8; e++) {
+                    kh[e] = __float2half(kv_row_dequant((const uint8_t *)kv_k, ko, kv_type, d + e));
+                    vh[e] = __float2half(kv_row_dequant((const uint8_t *)kv_v, vo, kv_type, d + e));
+                }
             }
             *(uint2 *)&k_sh[t][d] = make_uint2(kq.x, kq.y);
             *(uint2 *)&k_sh[t][d + 4] = make_uint2(kq.z, kq.w);
