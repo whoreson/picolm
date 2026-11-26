@@ -5697,14 +5697,35 @@ int tensor_matmul_multi(const mm_job_t *jobs, int n_jobs) {
     c.cursor = 0;
     if (c.nblocks < 2) return 0;     /* not worth a dispatch */
 
-    /* Quantize each job's activation once, here, instead of per work item. */
+    /* Quantize each UNIQUE activation once, here, instead of per work item.
+     *
+     * The MoE batch passes 2 jobs per expert (gate + up) that share the same
+     * `cur`, and the deepseek2 batched attention passes T*128 absorb jobs
+     * whose activations are all distinct -- so dedup by (x pointer, n,
+     * qtype): the MoE case quantizes 8 times instead of 16, everything else
+     * is unchanged. */
     mm_job_q_t qbufs[64];
     mm_job_q_t *q = n_jobs <= 64 ? qbufs : (mm_job_q_t *)malloc((size_t)n_jobs * sizeof *q);
     if (!q) return 0;
+    int first_of[256];                     /* first job index with same activation */
+    int n_first = 0;
     for (int j = 0; j < n_jobs; j++) {
         q[j].xq = NULL; q[j].x_d = NULL; q[j].owned = 0; q[j].usable = 0;
         const type_info_t *ti = typeinfo(jobs[j].qtype);
-        if (!ti || ti->act_fmt == ACT_FMT_F32) continue;
+        if (!ti || ti->act_fmt == ACT_FMT_F32) { first_of[j] = -1; continue; }
+        int hit = -1;
+        for (int u = 0; u < n_first; u++) {
+            const int f = first_of[u];
+            if (jobs[f].x == jobs[j].x && jobs[f].n == jobs[j].n &&
+                jobs[f].qtype == jobs[j].qtype) { hit = f; break; }
+        }
+        if (hit >= 0) {
+            first_of[j] = hit;
+            q[j] = q[hit];                 /* share the quantized buffers */
+            q[j].owned = 0;                /* only the first occurrence frees */
+            continue;
+        }
+        first_of[j] = j; n_first++;
         quant_buf_t qb = quant_activations_ex(jobs[j].qtype, jobs[j].x, 1, jobs[j].n,
                                               NULL, 0, 1);
         if (!qb.qbuf) continue;
