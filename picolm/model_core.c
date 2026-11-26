@@ -491,6 +491,26 @@ static float resolve_rope_mscale(const model_config_t *c, float ext_factor) {
     return mscale;
 }
 
+
+static void build_rope_table(float *cos_tbl, float *sin_tbl, const model_config_t *c,
+                              float freq_base, const float *freq_factors,
+                              float ext_factor, float mscale);
+
+/* Build an arbitrary RoPE table with an explicit mscale and ext_factor.
+ *
+ * DeepSeek V3 needs this: llama.cpp's deepseek2 graph passes
+ *   attn_factor_scaled = 1 / (1 + 0.1*log(1/freq_scale))
+ * as the RoPE table's magnitude factor, while folding
+ *   mscale = 1 + rope_yarn_log_mul * log(1/freq_scale)
+ * into the attention score scale instead. PicoLM's resolve_rope_mscale()
+ * implements a different (ratio-of-two-get_mscale) convention that assumes
+ * the rope math applies the inline mscale itself, which build_rope_table()
+ * does not -- so it cannot be reused here without altering other arches. */
+void rope_build_table_ext(const model_config_t *c, float *cos_tbl, float *sin_tbl,
+                          float mscale, float ext_factor) {
+    build_rope_table(cos_tbl, sin_tbl, c, c->rope_freq_base, NULL, ext_factor, mscale);
+}
+
 /* Shared table builder for both the global and SWA tables. freq_base and
  * freq_factors are passed explicitly since SWA layers use a different base
  * (and, in principle, could have their own factors, though no known model
@@ -833,6 +853,32 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
         }
     }
 
+    /* DeepSeek V3 (MLA) state: one compressed latent cache per attention
+     * layer, holding [k_rope ; kv_lora] floats per position, plus per-token
+     * attention scratch. Folded into sz_glm5 (same arena, carved separately). */
+    if (c->is_deepseek2) {
+        const int NH   = c->n_heads;
+        const int KVL  = c->glm5_kv_lora;
+        const int ROPE = c->ds2_rope;
+        const int NOPE = c->ds2_nope;
+        const int HV   = c->ds2_head_v;
+        const int LROW = KVL + ROPE;      /* cache row width */
+        /* latent cache: n_layers * max_seq * (KVL+ROPE) */
+        sz_glm5 += (size_t)c->n_layers * c->max_seq_len * LROW * sizeof(float);
+        /* per-token scratch (see ds2_mla_forward):
+         *   qr[QL] + q[NH*KHK] + qabs[NH*KVL] + kvr[LROW] + ctx[NH*KVL]
+         *   + scores[max_seq] + o_concat[NH*HV] */
+        sz_glm5 += (size_t)(c->glm5_q_lora + (size_t)NH * c->glm5_mla_head_dim
+                  + 2 * (size_t)NH * KVL + LROW + c->max_seq_len
+                  + (size_t)NH * HV) * sizeof(float);
+        /* cur + attn_out + glm5.moe_down (shared-expert staging) */
+        sz_glm5 += (size_t)3 * c->n_embd * sizeof(float);
+        /* dedicated DeepSeek YaRN RoPE tables (cos + sin) */
+        sz_glm5 += (size_t)2 * c->max_seq_len * (c->ds2_rope / 2) * sizeof(float);
+        /* dense-FFN staging is s->hb/hb2 (n_ffn wide), no extra here. */
+        (void)NOPE;
+    }
+
     /* MoE buffers */
     size_t sz_moe = 0;
     if (c->has_moe) {
@@ -990,6 +1036,14 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
     /* Gemma-3n: only first n_layer_kv_from_start layers have KV cache */
     if (c->is_gemma3n && c->n_layer_kv_from_start > 0 && c->n_layer_kv_from_start < kv_layers) {
         kv_layers = c->n_layer_kv_from_start;
+    }
+    /* DeepSeek V3 (MLA): the K/V cache is a single compressed latent
+     * (kv_lora + rope) per position, held in s->glm5.mla_kv. The standard
+     * GQA cache is never touched, so do not pay for it. */
+    if (c->is_deepseek2) {
+        kv_layers = 0;
+        sz_k_row = 0;
+        sz_v_row = 0;
     }
     /* GQA layout: each position stores one GQA row, not n_kv_heads rows */
     size_t sz_kv = (size_t)kv_layers * c->max_seq_len * (sz_k_row + sz_v_row);
@@ -1424,6 +1478,37 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
         p = gp5;
     }
 
+    /* DeepSeek V3 (MLA) state carving. Layout must match the sizing block
+     * above and ds2_mla_forward()'s scratch partitioning. */
+    if (c->is_deepseek2) {
+        const int NH   = c->n_heads;
+        const int KVL  = c->glm5_kv_lora;
+        const int ROPE = c->ds2_rope;
+        const int HV   = c->ds2_head_v;
+        const int LROW = KVL + ROPE;
+        float *dp = p;
+        s->ds2.mla_kv = dp;
+        dp += (size_t)c->n_layers * c->max_seq_len * LROW;
+        s->ds2.mla_kv_layer_stride = (size_t)c->max_seq_len * LROW;
+        s->ds2.cur = dp;      dp += (size_t)c->n_embd;
+        s->ds2.attn_out = dp; dp += (size_t)c->n_embd;
+        /* Shared-expert down-projection staging, reused by glm5_moe_shared_expert(). */
+        s->glm5.moe_down = dp; dp += (size_t)c->n_embd;
+        s->ds2.rope_cos = dp; dp += (size_t)c->max_seq_len * (ROPE / 2);
+        s->ds2.rope_sin = dp; dp += (size_t)c->max_seq_len * (ROPE / 2);
+        s->ds2.kq_scale = 0.0f;
+        s->ds2.scratch = dp;  dp += (size_t)(c->glm5_q_lora
+                                   + (size_t)NH * c->glm5_mla_head_dim
+                                   + 2 * (size_t)NH * KVL + LROW
+                                   + c->max_seq_len
+                                   + (size_t)NH * HV);
+        p = dp;
+        fprintf(stderr, "[carve ds2] mla_kv=%p cur=%p attn_out=%p moe_down=%p rope_cos=%p rope_sin=%p scratch=%p end=%p\n",
+                (void*)s->ds2.mla_kv, (void*)s->ds2.cur, (void*)s->ds2.attn_out,
+                (void*)s->glm5.moe_down, (void*)s->ds2.rope_cos, (void*)s->ds2.rope_sin,
+                (void*)s->ds2.scratch, (void*)p);
+    }
+
     /* MoE buffer carving */
     if (c->has_moe) {
         s->expert_logits = p; p += (size_t)c->n_expert * c->max_seq_len;
@@ -1814,9 +1899,10 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
     /* Validate that all required tensors are present */
     {
         layer_weights_t *lw = &m->weights.layers[0];
-        if (m->config.is_glm5) {
-            /* GLM-5: validated in the glm5-specific block below (dense lead
-             * layers have no MoE tensors; shared expert has no gate input). */
+        if (m->config.is_glm5 || m->config.is_deepseek2) {
+            /* GLM-5 / DeepSeek V3: validated in the arch-specific block
+             * below (dense lead layers have no MoE tensors; the DeepSeek
+             * shared expert has no gate input tensor). */
         } else if (m->config.has_moe) {
             /* MoE model: check MoE tensors */
             if (!lw->ffn_gate_exps || !lw->ffn_up_exps || !lw->ffn_down_exps ||
@@ -1874,6 +1960,14 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
     }
 
     if (allocate_run_state(m, kv_type_k, kv_type_v, k_cache_hadamard, v_cache_hadamard, n_threads) != 0) return -1;
+
+    /* DeepSeek V3: derive wk_b/wv_b from the combined attn_kv_b when the
+     * GGUF does not ship them split. Runs once; the result is Q8_0 and lives
+     * on the heap for the model's lifetime. */
+    if (m->config.is_deepseek2) {
+        if (ds2_prepare_mla(m) != 0) return -1;
+        if (ds2_init_rope(m) != 0) return -1;
+    }
 
     /* ---- SSM alpha/beta must be a type matmul_batch can actually run ----
      * ssm_alpha / ssm_beta feed a recurrence whose error compounds over every
@@ -1953,7 +2047,6 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
             int q_dim = c->n_heads * c->head_dim;
             int kv_dim = c->n_kv_heads * c->head_dim;
             int uploaded = 0, attempted = 0;
-            const int mhc_dim = c->n_embd;   /* mHC router rows are [2*n_embd, 8] */
             /* PICOLM_NGL: number of GPU layers (like llama.cpp -ngl, 0 or -1 = all) */
             int ngl = c->n_layers;
             { const char *ngl_env = getenv("PICOLM_NGL");
@@ -2084,68 +2177,6 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                                 lw->ssm_out, lw->type_ssm_out, c->ssm_d_inner, c->n_embd, device)) uploaded++;
                     }
                 }
-                /* SenseNova-Loop mHC router weights: tiny F32 tensors, only
-                 * on mHC layers (kind != 0). The loop-aliased layers 28..51
-                 * share host pointers with 4..27 (model_gguf.c copies the
-                 * layer_weights_t), so dedup by host pointer to avoid
-                 * uploading the same [2*dim, 8] matrix twice per pair. */
-                if (c->is_sensenova_loop && c->mhc_layer_kinds[l] != 0) {
-                    /* mhc_attn_w: [2*n_embd, 8] F32 -- row k packs
-                     * [a_weights(n_embd), b_weights(n_embd)] for logit k.
-                     * Dedup by host pointer: loop-aliased layers share
-                     * layer_weights_t contents, so an earlier layer with the
-                     * same host pointer already holds the device copy. */
-                    if (lw->mhc_attn_w) {
-                        attempted++;
-                        void *dev = NULL;
-                        for (int p = 0; p < l && !dev; p++) {
-                            if (m->weights.layers[p].mhc_attn_w == lw->mhc_attn_w &&
-                                m->gpu.layers[p].mhc_attn_w)
-                                dev = m->gpu.layers[p].mhc_attn_w;
-                        }
-                        if (dev) { gl->mhc_attn_w = dev; uploaded++; }
-                        else if (picolm_gpu_tensor_upload(&gl->mhc_attn_w,
-                                lw->mhc_attn_w, GGUF_TYPE_F32, 2 * mhc_dim, 8, device)) uploaded++;
-                    }
-                    if (lw->mhc_attn_b) {
-                        attempted++;
-                        float *dev = NULL;
-                        for (int p = 0; p < l && !dev; p++) {
-                            if (m->weights.layers[p].mhc_attn_b == lw->mhc_attn_b &&
-                                m->gpu.layers[p].mhc_attn_b)
-                                dev = (float *)m->gpu.layers[p].mhc_attn_b;
-                        }
-                        if (dev) { gl->mhc_attn_b = dev; uploaded++; }
-                        else gl->mhc_attn_b = picolm_gpu_upload_f32(
-                            (const float *)lw->mhc_attn_b, 8, device);
-                        if (gl->mhc_attn_b) uploaded++;
-                    }
-                    if (lw->mhc_ffn_w) {
-                        attempted++;
-                        void *dev = NULL;
-                        for (int p = 0; p < l && !dev; p++) {
-                            if (m->weights.layers[p].mhc_ffn_w == lw->mhc_ffn_w &&
-                                m->gpu.layers[p].mhc_ffn_w)
-                                dev = m->gpu.layers[p].mhc_ffn_w;
-                        }
-                        if (dev) { gl->mhc_ffn_w = dev; uploaded++; }
-                        else if (picolm_gpu_tensor_upload(&gl->mhc_ffn_w,
-                                lw->mhc_ffn_w, GGUF_TYPE_F32, 2 * mhc_dim, 8, device)) uploaded++;
-                    }
-                    if (lw->mhc_ffn_b) {
-                        attempted++;
-                        float *dev = NULL;
-                        for (int p = 0; p < l && !dev; p++) {
-                            if (m->weights.layers[p].mhc_ffn_b == lw->mhc_ffn_b &&
-                                m->gpu.layers[p].mhc_ffn_b)
-                                dev = (float *)m->gpu.layers[p].mhc_ffn_b;
-                        }
-                        if (dev) { gl->mhc_ffn_b = dev; uploaded++; }
-                        else gl->mhc_ffn_b = picolm_gpu_upload_f32(
-                            (const float *)lw->mhc_ffn_b, 8, device);
-                        if (gl->mhc_ffn_b) uploaded++;
-                    }
-                }
             }
 
             /* Bridge per-layer GPU tensor pointers to the global SSM arrays.
@@ -2203,15 +2234,6 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                      * Spark support; the weights are still uploaded so that work
                      * can start from a warm cache. */
                     if (c->is_spark25) { eligible = 0; el_reason = 9; }
-                    /* SenseNova-Loop: the mHC 2-stream router (per-layer
-                     * [2*n_embd,8] F32 GEMM + 20-iteration sinkhorn normalize
-                     * + 2-stream merge) and the looped weight-reuse blocks
-                     * (28..51 aliasing 4..27) have no GPU forward kernels.
-                     * Running model_forward_gpu would compute a plain
-                     * Qwen3.5-SSM network without the routing and emit
-                     * fluent-looking garbage. Veto; the router weights are
-                     * still uploaded so kernel work starts from a warm cache. */
-                    if (c->is_sensenova_loop) { eligible = 0; el_reason = 10; }
                     /* PICOLM_NGL with a partial layer count is NOT supported by
                      * the GPU pipeline. n_gpu_layers only limits how many layers
                      * get uploaded; model_forward_gpu()/_prefill_gpu_ubatch()
@@ -2569,8 +2591,6 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                         else if (el_reason == 2) reason = "KV cache not F16 (GPU attention requires F16 std430)";
                         else if (el_reason == 9) reason = "Spark-X2.5 not implemented by the GPU decode pipeline "
                                                         "(no head-wise attn gate / per-layer SWA rope dim)";
-                        else if (el_reason == 10) reason = "SenseNova-Loop mHC routing has no GPU kernels "
-                                                           "(weights uploaded, forward pass pending)";
                         else if (el_reason == 11) reason = "PICOLM_NGL is a partial layer count and the GPU "
                                                          "pipeline has no hybrid CPU/GPU layer split "
                                                          "(unset PICOLM_NGL to use the GPU)";
@@ -2782,6 +2802,8 @@ static void repack_model_weights_q4_0x8(model_t *m) {
 /* ---- Gemma-3n forward pass (specialized) ---- */
 float *model_forward_gemma3n(model_t *m, int token, int pos);
 float *model_forward_glm5(model_t *m, int token, int pos);
+float *model_forward_deepseek2(model_t *m, int token, int pos);
+float *model_forward_prefill_deepseek2(model_t *m, const int *tokens, int n_tokens, int start_pos, volatile int *interrupt);
 float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens, int start_pos, volatile int *interrupt);
 /* ---- SenseNova-Loop forward pass (mHC 2-stream routing + looped blocks) ----
  * model_forward_sensenova is declared in model_internal.h along with the
@@ -3588,6 +3610,10 @@ float *model_forward_range(model_t *m, int token, int pos, int l_lo, int l_hi,
     if (m->config.is_glm5) {
         return model_forward_glm5(m, token, pos);
     }
+    /* DeepSeek V3: MLA (absorbed, partial RoPE) + MoE */
+    if (m->config.is_deepseek2) {
+        return model_forward_deepseek2(m, token, pos);
+    }
     /* SenseNova-Loop: mHC 2-stream routing + looped weight-reuse blocks */
     if (m->config.is_sensenova_loop) {
         return model_forward_sensenova(m, token, pos);
@@ -4302,6 +4328,7 @@ float *model_forward(model_t *m, int token, int pos) {
 }
 
 void model_free(model_t *m) {
+    ds2_free_mla();
 #ifdef PICOLM_GPU
     /* Free GPU weight tensors */
     if (m->gpu.output) { picolm_gpu_tensor_free(m->gpu.output); m->gpu.output = NULL; }
@@ -5847,6 +5874,15 @@ float *model_forward_prefill_range(model_t *m, const int *tokens, int n_tokens, 
         }
         g_is_prefill = 0;
         return m->state.logits;
+    }
+    /* DeepSeek V3 (MLA): batched prefill (projections batched; attention
+     * scoring and MoE per-token). PICOLM_DS2_NO_BATCH=1 forces the per-token
+     * decode path for output-parity debugging. */
+    if (m->config.is_deepseek2) {
+        g_is_prefill = 1;
+        float *ret = model_forward_prefill_deepseek2(m, tokens, n_tokens, start_pos, interrupt);
+        g_is_prefill = 0;
+        return ret;
     }
     /* SenseNova-Loop: batched prefill lives in model_forward_prefill_range
      * (mHC route/merge batched; GDN cores per-token via mhc_sublayer_only).

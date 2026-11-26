@@ -114,6 +114,18 @@ extern void moe_forward_batch(model_t *m, run_state_t *s,
                               const float *x_batch, float *residual_batch,
                               int n_tokens, const layer_weights_t *lw);
 
+/* --- GLM-5 helpers reused by DeepSeek V3 ---
+ * glm5_moe_ffn() is exactly the DeepSeek sigmoid-routed MoE: exp_probs_b bias
+ * used for SELECTION only, weights taken from the raw sigmoid probabilities,
+ * renormalised, scaled by expert_weights_scale, then the shared expert added
+ * with no gate. Implemented in model_glm5.c. */
+extern void glm5_moe_ffn(const model_t *m, const glm5_layer_weights_t *gw,
+                         const layer_weights_t *lw, run_state_t *s,
+                         const float *cur, float *out, int layer_idx);
+extern void glm5_moe_shared_expert(const model_t *m, const layer_weights_t *lw,
+                                   run_state_t *s, const float *cur, float *out,
+                                   int SFF);
+
 /* --- Benchmark ---
  * Every forward-pass function that iterates over layers MUST wrap the
  * per-layer body with BENCH_LAYER_START() / BENCH_LAYER_END().

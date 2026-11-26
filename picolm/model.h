@@ -57,6 +57,19 @@ typedef struct {
     int is_glm4_tok;    /* 1 if tokenizer.ggml.pre == "glm4" (GLM-4/5 BPE with \p{N}{1,3}
                             digit grouping; see qwen_tokenize.c QWEN_PRETOK_GLM4). */
     int is_glm5;        /* 1 if model architecture is glm5next / glm5-next */
+    int is_deepseek2;   /* 1 if model architecture is deepseek2 (DeepSeek V3) */
+    /* ---- DeepSeek V3 (GGUF arch "deepseek2") ----
+     * MLA attention with partial RoPE + MoE FFN. Reuses the GLM-5 fields
+     * glm5_q_lora / glm5_kv_lora / glm5_moe_scale / glm5_moe_norm /
+     * n_layer_dense_lead / n_expert* / n_ff_exp / n_ff_shexp, since the
+     * semantics are identical. glm5_mla_head_dim holds
+     * attention.key_length (192), i.e. nope + rope. The fields below are
+     * genuinely DeepSeek-specific. */
+    int ds2_head_v;     /* attention.value_length (128) */
+    int ds2_nope;       /* key_length - rope.dimension_count (128) */
+    int ds2_rope;       /* rope.dimension_count (64) */
+    int ds2_has_q_lora;  /* 1 if q_lora_rank > 0 (else "lite": direct attn_q) */
+    int ds2_wkv_b_split; /* 1 if the GGUF ships attn_k_b/attn_v_b separately */
     int is_spark25;     /* 1 if model architecture is spark2_5 */
     int is_granite;     /* 1 if model architecture is granite (IBM Granite 4.x) */
     int is_mistral3;    /* 1 if model architecture is mistral3 (Mistral/Ministral 3) */
@@ -110,6 +123,10 @@ typedef struct {
     int n_ff_exp;             /* per-expert FFN hidden dim (512) */
     int n_ff_shexp;           /* shared expert FFN hidden dim (512) */
     int n_layer_dense_lead;   /* GLM-5: first N layers use dense FFN (3) */
+    /* Generic MoE routing knobs (DeepSeek V3, future V4). 0 means "unset":
+     * callers fall back to the architecture-specific default. */
+    int expert_gating_func;   /* 0=softmax, 1=sqrt_softplus, 2=sigmoid; 0 if unset */
+    int n_expert_shared;      /* shared-expert count (DeepSeek V3 = 1); 0 if unset */
     /* Gemma-3n specific */
     int n_altup;              /* number of altup copies (default 4) */
     int i_altup_act;          /* active altup index (default 0) */
@@ -231,13 +248,6 @@ typedef struct {
     void *ssm_conv1d;          /* SSM: [d_conv x conv_dim] f32 */
     void *ssm_alpha;           /* SSM: [dim x dt_rank] f32 or quantized */
     void *ssm_beta;            /* SSM: [dim x dt_rank] f32 or quantized */
-    /* SenseNova-Loop mHC router weights: F32, present only on mHC layers
-     * (mhc_layer_kinds[l] != 0). Loop-aliased layers (28..51) share the
-     * same host tensors as 4..27 -- the upload dedups by host pointer. */
-    void *mhc_attn_w;          /* [2*n_embd, 8] F32 router weights (attn sublayer) */
-    void *mhc_attn_b;          /* [8] F32 router bias */
-    void *mhc_ffn_w;           /* [2*n_embd, 8] F32 router weights (FFN sublayer) */
-    void *mhc_ffn_b;           /* [8] F32 router bias */
 } gpu_layer_weights_t;
 
 typedef struct {
@@ -437,6 +447,8 @@ typedef struct {
     gguf_type_t type_kda_out;
     const void *exp_probs_b;     /* [n_expert] F32 (exp_probs_b.bias) */
     /* MLA (head_count_kv == 1) */
+    const void *mla_q;           /* DeepSeek "lite": [q_lora absent] direct Q */
+    gguf_type_t type_mla_q;
     const void *mla_q_a;         /* [q_lora, n_embd] */
     gguf_type_t type_mla_q_a;
     const void *mla_q_a_norm;    /* [q_lora] F32 */
@@ -449,6 +461,11 @@ typedef struct {
     gguf_type_t type_mla_k_b;
     const void *mla_v_b;         /* 3D [kv_lora, mla_hd, n_head] */
     gguf_type_t type_mla_v_b;
+    /* DeepSeek V3 legacy combined B projection, [kv_lora, n_head*(nope+head_v)].
+     * Only present in GGUFs that do not ship attn_k_b/attn_v_b split; the
+     * loader derives mla_k_b/mla_v_b from it (heap, Q8_0) after mapping. */
+    const void *mla_kv_b;
+    gguf_type_t type_mla_kv_b;
     const void *mla_o;           /* [n_embd, n_head*mla_hd] (attn_output) */
     gguf_type_t type_mla_o;
     /* DSA k-pool indexer (MLA layers only; optional) */
@@ -580,6 +597,24 @@ typedef struct {
     size_t pf_mla_kv_off;        /* [N][KVL]  MLA post-norm latent */
     size_t pf_moe_router_off;    /* [N][n_expert] router logits */
 } glm5_state_t;
+
+/* ---- DeepSeek V3 (deepseek2) runtime state ----
+ * MLA absorbs K into a compressed latent, so the cache is ONE row of
+ * [k_rope ; kv_lora] floats per position per layer (MQA), not a GQA K/V
+ * pair. wk_b/wv_b are derived from the combined attn_kv_b at load time and
+ * live in a heap array (see model_deepseek2.c), not in this arena. */
+typedef struct {
+    float *mla_kv;               /* [n_layers][max_seq][kv_lora+rope], F32 */
+    size_t mla_kv_layer_stride;  /* max_seq * (kv_lora+rope) */
+    float *scratch;              /* per-token scratch, see ds2_mla_forward */
+    float *cur;                  /* [n_embd] normed input for the block */
+    float *attn_out;             /* [n_embd] attention block output */
+    /* DeepSeek V3 YaRN tables, built with llama.cpp's deepseek2 magnitude
+     * (attn_factor_scaled), which differs from every other architecture's. */
+    float *rope_cos;             /* [max_seq][rope/2] */
+    float *rope_sin;             /* [max_seq][rope/2] */
+    float  kq_scale;             /* mscale^2 / sqrt(key_length) */
+} ds2_state_t;
 
 typedef struct {
     const void *token_embd;
@@ -805,6 +840,8 @@ typedef struct {
 
     /* GLM-5 KDA recurrent state + MLA latent cache (allocated in model_core.c) */
     glm5_state_t glm5;
+    /* DeepSeek V3 MLA latent cache + scratch */
+    ds2_state_t ds2;
 } run_state_t;
 
 /* ---- Split GGUF mmap entries ---- */
@@ -979,6 +1016,18 @@ void picolm_ssm_state_sync_to_host(model_t *m, int device);
 
 /* Free all resources. */
 void model_free(model_t *m);
+
+/* ---- DeepSeek V3 (deepseek2) MLA helpers ----
+ * ds2_prepare_mla() derives the per-head wk_b/wv_b matrices from the combined
+ * attn_kv_b tensor for GGUFs that do not ship them split. Called by
+ * model_load(); ds2_free_mla() releases the derived buffers. */
+int  ds2_prepare_mla(model_t *m);
+int  ds2_init_rope(model_t *m);
+/* Build a RoPE table with an explicit magnitude/ext factor (DeepSeek V3's
+ * YaRN convention differs from resolve_rope_mscale()'s). */
+void rope_build_table_ext(const model_config_t *c, float *cos_tbl, float *sin_tbl,
+                          float mscale, float ext_factor);
+void ds2_free_mla(void);
 
 /* ---- KV cache persistence ---- */
 

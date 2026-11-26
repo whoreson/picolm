@@ -1400,6 +1400,13 @@ int parse_gguf(model_t *m, int max_seq_len) {
                     (arch.len == 9 && memcmp(arch.str, "glm5-next", 9) == 0)) {
                     cfg->is_glm5 = 1;
                 }
+                /* Check for DeepSeek V3: "deepseek2" (MLA + MoE).
+                 * V3.2 uses "deepseek32" and is NOT handled yet; V4 uses
+                 * "deepseek4" with a different (non-MLA) attention. */
+                if (arch.len == 9 && memcmp(arch.str, "deepseek2", 9) == 0) {
+                    cfg->is_deepseek2 = 1;
+                    cfg->has_moe = 1;
+                }
                 /* Check for SenseNova-Loop: "sensenova_loop" */
                 if (arch.len == 14 && memcmp(arch.str, "sensenova_loop", 14) == 0) {
                     cfg->is_sensenova_loop = 1;
@@ -1427,7 +1434,7 @@ int parse_gguf(model_t *m, int max_seq_len) {
         } else
 
 
-        if (str_eq(key, "glm5next.embedding_length") || str_eq(key, "llama.embedding_length") || str_eq(key, "general.embedding_length")
+        if (str_eq(key, "glm5next.embedding_length") || str_eq(key, "deepseek2.embedding_length") || str_eq(key, "llama.embedding_length") || str_eq(key, "general.embedding_length")
             || str_eq(key, "qwen2.embedding_length") || str_eq(key, "qwen3.embedding_length") || str_eq(key, "qwen35.embedding_length") || str_eq(key, "qwen35moe.embedding_length")
             || str_eq(key, "gemma3n.embedding_length") || str_eq(key, "gpt2.embedding_length") || str_eq(key, "stablelm.embedding_length")
             || str_eq(key, "gptneox.embedding_length") || str_eq(key, "spark2_5.embedding_length") || str_eq(key, "mistral3.embedding_length") || str_eq(key, "granite.embedding_length")) {
@@ -1493,23 +1500,25 @@ int parse_gguf(model_t *m, int max_seq_len) {
              * supports multimodal Qwen3-VL/Qwen3.5-VL, plain half-split will
              * no longer be sufficient and the mrope section layout will have to
              * be implemented. See notes/picolm/qwen36_divergence_findings.md. */
-        } else if (str_eq(key, "glm5next.feed_forward_length") || str_eq(key, "llama.feed_forward_length") || str_eq(key, "general.feed_forward_length")
+        } else if (str_eq(key, "glm5next.feed_forward_length") || str_eq(key, "deepseek2.feed_forward_length") || str_eq(key, "llama.feed_forward_length") || str_eq(key, "general.feed_forward_length")
             || str_eq(key, "qwen2.feed_forward_length") || str_eq(key, "qwen3.feed_forward_length") || str_eq(key, "qwen35.feed_forward_length")
             || str_eq(key, "gemma3n.feed_forward_length") || str_eq(key, "gpt2.feed_forward_length") || str_eq(key, "stablelm.feed_forward_length")
             || str_eq(key, "gptneox.feed_forward_length") || str_eq(key, "spark2_5.feed_forward_length") || str_eq(key, "mistral3.feed_forward_length") || str_eq(key, "granite.feed_forward_length")) {
             cfg->n_ffn = (int)read_ffn_length(&r, vtype);
-        } else if (str_eq(key, "glm5next.attention.head_count") || str_eq(key, "llama.attention.head_count")
+        } else if (str_eq(key, "glm5next.attention.head_count") || str_eq(key, "deepseek2.attention.head_count") || str_eq(key, "llama.attention.head_count")
             || str_eq(key, "qwen2.attention.head_count") || str_eq(key, "qwen3.attention.head_count") || str_eq(key, "qwen35.attention.head_count") || str_eq(key, "qwen35moe.attention.head_count")
             || str_eq(key, "gemma3n.attention.head_count") || str_eq(key, "gpt2.attention.head_count") || str_eq(key, "stablelm.attention.head_count")
             || str_eq(key, "gptneox.attention.head_count") || str_eq(key, "spark2_5.attention.head_count") || str_eq(key, "mistral3.attention.head_count") || str_eq(key, "granite.attention.head_count")) {
             int dummy; cfg->n_heads = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "llama.attention.head_count_kv")
+            || str_eq(key, "deepseek2.attention.head_count_kv")
             || str_eq(key, "qwen2.attention.head_count_kv") || str_eq(key, "qwen3.attention.head_count_kv") || str_eq(key, "qwen35.attention.head_count_kv") || str_eq(key, "qwen35moe.attention.head_count_kv")
             || str_eq(key, "gemma3n.attention.head_count_kv") || str_eq(key, "gpt2.attention.head_count_kv") || str_eq(key, "stablelm.attention.head_count_kv")
             || str_eq(key, "gptneox.attention.head_count_kv") || str_eq(key, "spark2_5.attention.head_count_kv") || str_eq(key, "mistral3.attention.head_count_kv") || str_eq(key, "granite.attention.head_count_kv")) {
             int dummy; cfg->n_kv_heads = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "attention.key_length")
             || str_eq(key, "llama.attention.key_length")
+            || str_eq(key, "deepseek2.attention.key_length")
             || str_eq(key, "qwen2.attention.key_length")
             || str_eq(key, "qwen3.attention.key_length") || str_eq(key, "qwen35.attention.key_length")
             || str_eq(key, "qwen35moe.attention.key_length")
@@ -1525,17 +1534,18 @@ int parse_gguf(model_t *m, int max_seq_len) {
             if (!cfg->is_glm5) cfg->head_dim = (int)skip_meta_value(&r, vtype, &dummy);
             else { int v = (int)skip_meta_value(&r, vtype, &dummy);
                    if (cfg->glm5_kda_d_inner <= 0) cfg->glm5_kda_d_inner = v; }
-        } else if (str_eq(key, "glm5next.block_count") || str_eq(key, "llama.block_count")
+        } else if (str_eq(key, "glm5next.block_count") || str_eq(key, "deepseek2.block_count") || str_eq(key, "llama.block_count")
             || str_eq(key, "qwen2.block_count") || str_eq(key, "qwen3.block_count") || str_eq(key, "qwen35.block_count") || str_eq(key, "qwen35moe.block_count")
             || str_eq(key, "gemma3n.block_count") || str_eq(key, "gpt2.block_count") || str_eq(key, "stablelm.block_count")
             || str_eq(key, "gptneox.block_count") || str_eq(key, "spark2_5.block_count") || str_eq(key, "mistral3.block_count") || str_eq(key, "granite.block_count")) {
             int dummy; cfg->n_layers = (int)skip_meta_value(&r, vtype, &dummy);
-        } else if (str_eq(key, "glm5next.context_length") || str_eq(key, "llama.context_length")
+        } else if (str_eq(key, "glm5next.context_length") || str_eq(key, "deepseek2.context_length") || str_eq(key, "llama.context_length")
             || str_eq(key, "qwen2.context_length") || str_eq(key, "qwen3.context_length") || str_eq(key, "qwen35.context_length") || str_eq(key, "qwen35moe.context_length")
             || str_eq(key, "gemma3n.context_length") || str_eq(key, "gpt2.context_length") || str_eq(key, "stablelm.context_length")
             || str_eq(key, "gptneox.context_length") || str_eq(key, "spark2_5.context_length") || str_eq(key, "mistral3.context_length") || str_eq(key, "granite.context_length")) {
             int dummy; cfg->max_seq_len = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "llama.rope.freq_base")
+            || str_eq(key, "deepseek2.rope.freq_base")
             || str_eq(key, "qwen2.rope.freq_base") || str_eq(key, "qwen3.rope.freq_base") || str_eq(key, "qwen35.rope.freq_base") || str_eq(key, "qwen35moe.rope.freq_base")
             || str_eq(key, "gemma3n.rope.freq_base") || str_eq(key, "gptneox.rope.freq_base")
             || str_eq(key, "spark2_5.rope.freq_base") || str_eq(key, "mistral3.rope.freq_base") || str_eq(key, "granite.rope.freq_base")) {
@@ -1546,6 +1556,7 @@ int parse_gguf(model_t *m, int max_seq_len) {
             }
         } else if (str_eq(key, "qwen35.rope.dimension_count")
             || str_eq(key, "qwen35moe.rope.dimension_count")
+            || str_eq(key, "deepseek2.rope.dimension_count")
             || str_eq(key, "llama.rope.dimension_count") || str_eq(key, "stablelm.rope.dimension_count")
             || str_eq(key, "gptneox.rope.dimension_count")
             || str_eq(key, "spark2_5.rope.dimension_count") || str_eq(key, "mistral3.rope.dimension_count") || str_eq(key, "granite.rope.dimension_count")) {
@@ -1590,11 +1601,13 @@ int parse_gguf(model_t *m, int max_seq_len) {
         /* ---- RoPE scaling metadata (linear / YaRN / LongRoPE) ----
          * %s is one of: llama, qwen2, qwen3, qwen35, qwen35moe, gemma3n. */
         } else if (str_eq(key, "llama.rope.scaling.type")
+            || str_eq(key, "deepseek2.rope.scaling.type")
             || str_eq(key, "qwen2.rope.scaling.type") || str_eq(key, "qwen3.rope.scaling.type")
             || str_eq(key, "qwen35.rope.scaling.type") || str_eq(key, "qwen35moe.rope.scaling.type")
             || str_eq(key, "gemma3n.rope.scaling.type") || str_eq(key, "mistral3.rope.scaling.type") || str_eq(key, "granite.rope.scaling.type")) {
             cfg->rope_scaling_type = parse_rope_scaling_type(&r, vtype);
         } else if (str_eq(key, "llama.rope.scaling.factor")
+            || str_eq(key, "deepseek2.rope.scaling.factor")
             || str_eq(key, "qwen2.rope.scaling.factor") || str_eq(key, "qwen3.rope.scaling.factor")
             || str_eq(key, "qwen35.rope.scaling.factor") || str_eq(key, "qwen35moe.rope.scaling.factor")
             || str_eq(key, "gemma3n.rope.scaling.factor") || str_eq(key, "mistral3.rope.scaling.factor") || str_eq(key, "granite.rope.scaling.factor")) {
@@ -1616,6 +1629,7 @@ int parse_gguf(model_t *m, int max_seq_len) {
                 skip_meta_value_warn(&r, vtype, key.str);
             }
         } else if (str_eq(key, "llama.rope.scaling.original_context_length")
+            || str_eq(key, "deepseek2.rope.scaling.original_context_length")
             || str_eq(key, "qwen2.rope.scaling.original_context_length")
             || str_eq(key, "qwen3.rope.scaling.original_context_length")
             || str_eq(key, "qwen35.rope.scaling.original_context_length")
@@ -1658,6 +1672,7 @@ int parse_gguf(model_t *m, int max_seq_len) {
                 skip_meta_value_warn(&r, vtype, key.str);
             }
         } else if (str_eq(key, "llama.rope.scaling.yarn_log_multiplier")
+            || str_eq(key, "deepseek2.rope.scaling.yarn_log_multiplier")
             || str_eq(key, "qwen3.rope.scaling.yarn_log_multiplier") || str_eq(key, "mistral3.rope.scaling.yarn_log_multiplier") || str_eq(key, "granite.rope.scaling.yarn_log_multiplier")) {
             /* DeepSeek-V2-style mscale special case */
             if (vtype == GGUF_META_FLOAT32) {
@@ -1684,6 +1699,7 @@ int parse_gguf(model_t *m, int max_seq_len) {
             || str_eq(key, "gemma3n.attention.layer_norm_rms_epsilon")
             || str_eq(key, "gpt2.attention.layer_norm_epsilon") || str_eq(key, "stablelm.attention.layer_norm_epsilon")
             || str_eq(key, "glm5next.attention.layer_norm_rms_epsilon")
+            || str_eq(key, "deepseek2.attention.layer_norm_rms_epsilon")
             || str_eq(key, "gptneox.attention.layer_norm_epsilon")
             || str_eq(key, "spark2_5.attention.layer_norm_rms_epsilon") || str_eq(key, "mistral3.attention.layer_norm_rms_epsilon") || str_eq(key, "granite.attention.layer_norm_rms_epsilon")) {
             /* Read epsilon from GGUF (F32 type=6 or F64 type=11 in metadata) */
@@ -1856,6 +1872,39 @@ int parse_gguf(model_t *m, int max_seq_len) {
             }
         } else if (str_eq(key, "tokenizer.ggml.eos_token_id")) {
             int dummy; m->tok_eos_id = (uint32_t)skip_meta_value(&r, vtype, &dummy);
+        /* ---- DeepSeek V3 (GGUF arch "deepseek2") ----
+         * MLA attention (partial RoPE on a compressed latent) + MoE FFN.
+         * The generic keys (embedding_length, head_count, block_count,
+         * rope.*, attention.key_length, expert_*) are handled by the
+         * matchers above; this block covers the MLA-only ones. */
+        } else if (cfg->is_deepseek2 && str_eq(key, "deepseek2.attention.value_length")) {
+            int dummy; cfg->ds2_head_v = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (cfg->is_deepseek2 && str_eq(key, "deepseek2.attention.q_lora_rank")) {
+            int dummy; cfg->glm5_q_lora = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (cfg->is_deepseek2 && str_eq(key, "deepseek2.attention.kv_lora_rank")) {
+            int dummy; cfg->glm5_kv_lora = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (cfg->is_deepseek2 && str_eq(key, "deepseek2.expert_weights_scale")) {
+            if (vtype == GGUF_META_FLOAT32) { cfg->glm5_moe_scale = read_f32(&r); cfg->glm5_moe_scale_set = 1; }
+            else { skip_meta_value(&r, vtype, NULL); }
+        } else if (cfg->is_deepseek2 && str_eq(key, "deepseek2.expert_weights_norm")) {
+            if (vtype == GGUF_META_BOOL) { cfg->glm5_moe_norm = (int)read_u8(&r); }
+            else { skip_meta_value(&r, vtype, NULL); }
+        } else if (cfg->is_deepseek2 && str_eq(key, "deepseek2.expert_gating_func")) {
+            int dummy; cfg->expert_gating_func = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (cfg->is_deepseek2 && str_eq(key, "deepseek2.expert_shared_count")) {
+            int dummy; cfg->n_expert_shared = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (cfg->is_deepseek2 && str_eq(key, "deepseek2.leading_dense_block_count")) {
+            int dummy; cfg->n_layer_dense_lead = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (cfg->is_deepseek2 && str_eq(key, "deepseek2.expert_count")) {
+            int dummy; cfg->n_expert = (int)skip_meta_value(&r, vtype, &dummy); cfg->has_moe = 1;
+        } else if (cfg->is_deepseek2 && str_eq(key, "deepseek2.expert_used_count")) {
+            int dummy; cfg->n_expert_used = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (cfg->is_deepseek2 && str_eq(key, "deepseek2.expert_feed_forward_length")) {
+            int dummy; cfg->n_ff_exp = (int)skip_meta_value(&r, vtype, &dummy);
+            /* n_ffn stays the DENSE feed_forward_length (18432): the MoE path
+             * reuses s->hb/hb2 as [n_embd] staging buffers. See the GLM-5 note. */
+        } else if (cfg->is_deepseek2 && str_eq(key, "deepseek2.vocab_size")) {
+            int dummy; cfg->vocab_size = (int)skip_meta_value(&r, vtype, &dummy);
         /* ---- GLM-5.3-Flash (glm5next / glm5-next) ----
          * Prefix-agnostic suffix match: the GGUF arch string may be either
          * spelling, and the KV keys carry it verbatim. */
@@ -1980,6 +2029,12 @@ int parse_gguf(model_t *m, int max_seq_len) {
                      * <sop> twice. GGUFs from this family omit the KV, hence the
                      * explicit default here (an explicit KV still wins). */
                     m->tok_add_bos = 0;
+                } else if (pre.len == 11 && strncmp(pre.str, "deepseek-v3", 11) == 0) {
+                    /* DeepSeek V3 (and V4): GPT-2 byte-level BPE with the
+                     * DeepSeek pretokenizer regex. Handled entirely by
+                     * qwen_tokenize.c with QWEN_PRETOK_DEEPSEEK3. */
+                    m->tok_space_marker = 0; /* literal space */
+                    m->tok_unknown_model = 0;
                 } else if (pre.len == 6 && strncmp(pre.str, "tekken", 6) == 0) {
                     /* Mistral Tekken tokenizer (Mistral-Nemo-2407 and later).
                      * Same GPT-2-style byte-level BPE vocab/merges representation as
@@ -2369,8 +2424,10 @@ int parse_gguf(model_t *m, int max_seq_len) {
     model_weights_t *w = &m->weights;
     memset(w, 0, sizeof(*w));
 
-    /* GLM-5: allocate the per-layer extension array (zeroed). */
-    if (cfg->is_glm5) {
+    /* GLM-5 / DeepSeek V3: allocate the per-layer extension array (zeroed).
+     * DeepSeek reuses the same struct: mla_q_a / mla_q_b / mla_kv_a_mqa /
+     * mla_k_b / mla_v_b / exp_probs_b all have the same meaning. */
+    if (cfg->is_glm5 || cfg->is_deepseek2) {
         w->glm5 = (glm5_layer_weights_t *)calloc(MAX_LAYERS, sizeof(glm5_layer_weights_t));
         if (!w->glm5) { fprintf(stderr, "OOM: glm5 layer weights\n"); return -1; }
     }
@@ -2566,7 +2623,10 @@ int parse_gguf(model_t *m, int max_seq_len) {
                     gw->kda_beta = ptr; gw->type_kda_beta = qtype;
                 } else if (cfg->is_glm5 && strcmp(suffix, "ssm_a") == 0) {
                     gw->kda_a = ptr;
-                } else if (cfg->is_glm5 && strcmp(suffix, "exp_probs_b.bias") == 0) {
+                } else if ((cfg->is_glm5 || cfg->is_deepseek2) && strcmp(suffix, "exp_probs_b.bias") == 0) {
+                    gw->exp_probs_b = ptr;
+                } else if (cfg->is_deepseek2 && strcmp(suffix, "ffn_exp_probs_b.bias") == 0) {
+                    /* llama.cpp naming for the same tensor (LLM_TENSOR_FFN_EXP_PROBS_B) */
                     gw->exp_probs_b = ptr;
                 } else if (cfg->is_glm5 && strcmp(suffix, "ssm_dt.bias") == 0) {
                     gw->kda_dt_bias = ptr;
@@ -2586,22 +2646,31 @@ int parse_gguf(model_t *m, int max_seq_len) {
                 } else if (cfg->is_glm5 && strcmp(suffix, "hc_ffn_scale.weight") == 0) {
                     gw->hc_ffn_scale = ptr;
                 }
-                /* GLM-5 MLA (absorbed, NoPE): attn_q_a/q_a_norm/q_b/kv_a_mqa/
-                 * kv_a_norm/k_b/v_b + attn_output (shared name with KDA). */
-                else if (cfg->is_glm5 && strcmp(suffix, "attn_q_a.weight") == 0) {
+                /* GLM-5 MLA (absorbed, NoPE) and DeepSeek V3 MLA (absorbed,
+                 * partial RoPE): attn_q_a/q_a_norm/q_b/kv_a_mqa/kv_a_norm +
+                 * split k_b/v_b + attn_output (generic name). DeepSeek's
+                 * combined attn_kv_b is decomposed after loading. */
+                else if ((cfg->is_glm5 || cfg->is_deepseek2) && strcmp(suffix, "attn_q_a.weight") == 0) {
                     gw->mla_q_a = ptr; gw->type_mla_q_a = qtype;
-                } else if (cfg->is_glm5 && strcmp(suffix, "attn_q_a_norm.weight") == 0) {
+                } else if ((cfg->is_glm5 || cfg->is_deepseek2) && strcmp(suffix, "attn_q_a_norm.weight") == 0) {
                     gw->mla_q_a_norm = ptr;
-                } else if (cfg->is_glm5 && strcmp(suffix, "attn_q_b.weight") == 0) {
+                } else if ((cfg->is_glm5 || cfg->is_deepseek2) && strcmp(suffix, "attn_q_b.weight") == 0) {
                     gw->mla_q_b = ptr; gw->type_mla_q_b = qtype;
-                } else if (cfg->is_glm5 && strcmp(suffix, "attn_kv_a_mqa.weight") == 0) {
+                } else if ((cfg->is_glm5 || cfg->is_deepseek2) && strcmp(suffix, "attn_kv_a_mqa.weight") == 0) {
                     gw->mla_kv_a_mqa = ptr; gw->type_mla_kv_a_mqa = qtype;
-                } else if (cfg->is_glm5 && strcmp(suffix, "attn_kv_a_norm.weight") == 0) {
+                } else if ((cfg->is_glm5 || cfg->is_deepseek2) && strcmp(suffix, "attn_kv_a_norm.weight") == 0) {
                     gw->mla_kv_a_norm = ptr;
-                } else if (cfg->is_glm5 && strcmp(suffix, "attn_k_b.weight") == 0) {
+                } else if ((cfg->is_glm5 || cfg->is_deepseek2) && strcmp(suffix, "attn_k_b.weight") == 0) {
                     gw->mla_k_b = ptr; gw->type_mla_k_b = qtype;
-                } else if (cfg->is_glm5 && strcmp(suffix, "attn_v_b.weight") == 0) {
+                } else if ((cfg->is_glm5 || cfg->is_deepseek2) && strcmp(suffix, "attn_v_b.weight") == 0) {
                     gw->mla_v_b = ptr; gw->type_mla_v_b = qtype;
+                } else if (cfg->is_deepseek2 && strcmp(suffix, "attn_kv_b.weight") == 0) {
+                    /* Combined [kv_lora, NH*(nope+head_v)]; decomposed after load. */
+                    gw->mla_kv_b = ptr; gw->type_mla_kv_b = qtype;
+                } else if (cfg->is_deepseek2 && strcmp(suffix, "attn_q.weight") == 0) {
+                    /* "lite" variants (V2-Lite, GigaChat3, Kanana-2): no
+                     * q_lora_rank, so Q is projected directly. */
+                    gw->mla_q = ptr; gw->type_mla_q = qtype;
                 }
                 /* GLM-5 DSA indexer (MLA layers only) */
                 else if (cfg->is_glm5 && strcmp(suffix, "indexer.k_norm.weight") == 0) {
@@ -2741,6 +2810,63 @@ int parse_gguf(model_t *m, int max_seq_len) {
         cfg->weight_type = w->layers[0].type_attn_qkv;
     } else {
         cfg->weight_type = w->layers[0].type_attn_q;
+    }
+
+    /* DeepSeek V3 (deepseek2): derive config and validate. */
+    if (cfg->is_deepseek2) {
+        /* attention.key_length went into cfg->head_dim above (the generic
+         * matcher), and rope.dimension_count into cfg->rope_dim. */
+        if (cfg->glm5_mla_head_dim <= 0) cfg->glm5_mla_head_dim = cfg->head_dim;
+        if (cfg->glm5_mla_head_dim <= 0) cfg->glm5_mla_head_dim = 192;
+        if (cfg->ds2_rope <= 0) cfg->ds2_rope = (cfg->rope_dim > 0) ? cfg->rope_dim : 64;
+        if (cfg->ds2_head_v <= 0) cfg->ds2_head_v = 128;
+        cfg->ds2_nope = cfg->glm5_mla_head_dim - cfg->ds2_rope;
+        if (cfg->ds2_nope <= 0) {
+            fprintf(stderr, "ERROR: deepseek2: key_length(%d) <= rope.dimension_count(%d)\n",
+                    cfg->glm5_mla_head_dim, cfg->ds2_rope);
+            return -1;
+        }
+        if (cfg->glm5_kv_lora <= 0) cfg->glm5_kv_lora = 512;
+        cfg->ds2_has_q_lora = (cfg->glm5_q_lora > 0) ? 1 : 0;
+        if (cfg->n_expert_shared <= 0) cfg->n_expert_shared = 1;
+        if (cfg->n_ff_shexp <= 0) cfg->n_ff_shexp = cfg->n_ff_exp;
+        if (!cfg->glm5_moe_scale_set) cfg->glm5_moe_scale = 1.0f;
+        if (cfg->n_expert_used <= 0) cfg->n_expert_used = 8;
+        cfg->rope_dim = cfg->ds2_rope;   /* ONLY rope.dimension_count dims rotate */
+        cfg->rope_type = 0;              /* LLAMA_ROPE_TYPE_NORM == pairwise */
+        cfg->has_ssm = 0;
+        /* The generic head_dim must be the K head width (192), so that any
+         * shared code sizing by head_dim is right. */
+        cfg->head_dim = cfg->glm5_mla_head_dim;
+        /* The MLA latent cache has ONE key/value head (MQA after absorption). */
+        cfg->n_kv_heads = 1;
+        if (cfg->n_layer_dense_lead < 0) cfg->n_layer_dense_lead = 0;
+        if (cfg->n_layer_dense_lead > cfg->n_layers) cfg->n_layer_dense_lead = cfg->n_layers;
+        /* Detect whether attn_k_b / attn_v_b are shipped split, or only the
+         * combined attn_kv_b (then wk_b/wv_b are derived at load time). */
+        cfg->ds2_wkv_b_split = 0;
+        {
+            int have_k = 0, have_kv = 0;
+            for (uint64_t ti = 0; ti < total_tensor_count; ti++) {
+                const char *nm = tinfos[ti].name.str;
+                size_t nl = tinfos[ti].name.len;
+                if (nl > 15 && memcmp(nm + nl - 15, "attn_k_b.weight", 15) == 0) have_k = 1;
+                if (nl > 16 && memcmp(nm + nl - 16, "attn_kv_b.weight", 16) == 0) have_kv = 1;
+            }
+            cfg->ds2_wkv_b_split = (have_k && !have_kv) ? 1 : 0;
+        }
+        /* n_ffn must remain the dense FFN width so s->hb/hb2 are big enough
+         * for the MoE path's [n_embd] staging reuse (same rule as GLM-5). */
+        if (cfg->n_ffn <= 0) cfg->n_ffn = 18432;
+        fprintf(stderr, "deepseek2: L=%d D=%d H=%d qlora=%d kv_lora=%d k_hd=%d v_hd=%d nope=%d rope=%d "
+                        "dense_lead=%d experts=%d(top%d) ff_exp=%d ff_shexp=%d scale=%.2f "
+                        "n_ffn=%d yarn=%d/%u wkv_b_split=%d\n",
+                cfg->n_layers, cfg->n_embd, cfg->n_heads, cfg->glm5_q_lora,
+                cfg->glm5_kv_lora, cfg->glm5_mla_head_dim, cfg->ds2_head_v,
+                cfg->ds2_nope, cfg->ds2_rope, cfg->n_layer_dense_lead,
+                cfg->n_expert, cfg->n_expert_used, cfg->n_ff_exp, cfg->n_ff_shexp,
+                (double)cfg->glm5_moe_scale, cfg->n_ffn, cfg->rope_scaling_type,
+                (unsigned)cfg->rope_ctx_orig, cfg->ds2_wkv_b_split);
     }
 
     /* GLM-5.3-Flash (glm5next): derive config, validate, classify layers. */
