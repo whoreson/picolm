@@ -139,7 +139,7 @@ GPU_OBJS =
 
 # GPU host .cu sources (split into modular files)
 GPU_SRCS = backend_gpu_kernels.cu backend_gpu_host_core.cu backend_gpu_host_ssm.cu backend_gpu_host_misc.cu
-GPU_CUH  = backend_kv_watermark.h backend_gpu_common.cuh backend_gpu_dequant.cuh backend_gpu_kernels.cuh backend_gpu_attn_fa3.cuh
+GPU_CUH  = backend_kv_watermark.h backend_gpu_ssm_chunk2.cuh backend_gpu_common.cuh backend_gpu_dequant.cuh backend_gpu_kernels.cuh backend_gpu_attn_fa3.cuh
 
 PREFIX  ?= /usr/local
 MODEL_DIR ?= /opt/picolm/models
@@ -544,6 +544,16 @@ test-attn-hmma-gpu: tests/test_attn_hmma_gpu.cu backend_gpu_kernels-cuda.o
 .PHONY: test-kv-watermark
 test-kv-watermark: tests/test_kv_watermark.c backend_kv_watermark.h
 	$(CC) -std=c99 -O2 -Wall -I. -o test_kv_watermark tests/test_kv_watermark.c
+
+# Restructured chunked gated-delta-rule SSM prefill (backend_gpu_ssm_chunk2.cuh).
+# CPU emulation: executes the real kernels and checks them against a token-sequential double-precision
+# reference. GPU test: same reference at the real Qwen sizes, plus timing projected over 48 layers.
+.PHONY: test-ssm-chunk2-emu
+test-ssm-chunk2-emu: tests/ssm_chunk2_emu.cpp tests/emu_prims.h backend_gpu_ssm_chunk2.cuh
+	$(CXX) -std=c++11 -O2 -pthread -DPICOLM_FA3_EMU -Wno-unknown-pragmas -I. -Itests -o ssm_chunk2_emu tests/ssm_chunk2_emu.cpp
+
+test-ssm-chunk2-gpu: tests/test_ssm_chunk2_gpu.cu backend_gpu_ssm_chunk2.cuh
+	$(NVCC) $(CUDAFLAGS) $(CUDA_GENCODE) -DPICOLM_GPU=1 -o test_ssm_chunk2_gpu tests/test_ssm_chunk2_gpu.cu -I.
 
 # CPU emulation of the FA3 kernel: compiles the REAL backend_gpu_attn_fa3.cuh with the PTX
 # primitives (ldmatrix, mma.m16n8k16, cp.async, shuffles, barriers) emulated, runs it on one

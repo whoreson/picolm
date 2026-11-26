@@ -1,6 +1,7 @@
 // backend_gpu_host_misc.cu - KV cache, pipeline, attention, rmsnorm, rope, residual, misc
 #include "backend_gpu_kernels.cuh"
 #include "backend_gpu_kvquant.cuh"
+#include "backend_gpu_ssm_chunk2.cuh"
 #include "backend_kv_watermark.h"
 
 /* PICOLM_GPU_PROF hooks, defined at the bottom of this file. */
@@ -2875,6 +2876,58 @@ int picolm_gpu_expert_mlp_dev(picolm_gpu_tensor_t *g, picolm_gpu_tensor_t *u, pi
     return gpu_ok(gpuGetLastError(), "expert MLP dev");
 }
 
+/* Restructured chunked recurrence (backend_gpu_ssm_chunk2.cuh): per group of up to SSM2_GROUP
+ * chunks, ONE parallel precompute launch over (heads x chunks) and ONE scan launch over
+ * (heads x state-row slices), instead of ~12 launches per chunk with 16-48-block grids.
+ * Same contract as the old pipeline: conv_dev / alpha_dev / beta_dev share the row stride
+ * xb2_stride, state_dev is [n_v_heads][d][d] and is updated in place, xb2_dev receives the
+ * per-token outputs. Returns 1 if launched. Every check that can fail runs BEFORE the first
+ * launch, so declining (return 0) never leaves the state half-updated and the caller can
+ * fall back to the old pipeline. */
+#define SSM2_GROUP 8
+static int ssm2_chunked_dev(gpu_device_ctx_t *ctx, const float *conv_dev, const float *alpha_dev,
+                            const float *beta_dev, float *state_dev, float *xb2_dev,
+                            int n_tokens, int xb2_stride, int d_state, int n_k_heads, int n_v_heads,
+                            int head_v_dim, int repeat, int device) {
+    if (d_state != SSM2_D || head_v_dim != SSM2_D || repeat < 1 || n_v_heads != n_k_heads * repeat) return 0;
+    if (n_tokens < 1 || xb2_stride < n_v_heads * SSM2_D) return 0;
+    const int qk_dim = d_state * n_k_heads;
+    const int nc = (n_tokens + SSM2_CS - 1) / SSM2_CS;
+    const int grp = nc < SSM2_GROUP ? nc : SSM2_GROUP;
+    static float *d_u = NULL, *d_wk = NULL, *d_kq = NULL, *d_cg = NULL;
+    static size_t cap_u = 0, cap_wk = 0, cap_kq = 0, cap_cg = 0;
+    const size_t nb = (size_t)grp * n_v_heads;
+    if (!ssm_batch_scratch_ensure((void **)&d_u,  &cap_u,  nb * SSM2_CS * SSM2_D * sizeof(float))) return 0;
+    if (!ssm_batch_scratch_ensure((void **)&d_wk, &cap_wk, nb * SSM2_CS * SSM2_D * sizeof(float))) return 0;
+    if (!ssm_batch_scratch_ensure((void **)&d_kq, &cap_kq, nb * SSM2_CS * SSM2_CS * sizeof(float))) return 0;
+    if (!ssm_batch_scratch_ensure((void **)&d_cg, &cap_cg, nb * SSM2_CS * sizeof(float))) return 0;
+    const size_t smem_pre = (size_t)SSM2_PRE_FLOATS * sizeof(float), smem_scan = (size_t)SSM2_SCAN_FLOATS * sizeof(float);
+    static size_t scan_cfg[16];                       /* per device: opt-in smem already raised to this */
+    if (device >= 0 && device < 16 && smem_scan > scan_cfg[device]) {
+        if (gpuFuncSetAttribute((const void *)ssm2_chunk_scan_kernel, gpuFuncAttributeMaxDynamicSharedMemorySize, (int)smem_scan) != gpuSuccess) {
+            gpuGetLastError();
+            return 0;
+        }
+        scan_cfg[device] = smem_scan;
+    }
+    for (int g0 = 0; g0 < nc; g0 += SSM2_GROUP) {
+        const int ng = (nc - g0) < SSM2_GROUP ? (nc - g0) : SSM2_GROUP;
+        { int _pk = picolm_gpu_prof_slot("ssm2_pre"); picolm_gpu_prof_begin(device);
+          ssm2_chunk_pre_kernel<<<dim3((unsigned)n_v_heads, (unsigned)ng), SSM2_THREADS, smem_pre, ctx->stream>>>(
+              d_u, d_wk, d_kq, d_cg, conv_dev, alpha_dev, beta_dev, g0, n_tokens, xb2_stride, xb2_stride,
+              qk_dim, n_v_heads, repeat);
+          picolm_gpu_prof_end(_pk); }
+        if (!gpu_ok(gpuGetLastError(), "ssm2 pre")) return 0;
+        { int _pk = picolm_gpu_prof_slot("ssm2_scan"); picolm_gpu_prof_begin(device);
+          ssm2_chunk_scan_kernel<<<dim3((unsigned)n_v_heads, (unsigned)(SSM2_D / SSM2_JT)), SSM2_THREADS, smem_scan, ctx->stream>>>(
+              state_dev, xb2_dev, d_u, d_wk, d_kq, d_cg, conv_dev, g0, ng, n_tokens, xb2_stride, xb2_stride,
+              qk_dim, n_v_heads, repeat);
+          picolm_gpu_prof_end(_pk); }
+        if (!gpu_ok(gpuGetLastError(), "ssm2 scan")) return 0;
+    }
+    return 1;
+}
+
 extern "C"
 /* Row-split factor for ssm_chunk_matvec_kernel. Grid becomes
  * (n_v_heads, MV_SPLIT) so a 48-head model fills more than 48 SMs, and each
@@ -2914,6 +2967,16 @@ int picolm_gpu_ssm_chunked_recurrence_dev(const float *conv_dev, const float *al
     int d=d_state, qk_dim=d_state*n_k_heads;
     gpu_device_ctx_t *ctx = find_ctx(device);
     if(!ctx||!select_ctx(ctx)) SSMCR_RET(0);
+    /* Restructured pipeline (backend_gpu_ssm_chunk2.cuh): opt in with PICOLM_SSM_CHUNK2=1 until it
+     * has been validated on the target GPU (tests/test_ssm_chunk2_gpu), then invert this check.
+     * Anything it cannot do (head size, scratch, launch config) is declined before the first
+     * launch, and the old pipeline below runs instead. */
+    if (getenv("PICOLM_SSM_CHUNK2") && cs == SSM2_CS &&
+        ssm2_chunked_dev(ctx, conv_dev, alpha_dev, beta_dev, state_dev, xb2_dev, n_tokens, xb2_stride,
+                         d_state, n_k_heads, n_v_heads, head_v_dim, repeat, device)) {
+        picolm_gpu_prof_end(_ssmps);
+        return 1;
+    }
     int n_threads=256;
     /* Persistent scratch buffers: must be static so they survive across
      * calls (one per SSM layer per layer loop). ssm_batch_scratch_ensure
