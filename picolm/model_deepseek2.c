@@ -1011,6 +1011,23 @@ static void ds2_mla_attention_forward(const model_t *m, int layer,
            m->weights.layers[layer].type_attn_output);
 }
 
+/* Head-partitioned batched absorb / V tasks (defined below, after the
+ * decode forward; used by the batched prefill). */
+typedef struct {
+    int T, NH, NOPE, KVL, KHK;
+    const void *wk; gguf_type_t wk_t; size_t wk_head_sz;
+    const float *q;      /* [T][NH*KHK] */
+    float *qabs;         /* [T][NH*KVL] */
+} ds2_absorb_ctx_t;
+typedef struct {
+    int T, NH, HV, KVL;
+    const void *wv; gguf_type_t wv_t; size_t wv_head_sz;
+    const float *ctx;    /* [T][NH*KVL] */
+    float *o;            /* [T][NH*HV] */
+} ds2_vproj_ctx_t;
+static void ds2_absorb_task(int idx, void *p);
+static void ds2_vproj_task(int idx, void *p);
+
 float *model_forward_prefill_deepseek2(model_t *m, const int *tokens, int n_tokens,
                                        int start_pos, volatile int *interrupt)
 {
@@ -1056,6 +1073,7 @@ float *model_forward_prefill_deepseek2(model_t *m, const int *tokens, int n_toke
     const int max_buf = (HVNH > D) ? HVNH : D;
     size_t total_bufs = NT * ((size_t)D * 3 + (size_t)QL + (size_t)NH * (size_t)KHK
                             + (size_t)LROW + (size_t)max_buf
+                            + 2 * (size_t)NH * KVL
                             + (size_t)ffn_buf * 2);
     float *pf = (float *)malloc(total_bufs * sizeof(float));
     if (!pf) {
@@ -1076,6 +1094,10 @@ float *model_forward_prefill_deepseek2(model_t *m, const int *tokens, int n_toke
     float *attn_batch = p; p += NT * D;
     float *hb_batch   = p; p += NT * ffn_buf;
     float *hb2_batch  = p; p += NT * ffn_buf;
+    /* token-batched attention scratch: absorbed q and latent context for
+     * all tokens (used by the batched absorb / V dispatches below). */
+    float *qabs_batch = p; p += NT * (size_t)NH * KVL;
+    float *ctx_batch  = p; p += NT * (size_t)NH * KVL;
 
     /* ---- Embed all tokens ---- */
     for (int t = 0; t < n_tokens; t++) {
@@ -1162,16 +1184,46 @@ float *model_forward_prefill_deepseek2(model_t *m, const int *tokens, int n_toke
             }
         }
 
-        /* Per-token MLA attention (absorb + score + softmax + V + output proj) */
-        for (int t = 0; t < n_tokens; t++) {
-            const int pos = start_pos + t;
-            ds2_mla_attention_forward(m, il, s,
-                                      q_batch + (size_t)t * (size_t)NH * KHK,
-                                      pos,
-                                      o_batch + (size_t)t * max_buf,
-                                      attn_batch + (size_t)t * D,
-                                      D, NH, KVL, ROPE, NOPE, HV, KHK, LROW,
-                                      HVNH);
+        /* ---- MLA attention, batched: head-partitioned absorb + V ----
+         * Each head's W (128 KB F16) streams once and serves ALL tokens
+         * from L2; scores+PV stay per token (causal ranges differ).
+         * outproj stays per token (IQ3_S GEMV is compute-bound; a batched
+         * GEMM has no faster kernel for this type yet). */
+        {
+            const void *wk; gguf_type_t wk_t; size_t wk_head_sz;
+            const void *wv; gguf_type_t wv_t; size_t wv_head_sz;
+            ds2_kv_b_ptrs(m, il, &wk, &wk_t, &wk_head_sz, &wv, &wv_t, &wv_head_sz);
+
+            ds2_absorb_ctx_t actx = { n_tokens, NH, NOPE, KVL, KHK,
+                                      wk, wk_t, wk_head_sz, q_batch, qabs_batch };
+            tensor_parallel_for(NH, ds2_absorb_task, &actx);
+
+            for (int t = 0; t < n_tokens; t++) {
+                const int pos = start_pos + t;
+                ds2_scores_ctx(m, il, s,
+                               q_batch + (size_t)t * NH * KHK,
+                               qabs_batch + (size_t)t * NH * KVL,
+                               /* per-token q_comb/scores from the decode
+                                * scratch (serial loop); decode scratch
+                                * order: qr, q, qabs, q_comb, scores */
+                               s->ds2.scratch + (size_t)c->glm5_q_lora
+                                 + (size_t)NH * KHK + (size_t)NH * KVL,
+                               s->ds2.scratch + (size_t)c->glm5_q_lora
+                                 + (size_t)NH * KHK + (size_t)NH * KVL
+                                 + (size_t)NH * LROW,
+                               pos,
+                               ctx_batch + (size_t)t * NH * KVL,
+                               NH, KVL, ROPE, NOPE, KHK, LROW);
+            }
+
+            ds2_vproj_ctx_t vctx = { n_tokens, NH, HV, KVL,
+                                     wv, wv_t, wv_head_sz, ctx_batch, o_batch };
+            tensor_parallel_for(NH, ds2_vproj_task, &vctx);
+
+            for (int t = 0; t < n_tokens; t++) {
+                matmul(attn_batch + (size_t)t * D, o_batch + (size_t)t * max_buf,
+                       lw->attn_output, HVNH, D, lw->type_attn_output);
+            }
         }
 
         /* Residual add: x += attn_out */
@@ -1500,6 +1552,36 @@ static void ds2_scores_ctx(const model_t *m, int layer, run_state_t *s,
         float *ch = ctx + (size_t)h * KVL;
         for (int d = 0; d < KVL; d++) ch[d] *= inv;
     }
+}
+
+/* ---- Head-partitioned batched absorb / V tasks (prefill) ----
+ *
+ * Wk_b/Wv_b are PER-HEAD [KVL*NOPE] / [HV*KVL] matrices, identical for every
+ * token. The efficient prefill shape is therefore: partition HEADS across
+ * the pool; each thread streams its heads' W (128 KB in F16 -- L2-resident)
+ * against all T tokens' activations, one serial GEMV per (token, head).
+ * This is compute-bound (~1 GMAC/layer) and reads each W once per layer,
+ * versus the per-token path which re-dispatches 128-job batches T times. */
+static void ds2_absorb_task(int idx, void *p) {
+    const ds2_absorb_ctx_t *c = (const ds2_absorb_ctx_t *)p;
+    const int h = idx;
+    if (h >= c->NH) return;
+    const uint8_t *W = (const uint8_t *)c->wk + (size_t)h * c->wk_head_sz;
+    for (int t = 0; t < c->T; t++)
+        matmul(c->qabs + ((size_t)t * c->NH + h) * c->KVL,
+               c->q + (size_t)t * c->NH * c->KHK + (size_t)h * c->KHK,
+               W, c->NOPE, c->KVL, c->wk_t);
+}
+
+static void ds2_vproj_task(int idx, void *p) {
+    const ds2_vproj_ctx_t *c = (const ds2_vproj_ctx_t *)p;
+    const int h = idx;
+    if (h >= c->NH) return;
+    const uint8_t *W = (const uint8_t *)c->wv + (size_t)h * c->wv_head_sz;
+    for (int t = 0; t < c->T; t++)
+        matmul(c->o + ((size_t)t * c->NH + h) * c->HV,
+               c->ctx + ((size_t)t * c->NH + h) * c->KVL,
+               W, c->KVL, c->HV, c->wv_t);
 }
 
 /* ------------------------------------------------------------------ */
