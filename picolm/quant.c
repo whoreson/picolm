@@ -10647,6 +10647,8 @@ static const uint8_t kmask_iq2xs[8] = { 1, 2, 4, 8, 16, 32, 64, 128 };
  * above without a second copy in the binary or a header every DOS/MSVC build
  * would have to drag in. */
 const uint32_t *picolm_iq3xxs_grid(void) { return iq3xxs_grid; }
+static const uint32_t iq3s_grid[512];
+const uint32_t *picolm_iq3s_grid(void)   { return iq3s_grid; }
 const uint8_t  *picolm_iq3xxs_ksigns(void) { return ksigns_iq2xs; }
 const uint8_t  *picolm_iq3xxs_kmask(void) { return kmask_iq2xs; }
 

@@ -2026,6 +2026,9 @@ int sgemm_iq6_k_q8_k_best(int nrows, int ncols, int k, const void *vx, const voi
 /* IQ3_XXS x Q8_K table fn_gemm: decode-once R8 (VNNI/AVX2) for big shapes, else the
  * 1-row GEMV over this thread's rows. Always computes its whole share. */
 int sgemm_iq3_xxs_q8_k_best(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
+int sgemm_iq3_s_q8_k_best(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
+int sgemm_iq3_s_q8_k_r8t(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
+int sgemm_iq3_s_q8_k_r8v(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
 int sgemm_iq3_xxs_q8_k_r8t(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
 int sgemm_iq3_xxs_q8_k_r8v(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
 /* IQ3_XXS x Q8_K ARM NEON tiled GEMM (I8MM / DOTPROD / plain NEON tiers).
@@ -2102,6 +2105,7 @@ float vec_dot_iq3_xxs_q8_k(const void *vx, const void *vy, int n);
 float vec_dot_iq3_xxs_q8_k_ref(const void *vx, const void *vy, int n);
 /* IQ3_XXS reference tables (see quant.c), shared by the GEMM decode path. */
 const uint32_t *picolm_iq3xxs_grid(void);    /* 256 x packed 4-byte grids */
+const uint32_t *picolm_iq3s_grid(void);      /* 512 x packed 4-byte grids (IQ3_S) */
 const uint8_t  *picolm_iq3xxs_ksigns(void);  /* 128 sign masks */
 const uint8_t  *picolm_iq3xxs_kmask(void);   /* 8 bit masks */
 

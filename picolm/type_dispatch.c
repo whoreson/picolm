@@ -757,7 +757,7 @@ PICOLM_ALIGNED8 const type_info_t type_info_table[] = {
     },
     [GGUF_TYPE_IQ3_S] = {
         .act_fmt = ACT_FMT_Q8_K, .rows_per_block = 1, .fn_gemv = gemv_iq3_s,
-        .fn_gemm = NULL, .has_qgemm_d = 0, .fn_dequant_single = NULL,
+        .fn_gemm = sgemm_iq3_s_q8_k_best, .has_qgemm_d = 0, .fn_dequant_single = NULL,
         .needs_qx = 1, .use_repacked = 0, .has_dual_scalar_path = 0,
     },
     [GGUF_TYPE_IQ2_S] = {
