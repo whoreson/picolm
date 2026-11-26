@@ -756,7 +756,8 @@ static void ds2_xcheck_attn(const model_t *m, int layer, run_state_t *s,
         {
             const uint8_t *wvh0 = (const uint8_t *)wvp;
             size_t wv_row = gguf_type_row_size(wvt, KVL);
-            float row0[KVL], row1[KVL];
+            float *row0 = (float *)malloc((size_t)KVL * sizeof(float));
+            float *row1 = (float *)malloc((size_t)KVL * sizeof(float));
             dequantize_row(wvh0, row0, KVL, wvt);
             dequantize_row(wvh0 + wv_row, row1, KVL, wvt);
             /* expected: row dv=0 -> wkv_b[r][h*per_head+NOPE+0] over r */
@@ -779,6 +780,7 @@ static void ds2_xcheck_attn(const model_t *m, int layer, run_state_t *s,
                         (double)d0[0],(double)d0[1],(double)d0[2],(double)d0[3],
                         (double)d1[0],(double)d1[1],(double)d1[2],(double)d1[3]);
             }
+            free(row0); free(row1);
         }
     }
     {
