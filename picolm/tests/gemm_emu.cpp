@@ -29,7 +29,14 @@ static uint32_t rnd() { rs ^= rs << 13; rs ^= rs >> 17; rs ^= rs << 5; return rs
 static float frand() { return (rnd() % 20001) / 10000.0f - 1.0f; }
 
 static int fmt_ggml(int fmt) { return fmt; }
-static size_t row_bytes_of(int fmt, int I) { return fmt == 5 ? (size_t)(I / 256) * 176 : fmt == 6 ? (size_t)(I / 256) * 210 : (size_t)(I / 32) * 34; }
+static size_t row_bytes_of(int fmt, int I) {
+    switch (fmt) {
+    case 5: return (size_t)(I / 256) * 176;   /* Q5_K */
+    case 6: return (size_t)(I / 256) * 210;   /* Q6_K */
+    case 7: return (size_t)(I / 256) * 212;   /* IQ6_K */
+    default: return (size_t)(I / 32) * 34;    /* Q8_0 */
+    }
+}
 
 static void make_weights(std::vector<uint8_t> &w, int fmt, int I, int O) {
     const size_t rb = row_bytes_of(fmt, I);
@@ -42,6 +49,12 @@ static void make_weights(std::vector<uint8_t> &w, int fmt, int I, int O) {
             const uint16_t dm = f2h(0.002f + 0.01f * (frand() * 0.5f + 0.5f));
             if (fmt == 5) { memcpy(blk, &d, 2); memcpy(blk + 2, &dm, 2); b += 176; }
             else if (fmt == 6) { memcpy(blk + 208, &d, 2); for (int k = 0; k < 16; k++) blk[192 + k] = (uint8_t)(int8_t)((int)(rnd() % 41) - 20); b += 210; }
+            else if (fmt == 7) { /* IQ6_K: d, extra, int8 scales[16]; qs/qh stay random.
+                                  * extra is a full random uint16 (all 16 LUT-select bits valid),
+                                  * scales in [-20,20) keep dl*lut within fp16 range like Q6_K. */
+                memcpy(blk, &d, 2);                       /* d at byte 0 */
+                for (int k = 0; k < 16; k++) blk[4 + k] = (uint8_t)(int8_t)((int)(rnd() % 41) - 20);
+                b += 212; }
             else { memcpy(blk, &d, 2); b += 34; }
         }
 }
@@ -50,7 +63,8 @@ static void ref_dequant(const std::vector<uint8_t> &w, int fmt, int I, int O, st
     const size_t rb = row_bytes_of(fmt, I);
     for (int o = 0; o < O; o++) {
         const uint8_t *r = &w[(size_t)o * rb]; float *d = &out[(size_t)o * I];
-        if (fmt == 5) dequantize_row_q5_K(r, d, I); else if (fmt == 6) dequantize_row_q6_K(r, d, I); else dequantize_row_q8_0(r, d, I);
+        if (fmt == 5) dequantize_row_q5_K(r, d, I); else if (fmt == 6) dequantize_row_q6_K(r, d, I);
+        else if (fmt == 7) dequantize_row_iq6_k(r, d, I); else dequantize_row_q8_0(r, d, I);
     }
 }
 
@@ -139,6 +153,7 @@ int main(int argc, char **argv) {
     f |= run_fmt<GEMMF_Q8_0>(quick);
     f |= run_fmt<GEMMF_Q5_K>(quick);
     f |= run_fmt<GEMMF_Q6_K>(quick);
+    f |= run_fmt<GEMMF_IQ6_K>(quick);
     printf(f ? "FAILED\n" : "all ok\n");
     return f;
 }

@@ -139,7 +139,7 @@ GPU_OBJS =
 
 # GPU host .cu sources (split into modular files)
 GPU_SRCS = backend_gpu_kernels.cu backend_gpu_host_core.cu backend_gpu_host_ssm.cu backend_gpu_host_misc.cu
-GPU_CUH  = backend_kv_watermark.h backend_gpu_ssm_chunk2.cuh backend_gpu_common.cuh backend_gpu_dequant.cuh backend_gpu_kernels.cuh backend_gpu_attn_fa3.cuh
+GPU_CUH  = backend_kv_watermark.h backend_gpu_ssm_chunk2.cuh backend_gpu_common.cuh backend_gpu_dequant.cuh backend_gpu_kernels.cuh backend_gpu_attn_fa3.cuh backend_gpu_gemm_f16.cuh backend_gpu_mma.cuh
 
 PREFIX  ?= /usr/local
 MODEL_DIR ?= /opt/picolm/models

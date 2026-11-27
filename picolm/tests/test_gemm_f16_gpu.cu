@@ -31,7 +31,14 @@ static float frand() { return (rnd() % 20001) / 10000.0f - 1.0f; }
 static uint16_t f2h(float f) { __half h = __float2half(f); return *(uint16_t *)&h; }
 static float h2f(uint16_t b) { __half h = *(__half *)&b; return __half2float(h); }
 
-static size_t row_bytes_of(int fmt, int I) { return fmt == 5 ? (size_t)(I / 256) * 176 : fmt == 6 ? (size_t)(I / 256) * 210 : (size_t)(I / 32) * 34; }
+static size_t row_bytes_of(int fmt, int I) {
+    switch (fmt) {
+    case 5: return (size_t)(I / 256) * 176;   /* Q5_K */
+    case 6: return (size_t)(I / 256) * 210;   /* Q6_K */
+    case 7: return (size_t)(I / 256) * 212;   /* IQ6_K */
+    default: return (size_t)(I / 32) * 34;    /* Q8_0 */
+    }
+}
 
 static void make_weights(std::vector<uint8_t> &w, int fmt, int I, int O) {
     const size_t rb = row_bytes_of(fmt, I);
@@ -44,6 +51,10 @@ static void make_weights(std::vector<uint8_t> &w, int fmt, int I, int O) {
             const uint16_t dm = f2h(0.0005f + 0.003f * (frand() * 0.5f + 0.5f));
             if (fmt == 5) { memcpy(blk, &d, 2); memcpy(blk + 2, &dm, 2); b += 176; }
             else if (fmt == 6) { memcpy(blk + 208, &d, 2); for (int k = 0; k < 16; k++) blk[192 + k] = (uint8_t)(int8_t)((int)(rnd() % 41) - 20); b += 210; }
+            else if (fmt == 7) { /* IQ6_K: d at 0, uint16 extra (any bits valid), int8 scales at 4 */
+                memcpy(blk, &d, 2);
+                for (int k = 0; k < 16; k++) blk[4 + k] = (uint8_t)(int8_t)((int)(rnd() % 41) - 20);
+                b += 212; }
             else { memcpy(blk, &d, 2); b += 34; }
         }
 }
@@ -59,7 +70,8 @@ static void check(const float *y, int ys, const std::vector<float> &x, int S, in
     std::vector<std::vector<float>> Wr(NO, std::vector<float>(I));
     for (int j = 0; j < NO; j++) {
         const uint8_t *r = &w[(size_t)oo[j] * rb];
-        if (fmt == 5) dequantize_row_q5_K(r, Wr[j].data(), I); else if (fmt == 6) dequantize_row_q6_K(r, Wr[j].data(), I); else dequantize_row_q8_0(r, Wr[j].data(), I);
+        if (fmt == 5) dequantize_row_q5_K(r, Wr[j].data(), I); else if (fmt == 6) dequantize_row_q6_K(r, Wr[j].data(), I);
+        else if (fmt == 7) dequantize_row_iq6_k(r, Wr[j].data(), I); else dequantize_row_q8_0(r, Wr[j].data(), I);
         for (int k = 0; k < I; k++) Wr[j][k] = h2f(f2h(Wr[j][k]));
     }
     *worst_rel = 0; *nonfinite_total = 0;
@@ -103,7 +115,11 @@ static int run(int fmt, int S, int I, int O, const char *label) {
     cudaEventRecord(a); for (int i = 0; i < iters; i++) picolm_gpu_gemm_f16_launch(0, fmt, dy, dx, dw, S, I, O, rb, 0, 0); cudaEventRecord(b);
     cudaEventSynchronize(b); float ms_new = 0; cudaEventElapsedTime(&ms_new, a, b); ms_new /= iters;
 
-    /* ---- old int8 kernels (Q5_K single-block-superblock "sb", Q6_K multi-tile) ---- */
+    /* ---- old int8 kernels (Q5_K single-block-superblock "sb", Q6_K multi-tile).
+     * IQ6_K has no int8 IMMA kernel (its old path is the generic per-element
+     * dequant matmul), and Q8_0's old path is the activation-quantizing IMMA
+     * kernel measured by the Q8_0 rows of bench_q8_gemm -- neither is wired
+     * here, so only the fp16 GEMM is timed for fmts 7 and 8. ---- */
     double rel_old = -1, ms_old = -1; size_t nf_old = 0;
     if (fmt == 5 || fmt == 6) {
         const int nb = I / 32, Sp = (S + 15) & ~15;
@@ -145,8 +161,8 @@ int main(void) {
     if (prop.major < 8) { printf("needs sm_80+: skipped\n"); return 0; }
     fp16_table_init();     /* quant.c's Q6_K / Q8_0 dequantisers read d through a lookup table */
     int f = 0;
-    const int fmts[3] = {5, 6, 8};
-    for (int i = 0; i < 3; i++) {
+    const int fmts[4] = {5, 6, 7, 8};
+    for (int i = 0; i < 4; i++) {
         const int fmt = fmts[i];
         /* correctness: ragged shapes, then the real Qwen3.6-27B projections */
         f |= run(fmt, 100, 512, 136, "ragged");

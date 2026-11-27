@@ -46,10 +46,13 @@
 #define GEMMF_THREADS 256
 #define GEMMF_BK      64
 
-enum { GEMMF_Q5_K = 5, GEMMF_Q6_K = 6, GEMMF_Q8_0 = 8 };
+enum { GEMMF_Q5_K = 5, GEMMF_IQ6_K = 7, GEMMF_Q6_K = 6, GEMMF_Q8_0 = 8 };
 
-/* smem bytes per row per raw stage (includes Q6_K's alignment window) */
-static inline FA3_HD int gemmf_stage_bytes(int fmt) { return fmt == GEMMF_Q5_K ? 176 : fmt == GEMMF_Q6_K ? 212 : 68; }
+/* smem bytes per row per raw stage (includes Q6_K's alignment window; IQ6_K
+ * blocks are 212 bytes too, but 4-byte aligned so no window is needed) */
+static inline FA3_HD int gemmf_stage_bytes(int fmt) {
+    return fmt == GEMMF_Q5_K ? 176 : (fmt == GEMMF_Q6_K || fmt == GEMMF_IQ6_K) ? 212 : 68;
+}
 /* 64-wide K slabs per raw stage */
 static inline FA3_HD int gemmf_slabs_per_stage(int fmt) { return fmt == GEMMF_Q8_0 ? 1 : 4; }
 /* smem: X16 tile | W16 tile | 2 raw stages, tiles are rows of 64 fp16 = 128 bytes */
@@ -61,6 +64,27 @@ static inline FA3_HD size_t gemmf_smem_bytes(int fmt, int bm, int bn) {
 
 __device__ static inline uint32_t gemmf_ld16(const uint8_t *p) { return *(const uint16_t *)p; }
 __device__ static inline float    gemmf_u8f(uint32_t w, int e) { return (float)((w >> (8 * e)) & 0xFFu); }
+
+/* IQ6_K non-linear 6-bit LUT: the same 64 bytes as iq6nl_lut[] in quant.c (the
+ * kernel devalues them by 128 at use, exactly like the CPU dequantiser). The
+ * nvcc build does NOT define the table here -- a file-scope __device__ array
+ * referenced from a __global__ *template* makes nvcc's cudafe MSVC host pass
+ * fail with "C2039: is not a member of `global namespace'" -- instead it uses
+ * iq6nl_lut_dev from backend_gpu_dequant.cuh, which backend_gpu_kernels.cu
+ * includes (via backend_gpu_kernels.cuh) before this header, and which is
+ * already proven to compile in that position (picolm_iq6_K_gemv uses it).
+ * Only the emulator (tests/gemm_emu.cpp, standalone, PICOLM_FA3_EMU) needs its
+ * own copy; it verifies the table against quant.c bit for bit. */
+#ifdef PICOLM_FA3_EMU
+static const uint8_t gemmf_iq6k_lut[64] = {
+       1,   7,  13,  19,  24,  30,  35,  40,  44,  49,  54,  58,  62,  66,  70,  74,
+      77,  81,  84,  88,  91,  94,  97, 100, 103, 106, 109, 112, 115, 117, 120, 123,
+     126, 128, 131, 134, 137, 140, 142, 145, 148, 151, 155, 158, 161, 164, 168, 172,
+     175, 179, 183, 187, 191, 196, 200, 205, 210, 215, 220, 226, 231, 237, 243, 249,
+};
+#else
+#define gemmf_iq6k_lut iq6nl_lut_dev
+#endif
 
 template <int FMT, int BM, int BN>
 __global__ void __launch_bounds__(GEMMF_THREADS, 1)
@@ -74,7 +98,7 @@ picolm_gpu_gemm_f16_kernel(float *__restrict__ y, const float *__restrict__ x,
     constexpr int NT = BM / 32;                       /* n8 output tiles per warp */
     constexpr int XU = BN * 8 / GEMMF_THREADS;        /* X chunks (8 values) per thread per slab */
     constexpr int WU = BM * 8 / GEMMF_THREADS;        /* W chunks per thread per slab */
-    constexpr int CB = FMT == GEMMF_Q5_K ? 176 : FMT == GEMMF_Q6_K ? 212 : 68;
+    constexpr int CB = FMT == GEMMF_Q5_K ? 176 : (FMT == GEMMF_Q6_K || FMT == GEMMF_IQ6_K) ? 212 : 68;
     constexpr int SPS = FMT == GEMMF_Q8_0 ? 1 : 4;    /* slabs per raw stage */
 
     FA3_DYN_SMEM_PTR(sm);
@@ -110,6 +134,15 @@ picolm_gpu_gemm_f16_kernel(float *__restrict__ y, const float *__restrict__ x,
             for (int u = tid; u < BM * 17; u += GEMMF_THREADS) {
                 const int r = u / 17, k = u - r * 17, o = tile_o0 + r;
                 if (o < O) fa3_cp4(dst0 + r * CB + k * 4, w + (size_t)o * row_bytes + (size_t)c * 68 + k * 4);
+            }
+        } else if (FMT == GEMMF_IQ6_K) {
+            /* IQ6_K block = 212 bytes = 53 four-byte chunks. 212 and row_bytes
+             * (= n_blocks * 212) are multiples of 4, so every chunk is naturally
+             * 4-byte aligned (the launcher guards the base pointer) and the plain
+             * Q8_0-style cp4 loop covers the whole stage -- no Q6_K-style window. */
+            for (int u = tid; u < BM * 53; u += GEMMF_THREADS) {
+                const int r = u / 53, k = u - r * 53, o = tile_o0 + r;
+                if (o < O) fa3_cp4(dst0 + r * CB + k * 4, w + (size_t)o * row_bytes + (size_t)c * 212 + k * 4);
             }
         } else {
             /* Q6_K superblock = 210 bytes at a 2-byte-aligned address: copy through a
@@ -194,6 +227,46 @@ picolm_gpu_gemm_f16_kernel(float *__restrict__ y, const float *__restrict__ x,
                     const uint32_t q = gemmf_ld16(bp + 2 + l0 + 2 * e);
                     v[2 * e]     = d * (float)(int)(int8_t)(uint8_t)(q & 0xFFu);
                     v[2 * e + 1] = d * (float)(int)(int8_t)(uint8_t)(q >> 8);
+                }
+                for (int e = 0; e < 4; e++) o4[e] = fa3_pack2(v[2 * e], v[2 * e + 1]);
+            } else if (FMT == GEMMF_IQ6_K) {
+                /* IQ6_K (GGUF 141): 212-byte block per 256 values = 4 slabs of 64.
+                 * block_iq6_k layout: d(2) extra(2) scales[16] qs[128] qh[64].
+                 * dequantize_row_iq6_k() fills dst[j], dst[j+16], dst[j+32],
+                 * dst[j+48] of sub-block `sub` from groups g=0..3:
+                 *   g=0: qs[j]    low nibble, qh[j]    bits shift..shift+1
+                 *   g=1: qs[j+16] low nibble, qh[j+16] bits shift..shift+1
+                 *   g=2: qs[j]    high nibble, qh[j]    bits shift+2..shift+3
+                 *   g=3: qs[j+16] high nibble, qh[j+16] bits shift+2..shift+3
+                 * with shift = 4*(sub&1) and the qh base advanced by 32 for sub>=2;
+                 * q = nibble | hi2<<4, value = d*scales[4*sub+g] * (lut[q]-128+m),
+                 * m = bit (4*sub+g) of the uint16 `extra` at byte 2.
+                 * The thread's 8 values (c8*8..c8*8+7) share one group g = c8>>1
+                 * and j0 = (c8&1)*8, and the qs/qh BYTE index is the same
+                 * (j0 + t + 16*(g&1)) for both, so two uint32 loads cover them.
+                 * Same fp32 op order as the reference (d*sc first, then one
+                 * multiply by lut-128+m), so the emulator's identity test
+                 * matches dequantize_row_iq6_k bit for bit. */
+                const int g = c8 >> 1, j0 = (c8 & 1) * 8;
+                const float d = fa3_f16_to_f32(gemmf_ld16(rr));
+                const float dl = d * (float)(int8_t)rr[4 + 4 * sub + g];
+                const int eb = 4 * sub + g;
+                const int m = (int)((rr[2 + (eb >> 3)] >> (eb & 7)) & 1u);
+                const int shn = (g & 2) ? 4 : 0;          /* low vs high nibble */
+                const int shh = 4 * (sub & 1) + (g & 2);  /* 2-bit field in qh   */
+                const int qo = 20 + 32 * sub + 16 * (g & 1) + j0;
+                const int ho = 148 + 32 * (sub >> 1) + 16 * (g & 1) + j0;
+                const uint32_t qs0 = *(const uint32_t *)(rr + qo);
+                const uint32_t qs1 = *(const uint32_t *)(rr + qo + 4);
+                const uint32_t qh0 = *(const uint32_t *)(rr + ho);
+                const uint32_t qh1 = *(const uint32_t *)(rr + ho + 4);
+                const uint32_t qa = ((qs0 >> shn) & 0x0F0F0F0Fu) | (((qh0 >> shh) & 0x03030303u) << 4);
+                const uint32_t qb = ((qs1 >> shn) & 0x0F0F0F0Fu) | (((qh1 >> shh) & 0x03030303u) << 4);
+                const uint32_t qs4[2] = { qa, qb };
+                float v[8];
+                for (int t = 0; t < 8; t++) {
+                    const uint32_t q = (qs4[t >> 2] >> (8 * (t & 3))) & 0xFFu;
+                    v[t] = dl * (float)((int)gemmf_iq6k_lut[q] - 128 + m);
                 }
                 for (int e = 0; e < 4; e++) o4[e] = fa3_pack2(v[2 * e], v[2 * e + 1]);
             } else {

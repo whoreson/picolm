@@ -7600,7 +7600,7 @@ int picolm_gpu_gemm_f16_launch(gpuStream_t stream, int fmt, float *y, const floa
     return 0;
 #else
     if (S < 1 || O < 8 || (O & 1)) return 0;
-    if (fmt == GEMMF_Q5_K || fmt == GEMMF_Q6_K) { if (I % 256) return 0; }
+    if (fmt == GEMMF_Q5_K || fmt == GEMMF_Q6_K || fmt == GEMMF_IQ6_K) { if (I % 256) return 0; }
     else if (fmt == GEMMF_Q8_0) { if (I % 64) return 0; }
     else return 0;
     const int xs = x_stride > 0 ? x_stride : I, ys = y_stride > 0 ? y_stride : O;
@@ -7609,6 +7609,8 @@ int picolm_gpu_gemm_f16_launch(gpuStream_t stream, int fmt, float *y, const floa
     if (fmt == GEMMF_Q5_K && (((uintptr_t)w & 15) || (row_bytes & 15))) return 0;   /* 16-byte cp.async */
     if (fmt == GEMMF_Q8_0 && (((uintptr_t)w & 3) || (row_bytes & 3))) return 0;     /* 4-byte cp.async */
     if (fmt == GEMMF_Q6_K && ((uintptr_t)w & 1)) return 0;
+    if (fmt == GEMMF_IQ6_K && (((uintptr_t)w & 3) || (row_bytes & 3))) return 0;    /* 4-byte cp.async: 212 = 4*53, so
+                                       every row of an IQ6_K tensor is 4-aligned whenever the base is */
     int dev = 0, nsm = 0, bm = 0, bn = 0;
     cudaGetDevice(&dev);
     cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev);
@@ -7616,6 +7618,7 @@ int picolm_gpu_gemm_f16_launch(gpuStream_t stream, int fmt, float *y, const floa
     const uint8_t *wp = (const uint8_t *)w;
     if (fmt == GEMMF_Q5_K) return gemmf_launch_fmt<GEMMF_Q5_K>(bm, bn, stream, y, x, wp, S, I, O, row_bytes, xs, ys);
     if (fmt == GEMMF_Q6_K) return gemmf_launch_fmt<GEMMF_Q6_K>(bm, bn, stream, y, x, wp, S, I, O, row_bytes, xs, ys);
+    if (fmt == GEMMF_IQ6_K) return gemmf_launch_fmt<GEMMF_IQ6_K>(bm, bn, stream, y, x, wp, S, I, O, row_bytes, xs, ys);
     return gemmf_launch_fmt<GEMMF_Q8_0>(bm, bn, stream, y, x, wp, S, I, O, row_bytes, xs, ys);
 #endif
 }
