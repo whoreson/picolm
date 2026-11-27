@@ -5709,23 +5709,6 @@ int tensor_matmul_multi(const mm_job_t *jobs, int n_jobs) {
     if (!q) return 0;
     int first_of[256];                     /* first job index with same activation */
     int n_first = 0;
-    /* Per-job activation quantize arena (see the alloc-site comment below). */
-    size_t q_row = 0;
-    for (int j = 0; j < n_jobs; j++) {
-        const type_info_t *ti = typeinfo(jobs[j].qtype);
-        if (ti && ti->act_fmt == ACT_FMT_Q8_0) {
-            const size_t rb = (size_t)(jobs[j].n / 32) * 34;
-            if (rb > q_row) q_row = rb;
-        } else if (ti && ti->act_fmt == ACT_FMT_Q8_K) {
-            const size_t rb = (size_t)(jobs[j].n / 256) * 292;
-            if (rb > q_row) q_row = rb;
-        }
-    }
-    char *q_arena = NULL;
-    if (q_row) {
-        q_arena = (char *)malloc((size_t)n_jobs * q_row + 64);
-        if (!q_arena) return 0;
-    }
     for (int j = 0; j < n_jobs; j++) {
         q[j].xq = NULL; q[j].x_d = NULL; q[j].owned = 0; q[j].usable = 0;
         const type_info_t *ti = typeinfo(jobs[j].qtype);
@@ -5743,24 +5726,18 @@ int tensor_matmul_multi(const mm_job_t *jobs, int n_jobs) {
             continue;
         }
         first_of[j] = j; n_first++;
-        /* Quantize into a shared arena slice instead of a per-job heap
-         * buffer: deepseek2 decode absorb runs 128 jobs per layer per
-         * token, and 128 heap alloc/free pairs cost more than the quantize
-         * itself (~0.45 ms/layer measured with PICOLM_DS2_WKV=q8_0). */
         quant_buf_t qb = quant_activations_ex(jobs[j].qtype, jobs[j].x, 1, jobs[j].n,
-                                              q_arena + (size_t)j * q_row,
-                                              q_row, 1);
-        if (!qb.qbuf || qb.owned) {
-            if (qb.qbuf && qb.owned) free(qb.qbuf);
-            continue;
-        }
-        q[j].xq = qb.qbuf; q[j].x_d = qb.dbuf; q[j].owned = 0; q[j].usable = 1;
+                                              NULL, 0, 1);
+        if (!qb.qbuf) continue;
+        /* qb is already heap-owned (we passed no scratch); take it over. */
+        q[j].xq = qb.qbuf; q[j].x_d = qb.dbuf; q[j].owned = 1; q[j].usable = 1;
     }
 
     c.q = q;
     tensor_parallel_for(n_threads, mm_multi_task, &c);
 
-    free(q_arena);
+    for (int j = 0; j < n_jobs; j++)
+        if (q[j].owned) free((void *)q[j].xq);
     if (q != qbufs) free(q);
     return 1;
 }
