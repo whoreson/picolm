@@ -1119,31 +1119,7 @@ static void mla_attn_task(int idx, void *vp) {
     }
 }
 
-#if defined(PICOLM_AVX512)
-/* expf for 16 lanes: Cephes range reduction + degree-6 polynomial, scaled with vscalefps so that
- * overflow -> +inf and underflow -> 0 like libm. Max error ~2 ULP against glibc's expf, i.e. NOT
- * bit-identical; that is why the vector pre-pass is opt-in (PICOLM_GLM5_KDA_VEXP=1). */
-static inline __m512 kda_expf16(__m512 x)
-{
-    /* expf(89) overflows to +inf and expf(-104) underflows to 0 in float, so clamping first keeps the
-     * range reduction sane for huge |x| without changing those limits. */
-    x = _mm512_min_ps(_mm512_max_ps(x, _mm512_set1_ps(-104.0f)), _mm512_set1_ps(89.0f));
-    const __m512 log2e = _mm512_set1_ps(1.44269504088896341f);
-    const __m512 c1 = _mm512_set1_ps(0.693359375f), c2 = _mm512_set1_ps(-2.12194440e-4f);
-    const __m512 fx = _mm512_roundscale_ps(_mm512_mul_ps(x, log2e), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-    __m512 r = _mm512_fnmadd_ps(fx, c1, x);
-    r = _mm512_fnmadd_ps(fx, c2, r);
-    __m512 y = _mm512_set1_ps(1.9875691500E-4f);
-    y = _mm512_fmadd_ps(y, r, _mm512_set1_ps(1.3981999507E-3f));
-    y = _mm512_fmadd_ps(y, r, _mm512_set1_ps(8.3334519073E-3f));
-    y = _mm512_fmadd_ps(y, r, _mm512_set1_ps(4.1665795894E-2f));
-    y = _mm512_fmadd_ps(y, r, _mm512_set1_ps(1.6666665459E-1f));
-    y = _mm512_fmadd_ps(y, r, _mm512_set1_ps(5.0000001201E-1f));
-    const __m512 r2 = _mm512_mul_ps(r, r);
-    y = _mm512_fmadd_ps(y, r2, _mm512_add_ps(r, _mm512_set1_ps(1.0f)));
-    return _mm512_scalef_ps(y, fx);
-}
-#endif
+/* kda_expf16 -> picolm_expf16_avx512 (shared in quant.h). */
 
 /* ---- Blocked flash-style prefill attention (absorbed MLA, dense) ------------
  *
@@ -1459,7 +1435,7 @@ static void glm5_pfa_task(int idx, void *vp)
                 for (int j = 0; j < nv; j += 16) {
                     const int rem = nv - j;
                     const __mmask16 mk = rem >= 16 ? (__mmask16)0xFFFF : (__mmask16)((1u << rem) - 1u);
-                    const __m512 e = _mm512_maskz_mov_ps(mk, kda_expf16(_mm512_sub_ps(_mm512_loadu_ps(sr + j), vmn)));
+                    const __m512 e = _mm512_maskz_mov_ps(mk, picolm_expf16_avx512(_mm512_sub_ps(_mm512_loadu_ps(sr + j), vmn)));
                     _mm512_storeu_ps(sr + j, e);              /* lanes >= nv are stored as 0 */
                     vsum = _mm512_add_ps(vsum, e);
                 }
@@ -2103,7 +2079,7 @@ static void glm5_skv_chunk_task_blk(int c, const glm5_skv_t *x)
                 for (int j = 0; j < nk; j += 16) {
                     const int rem = nk - j;
                     const __mmask16 mk = rem >= 16 ? (__mmask16)0xFFFF : (__mmask16)((1u << rem) - 1u);
-                    const __m512 e = _mm512_maskz_mov_ps(mk, kda_expf16(_mm512_sub_ps(_mm512_loadu_ps(sr + j), vmn)));
+                    const __m512 e = _mm512_maskz_mov_ps(mk, picolm_expf16_avx512(_mm512_sub_ps(_mm512_loadu_ps(sr + j), vmn)));
                     _mm512_storeu_ps(sr + j, e);
                     vsum = _mm512_add_ps(vsum, e);
                 }
@@ -4584,11 +4560,11 @@ static void kda_split_pre_head_v(const kda_split_t *x, int t, int h)
         const __m512 zero = _mm512_setzero_ps();
         for (int ch = 0; ch < KD; ch += 16) {
             const int idx = h * KD + ch;
-            const __m512 e = kda_expf16(_mm512_mul_ps(a_val, _mm512_add_ps(_mm512_loadu_ps(raw + idx), _mm512_loadu_ps(dt_bias + idx))));
+            const __m512 e = picolm_expf16_avx512(_mm512_mul_ps(a_val, _mm512_add_ps(_mm512_loadu_ps(raw + idx), _mm512_loadu_ps(dt_bias + idx))));
             const __m512 g = _mm512_mul_ps(lb, _mm512_div_ps(one, _mm512_add_ps(one, e)));
-            _mm512_storeu_ps(x->decay_p + (size_t)t * DI + idx, kda_expf16(_mm512_min_ps(g, cap)));
+            _mm512_storeu_ps(x->decay_p + (size_t)t * DI + idx, picolm_expf16_avx512(_mm512_min_ps(g, cap)));
             _mm512_storeu_ps(x->gate_p + (size_t)t * DI + idx,
-                             _mm512_div_ps(one, _mm512_add_ps(one, kda_expf16(_mm512_sub_ps(zero, _mm512_loadu_ps(z + idx))))));
+                             _mm512_div_ps(one, _mm512_add_ps(one, picolm_expf16_avx512(_mm512_sub_ps(zero, _mm512_loadu_ps(z + idx))))));
         }
     }
     {
@@ -4613,7 +4589,7 @@ static void kda_split_pre_head_v(const kda_split_t *x, int t, int h)
                                                             w + (size_t)ch_off * CK, 4);
                     acc = _mm512_add_ps(acc, _mm512_mul_ps(xs, wv16));
                 }
-                const __m512 den = _mm512_add_ps(one, kda_expf16(_mm512_sub_ps(zero, acc)));
+                const __m512 den = _mm512_add_ps(one, picolm_expf16_avx512(_mm512_sub_ps(zero, acc)));
                 _mm512_storeu_ps(conv_out + ch, _mm512_div_ps(acc, den));
             }
         }

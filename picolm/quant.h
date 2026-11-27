@@ -656,6 +656,30 @@ static inline __m512 fp16x16_to_fp32_inline(const uint16_t *p) {
         fp16_to_fp32_lookup(p[3]), fp16_to_fp32_lookup(p[2]), fp16_to_fp32_lookup(p[1]), fp16_to_fp32_lookup(p[0]));
 #endif
 }
+
+/* Vectorised expf for 16 float lanes (AVX-512).
+ * Cephes range reduction + degree-6 polynomial, scaled with _mm512_scalef_ps.
+ * Overflow -> +inf, underflow -> 0 like libm.  Max error ~2 ULP vs glibc expf.
+ * Used by flash-style PFA attention (glm5, deepseek2) and KDA decay/gate. */
+static inline __m512 picolm_expf16_avx512(__m512 x)
+{
+    x = _mm512_min_ps(_mm512_max_ps(x, _mm512_set1_ps(-104.0f)), _mm512_set1_ps(89.0f));
+    const __m512 log2e = _mm512_set1_ps(1.44269504088896341f);
+    const __m512 c1 = _mm512_set1_ps(0.693359375f), c2 = _mm512_set1_ps(-2.12194440e-4f);
+    const __m512 fx = _mm512_roundscale_ps(_mm512_mul_ps(x, log2e),
+                                           _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    __m512 r = _mm512_fnmadd_ps(fx, c1, x);
+    r = _mm512_fnmadd_ps(fx, c2, r);
+    __m512 y = _mm512_set1_ps(1.9875691500E-4f);
+    y = _mm512_fmadd_ps(y, r, _mm512_set1_ps(1.3981999507E-3f));
+    y = _mm512_fmadd_ps(y, r, _mm512_set1_ps(8.3334519073E-3f));
+    y = _mm512_fmadd_ps(y, r, _mm512_set1_ps(4.1665795894E-2f));
+    y = _mm512_fmadd_ps(y, r, _mm512_set1_ps(1.6666665459E-1f));
+    y = _mm512_fmadd_ps(y, r, _mm512_set1_ps(5.0000001201E-1f));
+    const __m512 r2 = _mm512_mul_ps(r, r);
+    y = _mm512_fmadd_ps(y, r2, _mm512_add_ps(r, _mm512_set1_ps(1.0f)));
+    return _mm512_scalef_ps(y, fx);
+}
 #endif
 
 /* GGUF tensor data types */

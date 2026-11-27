@@ -346,7 +346,7 @@ static void ds2_scores_ctx(const model_t *m, int layer, run_state_t *s,
                            float *q_comb, float *scores,
                            int pos, float *ctx,
                            int NH, int KVL, int ROPE, int NOPE, int KHK, int LROW);
-static int ds2_prefill_attn_par(const model_t *m, int layer, run_state_t *s,
+static int ds2_prefill_attn_pfa(const model_t *m, int layer, run_state_t *s,
                                 const float *q_batch, const float *qabs_batch, float *ctx_batch,
                                 int n_tokens, int start_pos,
                                 int NH, int KVL, int ROPE, int NOPE, int KHK, int LROW);
@@ -1235,7 +1235,7 @@ float *model_forward_prefill_deepseek2(model_t *m, const int *tokens, int n_toke
                                       wk, wk_t, wk_head_sz, q_batch, qabs_batch };
             tensor_parallel_for(NH, ds2_absorb_task, &actx);
 
-            if (!ds2_prefill_attn_par(m, l, s, q_batch, qabs_batch, ctx_batch,
+            if (!ds2_prefill_attn_pfa(m, l, s, q_batch, qabs_batch, ctx_batch,
                                       n_tokens, start_pos, NH, KVL, ROPE, NOPE, KHK, LROW)) {
             for (int t = 0; t < n_tokens; t++) {
                 const int pos = start_pos + t;
@@ -1744,56 +1744,194 @@ static void ds2_scores_ctx(const model_t *m, int layer, run_state_t *s,
                           NH, KVL, ROPE, NOPE, KHK, LROW);
 }
 
-/* ---- Token-parallel prefill attention ------------------------------------
- * The batched prefill used to call the serial kernel once per token on the
- * calling thread (every pool worker idle). Tokens are independent here
- * (causal ranges differ, the cache rows are already written), so hand them to
- * the pool: task i takes tokens i, i+nt, i+2nt, ... (strided, which balances
- * the causal triangle) with its own q_comb/scores scratch. PICOLM_DS2_PF_PAR=0
- * restores the serial loop. */
-typedef struct {
-    const model_t *m; int layer; run_state_t *s;
-    const float *q_batch, *qabs_batch; float *ctx_batch;
-    float *scratch;           /* [nt][NH*LROW + NH*DS2_PFA_BK] */
-    int n_tokens, nt, start_pos, NH, KVL, ROPE, NOPE, KHK, LROW;
-} ds2_pfattn_t;
+/* ---- Flash-style blocked PFA prefill attention ---------------------------
+ *
+ * Replaces the token-parallel serial loop with a true blocked kernel. Each
+ * task owns PFA_HG heads x PFA_BQ tokens = up to 64 query rows, and walks
+ * keys in blocks of DS2_PFA_BK. Per block:
+ *   - S[r][j] = scale * dot(q_comb_r, cache_j)    [4x4 FMA tile via ds2_pfa_scores]
+ *   - online softmax per row (running max/sum, causal mask)
+ *   - O[r][:] += P[r][j] * latent_j               [4 rows x 64 cols via ds2_pfa_pv]
+ *
+ * Each key block (64 rows x LROW floats = ~140 KB) stays in L2 and is reused
+ * by all 64 query rows: ~64x less cache traffic, FMA-bound instead of load-bound.
+ *
+ * q_comb = [q_rope(ROPE); q_abs(KVL)] is built per query row on the stack.
+ * The score dot runs over LROW elements; the PV accumulates over KVL elements
+ * from the latent part of the cache (offset by ROPE).
+ *
+ * Causal mask: row r (token t) sees keys <= start_pos + t.
+ * Not bit-identical to the serial path (online softmax, different summation
+ * order); accurate to float rounding (~1e-7 relative).
+ *
+ * ON by default; PICOLM_DS2_PFA=0 disables (falls back to serial loop). */
+#define DS2_PFA_HG       8
+#define DS2_PFA_BQ       8
+#define DS2_PFA_MAXR     (DS2_PFA_HG * DS2_PFA_BQ)   /* 64 */
+#define DS2_PFA_MAXKVL   512                          /* fixed for DeepSeek V3 */
+#define DS2_PFA_MAXLROW  576                          /* KVL + ROPE = 512+64 */
 
-static void ds2_pfattn_task(int i, void *vp)
+typedef struct {
+    const float *cache;       /* layer cache base, rows LROW wide */
+    const float *q_batch;     /* [n_tokens][NH*KHK] */
+    const float *qabs_batch;  /* [n_tokens][NH*KVL] */
+    float *ctx_batch;         /* [n_tokens][NH*KVL] */
+    int n_tokens, start_pos, NH, KVL, ROPE, NOPE, KHK, LROW;
+    float scale;
+    int nTB, perm;            /* token blocks and stride permutation */
+} ds2_pfa_t;
+
+static void ds2_pfa_task(int idx, void *vp)
 {
-    const ds2_pfattn_t *x = (const ds2_pfattn_t *)vp;
-    if (i >= x->nt) return;
-    float *qc = x->scratch + (size_t)i * ((size_t)x->NH * x->LROW + (size_t)x->NH * DS2_PFA_BK);
-    float *sc = qc + (size_t)x->NH * x->LROW;
-    for (int t = i; t < x->n_tokens; t += x->nt)
-        ds2_scores_ctx_serial(x->m, x->layer, x->s,
-                              x->q_batch + (size_t)t * x->NH * x->KHK,
-                              x->qabs_batch + (size_t)t * x->NH * x->KVL,
-                              qc, sc, x->start_pos + t,
-                              x->ctx_batch + (size_t)t * x->NH * x->KVL,
-                              x->NH, x->KVL, x->ROPE, x->NOPE, x->KHK, x->LROW);
+    const ds2_pfa_t *x = (const ds2_pfa_t *)vp;
+    const int NH = x->NH, KVL = x->KVL, ROPE = x->ROPE, LROW = x->LROW;
+    const int NOPE = x->NOPE, KHK = x->KHK;
+    const int hg = idx / x->nTB;
+    const int tb = (int)(((long long)(idx % x->nTB) * x->perm) % x->nTB);
+    const int h0 = hg * DS2_PFA_HG, hn = (NH - h0 < DS2_PFA_HG) ? NH - h0 : DS2_PFA_HG;
+    const int t0 = tb * DS2_PFA_BQ, tn = (x->n_tokens - t0 < DS2_PFA_BQ) ? x->n_tokens - t0 : DS2_PFA_BQ;
+    const int R = tn * hn;
+    if (R <= 0) return;
+
+    /* Fixed-size stack arrays (matching glm5_pfa_task's strategy).
+     * Total stack: O=128KB, S=16KB, qcomb=~230KB, m/l=512B, qp/lim=~3KB = ~378 KB. */
+    float O[DS2_PFA_MAXR * DS2_PFA_MAXKVL];
+    float S[DS2_PFA_MAXR * DS2_PFA_BK];
+    float m_arr[DS2_PFA_MAXR], l_arr[DS2_PFA_MAXR];
+    float qcomb[DS2_PFA_MAXR * DS2_PFA_MAXLROW];
+    const float *qp[DS2_PFA_MAXR];
+    int lim[DS2_PFA_MAXR];
+
+    /* Build q_comb for each (token, head) in this task: [q_rope; q_abs] */
+    for (int tt = 0; tt < tn; tt++)
+        for (int hh = 0; hh < hn; hh++) {
+            const int r = tt * hn + hh;
+            const int t = t0 + tt, h = h0 + hh;
+            const float *q_row = x->q_batch + (size_t)t * NH * KHK + (size_t)h * KHK;
+            const float *qa_row = x->qabs_batch + (size_t)t * NH * KVL + (size_t)h * KVL;
+            float *qc = qcomb + (size_t)r * LROW;
+            /* q_rope: last ROPE dims of the full head */
+            memcpy(qc, q_row + NOPE, (size_t)ROPE * sizeof(float));
+            /* q_abs: the absorbed latent */
+            memcpy(qc + ROPE, qa_row, (size_t)KVL * sizeof(float));
+            qp[r] = qc;
+            lim[r] = x->start_pos + t;  /* last visible key, inclusive */
+            m_arr[r] = -INFINITY; l_arr[r] = 0.f;
+        }
+    memset(O, 0, (size_t)R * KVL * sizeof(float));
+    const int nkeys = x->start_pos + t0 + tn;  /* max keys any row can see */
+
+    /* Walk keys in blocks of DS2_PFA_BK */
+    for (int kb = 0; kb < nkeys; kb += DS2_PFA_BK) {
+        const int nk = (nkeys - kb < DS2_PFA_BK) ? nkeys - kb : DS2_PFA_BK;
+        const float *kb_rows = x->cache + (size_t)kb * LROW;
+        ds2_pfa_scores(qp, R, kb_rows, nk, LROW, LROW, S, x->scale);
+
+        /* Online softmax per row with causal mask.
+         * AVX-512: vector max + vec-expf (16 lanes at a time).
+         * Scalar fallback: same logic as the serial path. */
+        for (int r = 0; r < R; r++) {
+            float *sr = S + (size_t)r * DS2_PFA_BK;
+            const int vis = lim[r] - kb + 1;  /* visible keys in this block */
+            int nv = vis < 0 ? 0 : (vis > nk ? nk : vis);
+#if defined(PICOLM_AVX512)
+            if (nv == 0) { for (int j = 0; j < nk; j++) sr[j] = 0.f; continue; }
+            __m512 vmx = _mm512_set1_ps(-INFINITY);
+            for (int j = 0; j < nv; j += 16) {
+                const int rem = nv - j;
+                const __mmask16 mk = rem >= 16 ? (__mmask16)0xFFFF : (__mmask16)((1u << rem) - 1u);
+                vmx = _mm512_mask_max_ps(vmx, mk, vmx, _mm512_loadu_ps(sr + j));
+            }
+            const float bm = _mm512_reduce_max_ps(vmx);
+            const float mn = bm > m_arr[r] ? bm : m_arr[r];
+            const float alpha = expf(m_arr[r] - mn);
+            const __m512 vmn = _mm512_set1_ps(mn);
+            __m512 vsum = _mm512_setzero_ps();
+            for (int j = 0; j < nv; j += 16) {
+                const int rem = nv - j;
+                const __mmask16 mk = rem >= 16 ? (__mmask16)0xFFFF : (__mmask16)((1u << rem) - 1u);
+                const __m512 e = _mm512_maskz_mov_ps(mk,
+                    picolm_expf16_avx512(_mm512_sub_ps(_mm512_loadu_ps(sr + j), vmn)));
+                _mm512_storeu_ps(sr + j, e);
+                vsum = _mm512_add_ps(vsum, e);
+            }
+            const float sum = _mm512_reduce_add_ps(vsum);
+            for (int j = (nv + 15) & ~15; j < nk; j++) sr[j] = 0.f;
+            l_arr[r] = l_arr[r] * alpha + sum;
+            if (alpha != 1.0f) {
+                float *o = O + (size_t)r * KVL;
+                for (int d = 0; d < KVL; d++) o[d] *= alpha;
+            }
+            m_arr[r] = mn;
+#else
+            for (int j = nv; j < nk; j++) sr[j] = -INFINITY;
+            float bm = -INFINITY;
+            for (int j = 0; j < nv; j++) if (sr[j] > bm) bm = sr[j];
+            if (nv == 0) { for (int j = 0; j < nk; j++) sr[j] = 0.f; continue; }
+            const float mn = bm > m_arr[r] ? bm : m_arr[r];
+            const float alpha = expf(m_arr[r] - mn);
+            float sum = 0.f;
+            for (int j = 0; j < nv; j++) { float e = expf(sr[j] - mn); sr[j] = e; sum += e; }
+            for (int j = nv; j < nk; j++) sr[j] = 0.f;
+            l_arr[r] = l_arr[r] * alpha + sum;
+            if (alpha != 1.0f) {
+                float *o = O + (size_t)r * KVL;
+                for (int d = 0; d < KVL; d++) o[d] *= alpha;
+            }
+            m_arr[r] = mn;
+#endif
+        }
+
+        /* PV: O[r] += S[r] @ latent(kb_rows), latent starts at ROPE offset */
+        ds2_pfa_pv(O, R, S, nk, kb_rows + ROPE, LROW, KVL);
+    }
+
+    /* Normalize and write out */
+    for (int tt = 0; tt < tn; tt++)
+        for (int hh = 0; hh < hn; hh++) {
+            const int r = tt * hn + hh;
+            const float inv = (l_arr[r] > 0.f) ? 1.0f / l_arr[r] : 1.0f;
+            const float *o = O + (size_t)r * KVL;
+            float *dst = x->ctx_batch + ((size_t)(t0 + tt) * NH + h0 + hh) * KVL;
+            for (int d = 0; d < KVL; d++) dst[d] = o[d] * inv;
+        }
 }
 
-/* Returns 1 if it ran. */
-static int ds2_prefill_attn_par(const model_t *m, int layer, run_state_t *s,
+/* Returns 1 if it ran (caller falls back to the serial kernel on 0). */
+static int ds2_prefill_attn_pfa(const model_t *m, int layer, run_state_t *s,
                                 const float *q_batch, const float *qabs_batch, float *ctx_batch,
                                 int n_tokens, int start_pos,
                                 int NH, int KVL, int ROPE, int NOPE, int KHK, int LROW)
 {
     static int en = -1;
-    if (en < 0) { const char *e = getenv("PICOLM_DS2_PF_PAR"); en = !(e && atoi(e) == 0); }
-    int nt = tensor_get_n_threads();
-    if (!en || nt < 2 || n_tokens < 2) return 0;
-    if (nt > n_tokens) nt = n_tokens;
-    static float *buf = NULL; static size_t cap = 0;
-    const size_t per = (size_t)NH * LROW + (size_t)NH * DS2_PFA_BK, need = per * nt;
-    if (need > cap) {
-        float *nb = (float *)realloc(buf, need * sizeof(float));
-        if (!nb) return 0;
-        buf = nb; cap = need;
+    if (en < 0) { const char *e = getenv("PICOLM_DS2_PFA"); en = !(e && atoi(e) == 0); }
+    if (!en || n_tokens < 1 || NH < 1 || NH > 128 || KVL > DS2_PFA_MAXKVL || KVL < 16) return 0;
+
+    const float scale = s->ds2.kq_scale;
+    const float *cache = s->ds2.mla_kv + (size_t)layer * s->ds2.mla_kv_layer_stride;
+
+    /* Token blocks: PFA_BQ tokens per block. */
+    int nTB = (n_tokens + DS2_PFA_BQ - 1) / DS2_PFA_BQ;
+    /* Head groups: DS2_PFA_HG heads per group. */
+    int nHG = (NH + DS2_PFA_HG - 1) / DS2_PFA_HG;
+
+    /* Stride permutation coprime with nTB to spread causal cost across threads */
+    int perm = 1;
+    for (int cand = (int)(nTB * 0.618) | 1; cand < nTB * 4 + 8; cand += 2) {
+        int a = cand, b = nTB;
+        while (b) { int t = a % b; a = b; b = t; }
+        if (a == 1) { perm = cand; break; }
     }
-    ds2_pfattn_t x = { m, layer, s, q_batch, qabs_batch, ctx_batch, buf,
-                       n_tokens, nt, start_pos, NH, KVL, ROPE, NOPE, KHK, LROW };
-    tensor_parallel_for(nt, ds2_pfattn_task, &x);
+
+    ds2_pfa_t x;
+    x.cache = cache; x.q_batch = q_batch; x.qabs_batch = qabs_batch;
+    x.ctx_batch = ctx_batch;
+    x.n_tokens = n_tokens; x.start_pos = start_pos;
+    x.NH = NH; x.KVL = KVL; x.ROPE = ROPE; x.NOPE = NOPE;
+    x.KHK = KHK; x.LROW = LROW;
+    x.scale = scale; x.nTB = nTB; x.perm = perm;
+
+    tensor_parallel_for(nHG * nTB, ds2_pfa_task, &x);
     return 1;
 }
 
