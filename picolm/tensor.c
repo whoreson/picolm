@@ -5956,12 +5956,32 @@ int tensor_matmul_batch_multi_ok(gguf_type_t qtype, int n, int d) {
      *   4. if it reports CHUNK-UNSAFE, leave it out and either fix the kernel's
      *      row-slicing or record here why it cannot be chunked */
     const type_info_t *ti = typeinfo(qtype);
-    if (!ti || !ti->fn_gemm || ti->act_fmt != ACT_FMT_Q8_K) return 0;
-    if (n < 256 || (n % 256) != 0 || d < 8 || (d % 8) != 0) return 0;
+    if (!ti || !ti->fn_gemm) return 0;
+    /* Activation format is NOT restricted to Q8_K any more: the Q8_0-activation
+     * family (Q8_0/Q4_0/Q5_0/IQ4_NL) is supported through the adapters, and the
+     * multi engine sizes and strides its scratch from qtype_act_format(). */
+    if (n < 32 || (n % 32) != 0 || d < 8 || (d % 8) != 0) return 0;
+    /* The K-quant / IQ kernels still need whole 256-value superblocks. */
+    if (ti->act_fmt != ACT_FMT_Q8_0 && (n % 256) != 0) return 0;
     switch (qtype) {
-    case GGUF_TYPE_IQ6_K:   /* original entry */
-    case GGUF_TYPE_IQ3_XXS: /* verified for DeepSeek-V3 routed experts */
-    case GGUF_TYPE_IQ3_S:   /* verified; DeepSeek-V3 attention projections */
+    case GGUF_TYPE_IQ6_K:    /* original entry (GLM-5 experts) */
+    case GGUF_TYPE_IQ3_XXS:  /* verified for DeepSeek-V3 routed experts */
+    case GGUF_TYPE_IQ3_S:    /* verified; DeepSeek-V3 attention projections */
+    case GGUF_TYPE_IQ3_K:
+    case GGUF_TYPE_Q6_K:
+    case GGUF_TYPE_Q5_K:
+    case GGUF_TYPE_Q3_K:
+    case GGUF_TYPE_Q2_K:
+    case GGUF_TYPE_IQ4_XS:
+    case GGUF_TYPE_IQ2_K:
+    /* These four/five reach their GEMM through the adapters at the bottom of
+     * sgemm_iq6_k.c: picolm_sgemm_d for the Q8_0-activation family, and
+     * picolm_sgemm_d_q4k for Q4_K (whose table entry was NULL on non-NEON). */
+    case GGUF_TYPE_Q8_0:
+    case GGUF_TYPE_Q4_0:
+    case GGUF_TYPE_Q5_0:
+    case GGUF_TYPE_IQ4_NL:
+    case GGUF_TYPE_Q4_K:
         return 1;
     default:
         return 0;
@@ -5980,6 +6000,8 @@ typedef struct {
     const type_info_t **ti;
     size_t *row_bytes;       /* per job: weight row bytes */
     size_t *q_off;           /* per job: offset into the scratch */
+    const float **q_d;       /* per job: fp32 per-block deltas (Q8_0-family only, else NULL) */
+    size_t *q_dstride;       /* per job: delta stride per activation row, in floats */
     char *scratch;           /* malloc'd block (freed/grown here) */
     char *qbase;             /* 64-byte aligned start of the usable area */
     size_t scratch_cap;
@@ -5988,10 +6010,28 @@ typedef struct {
     volatile int failed;
 } bmulti_t;
 
+/* Activation-buffer bytes for one job's quantized activations.
+ *
+ * This used to hardcode block_q8_K, which is the format for the K-quant / IQ
+ * weight families. Types on the ACT_FMT_Q8_0 side (Q8_0, Q4_0, Q5_0, IQ4_NL) use
+ * the smaller block_q8_0, so the hardcoded size over-allocated by ~8x -- harmless
+ * in itself, but it also meant qtype_act_format() was never consulted here and
+ * those types could not participate at all. Everything that sizes or strides the
+ * scratch now goes through this one function, so the two cannot drift apart. */
+static size_t bmulti_act_bytes(gguf_type_t qtype, int n_batch, int n)
+{
+    switch (qtype_act_format(qtype)) {
+    case ACT_FMT_Q8_0: return (size_t)n_batch * (size_t)(n / 32)  * sizeof(block_q8_0);
+    case ACT_FMT_Q8_K: return (size_t)n_batch * (size_t)(n / 256) * sizeof(block_q8_K);
+    case ACT_FMT_Q8_2: return (size_t)n_batch * (size_t)(n / 32)  * sizeof(block_q8_2);
+    default:           return 0;   /* F32: no table GEMM, never reaches here */
+    }
+}
+
 static void bmulti_quant_task(int j, void *p) {
     bmulti_t *c = (bmulti_t *)p;
     const mm_bjob_t *J = &c->jobs[j];
-    const size_t sz = (size_t)J->n_batch * (size_t)(J->n / 256) * sizeof(block_q8_K);
+    const size_t sz = bmulti_act_bytes(J->qtype, J->n_batch, J->n);
     quant_buf_t qb = quant_activations_ex(J->qtype, J->x, J->n_batch, J->n, c->qbase + c->q_off[j], sz, 1);
     if (!qb.qbuf || qb.owned) {      /* must have used our slice (it fits exactly) */
         if (qb.qbuf && qb.owned) free(qb.qbuf);
@@ -5999,6 +6039,9 @@ static void bmulti_quant_task(int j, void *p) {
         return;
     }
     c->qbuf[j] = (char *)qb.qbuf;
+    c->q_d[j] = qb.dbuf;
+    /* deltas are one float per 32-value block for Q8_0-family; 0 when absent */
+    c->q_dstride[j] = qb.dbuf ? (size_t)(J->n / 32) : 0;
 }
 
 static void bmulti_gemm_task(int i, void *p) {
@@ -6052,15 +6095,19 @@ int tensor_matmul_batch_multi(const mm_bjob_t *jobs, int n_jobs) {
     size_t n_tasks = 0, q_total = 0;
     for (int j = 0; j < n_jobs; j++) {
         n_tasks += (size_t)(jobs[j].d + R - 1) / R;
-        q_total += (((size_t)jobs[j].n_batch * (size_t)(jobs[j].n / 256) * sizeof(block_q8_K)) + 63) & ~(size_t)63;
+        q_total += ((bmulti_act_bytes(jobs[j].qtype, jobs[j].n_batch, jobs[j].n) + 63) & ~(size_t)63);
     }
     if ((size_t)n_jobs > cap_jobs) {
         free(c.qbuf); free(c.ti); free(c.row_bytes); free(c.q_off);
+        free(c.q_d); free(c.q_dstride);
         c.qbuf = (char **)malloc(n_jobs * sizeof(char *));
         c.ti = (const type_info_t **)malloc(n_jobs * sizeof(void *));
         c.row_bytes = (size_t *)malloc(n_jobs * sizeof(size_t));
         c.q_off = (size_t *)malloc(n_jobs * sizeof(size_t));
-        cap_jobs = (c.qbuf && c.ti && c.row_bytes && c.q_off) ? (size_t)n_jobs : 0;
+        c.q_d = (const float **)malloc(n_jobs * sizeof(float *));
+        c.q_dstride = (size_t *)malloc(n_jobs * sizeof(size_t));
+        cap_jobs = (c.qbuf && c.ti && c.row_bytes && c.q_off && c.q_d && c.q_dstride)
+                   ? (size_t)n_jobs : 0;
     }
     if (n_tasks > cap_tasks) {
         free(c.t_job); free(c.t_r0); free(c.t_nr);
@@ -6085,7 +6132,7 @@ int tensor_matmul_batch_multi(const mm_bjob_t *jobs, int n_jobs) {
         c.ti[j] = typeinfo(jobs[j].qtype);
         c.row_bytes[j] = gguf_type_row_size(jobs[j].qtype, jobs[j].n);
         c.q_off[j] = off;
-        off += (((size_t)jobs[j].n_batch * (size_t)(jobs[j].n / 256) * sizeof(block_q8_K)) + 63) & ~(size_t)63;
+        off += ((bmulti_act_bytes(jobs[j].qtype, jobs[j].n_batch, jobs[j].n) + 63) & ~(size_t)63);
         for (int r0 = 0; r0 < jobs[j].d; r0 += R) {
             c.t_job[t] = j; c.t_r0[t] = r0;
             c.t_nr[t] = (jobs[j].d - r0 < R) ? jobs[j].d - r0 : R;

@@ -66,15 +66,32 @@ static size_t block_bytes_of(gguf_type_t t, int n)
 {
     const size_t rb = gguf_type_row_size(t, n);
     if (rb == 0) return 0;
-    static const int vals[2] = { 256, 32 };
-    for (int i = 0; i < 2; i++) {
-        const int nb = n / vals[i];
-        if (nb > 0 && (n % vals[i]) == 0 && (rb % (size_t)nb) == 0) {
-            const size_t bb = rb / (size_t)nb;
-            if (bb >= 16) return bb;
-        }
+
+    /* Which block width does this type actually use? It CANNOT be inferred from
+     * the row size, because both answers divide evenly: for Q8_0 at n=2048,
+     * 2048/256 = 8 "blocks" of 272 bytes looks just as valid as 64 blocks of
+     * 34. Picking 256 there yields a 272-byte pseudo-block whose first 34 bytes
+     * get stomped and whose remaining 238 keep random fp16 exponent bits, so
+     * dequant magnitudes hit ~1e7 and the type reports DATA-BAD.
+     *
+     * qtype_act_format() is NOT the discriminator either (it says Q8_0 vs
+     * Q8_K, and Q4_K/IQ* are a mix). So: list the 32-value formats explicitly.
+     * Every other format in this tree is 256 values/block (K-quants, IQ1..IQ6,
+     * Q1_0/Q2_0 use 128 -- see the sizeof check below, which is authoritative
+     * for the ones we care about because it reads the real block struct). */
+    switch (t) {
+    case GGUF_TYPE_Q8_0: case GGUF_TYPE_Q4_0: case GGUF_TYPE_Q5_0:
+    case GGUF_TYPE_Q5_1: case GGUF_TYPE_IQ4_NL:
+        return (rb % (size_t)(n / 32) == 0) ? rb / (size_t)(n / 32) : rb;
+    case GGUF_TYPE_Q1_0: {  /* 128 values/block */
+        return (rb % (size_t)(n / 128) == 0) ? rb / (size_t)(n / 128) : rb;
     }
-    return rb;
+    case GGUF_TYPE_Q2_0: {  /* 128 values/block */
+        return (rb % (size_t)(n / 128) == 0) ? rb / (size_t)(n / 128) : rb;
+    }
+    default:                /* K-quants and the IQ family: 256 values/block */
+        return (rb % (size_t)(n / 256) == 0) ? rb / (size_t)(n / 256) : rb;
+    }
 }
 
 /* Where the fp16 scale word(s) live inside one block.

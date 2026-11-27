@@ -22,6 +22,13 @@
 #include <stdio.h>
 #include <string.h>
 #include <stddef.h>
+
+/* Needed from here on: the table fn_gemm adapters at the bottom of this file
+ * call picolm_sgemm_d() / picolm_sgemm_d_q4k() and the Q8_0-family delta
+ * helper. Those are declared in sgemm.h. (This file used to avoid the include
+ * on purpose, repeating any needed prototypes inline; that stopped working once
+ * the adapters legitimately need four functions at once.) */
+#include "sgemm.h"
 #if defined(__x86_64__) || defined(__i386__)
 #  if __GNUC__ >= 4 && __GNUC_MINOR__ >= 7
 #    include <immintrin.h>
@@ -1923,6 +1930,109 @@ int sgemm_q4_k_q8_k_fast(int nrows, int ncols, int k_blocks, const void *vx, int
     if (lda != k_blocks || ldb != k_blocks) return 0;
     return kq_fast("sgemm_q4_k_q8_k", sgemm_q4_k_q8_k_r8v, sgemm_q4_k_q8_k_r8t, nrows, ncols, k_blocks * QK_K, vx, vy, out, bs, ith, nth) != 0;
 }
+/* ================================================================
+ * Table fn_gemm adapters for types whose GEMM lives behind picolm_sgemm_d()
+ * or behind a "returns 1 if handled" helper.
+ *
+ * tensor_matmul_batch_multi() needs EVERY type it drives to expose a fn_gemm
+ * with the uniform contract
+ *
+ *     int fn(nrows, ncols, n, W, acts, out, bs, ith, nth)   -> nrows on success
+ *
+ * because it slices rows and calls the function once per chunk. Several types
+ * did not have one:
+ *   Q4_K                    picolm_sgemm_d_q4k returns 0/1, not a row count
+ *   Q8_0/Q4_0/Q5_0/IQ4_NL   fn_gemm was NULL; the GEMM lives inside
+ *                           picolm_sgemm_d(), which additionally needs the
+ *                           per-block fp32 delta array (B_d) that the multi
+ *                           engine holds next to the quantized buffer.
+ *
+ * These adapters always produce this thread's full row share and return nrows,
+ * because the multi engine treats 0 as "nothing computed" and aborts the whole
+ * dispatch.
+ *
+ * q8_0_act_deltas(qtype, acts, n_batch, n) computes the delta array the
+ * picolm_sgemm_d family wants (one fp32 per 32-value block, amax/127 -- the
+ * same convention matmul() uses). It is declared in sgemm.h; see the comment
+ * there for why it cannot be derived from the block header alone.
+ * ================================================================ */
+int sgemm_q4_k_q8_k_table(int nrows, int ncols, int k, const void *vx, const void *vy,
+                          float *out, size_t bs, int ith, int nth) {
+    const int k_blocks = k / QK_K;
+    if (k_blocks < 1 || (k % QK_K) != 0 || ncols < 1 || nrows < 1) return 0;
+    /* Covers every SIMD tier (AVX2 / AVX1 / NEON / scalar) and always computes
+     * the thread's row slice, so a 0 return only ever means "unsupported
+     * build". */
+    if (!picolm_sgemm_d_q4k(nrows, ncols, k_blocks, vx, k_blocks, vy, k_blocks,
+                            out, (int)bs, ith, nth)) return 0;
+    return nrows;
+}
+
+static int sgemm_q8fam_table(int nrows, int ncols, int k, const void *vx, const void *vy,
+                             float *out, size_t bs, int Atype, int ith, int nth) {
+    const int k_blocks = k / 32;
+    if (k_blocks < 1 || (k % 32) != 0 || ncols < 1 || nrows < 1) return 0;
+    /* Deltas are a pure function of the quantized activations, so deriving them
+     * here is correct for any caller and needs no extra state. Cost is one pass
+     * over the int8 payload; the GEMM that follows dominates. Not hoisted to
+     * the multi engine's per-job arrays because that would require threading an
+     * extra pointer through fn_gemm's fixed signature. */
+    /* picolm_sgemm_d() declines n < 2 (no tile to GEMM), but the multi engine
+     * can hand it a single-column job -- the MoE n_e == 1 bucket, which is the
+     * COMMON case for a small prefill. Fall back to one vector dot per row; it
+     * is the same kernel family matmul() uses for single tokens. */
+    if (ncols < 2) {
+        const size_t a_row = (size_t)k_blocks * sizeof(block_q8_0);
+        const size_t w_row = gguf_type_row_size((gguf_type_t)Atype, k);
+        float (*dot)(const void *, const void *, int) = NULL;
+        switch ((gguf_type_t)Atype) {
+        case GGUF_TYPE_Q8_0:  dot = vec_dot_q8_0_q8_0; break;
+        case GGUF_TYPE_Q4_0:  dot = vec_dot_q4_0_q8_0; break;
+        case GGUF_TYPE_Q5_0:  dot = vec_dot_q5_0_q8_0; break;
+        case GGUF_TYPE_IQ4_NL: dot = vec_dot_iq4_nl_q8_0; break;
+        default: return 0;
+        }
+        if (!dot || w_row == 0) return 0;
+        const int gpt = (nrows + nth - 1) / nth;
+        const int r0 = ith * gpt, r1 = (ith + 1) * gpt < nrows ? (ith + 1) * gpt : nrows;
+        for (int i = r0; i < r1; ++i)
+            for (int c = 0; c < ncols; ++c)
+                out[(size_t)c * bs + i] = dot((const char *)vx + (size_t)i * w_row,
+                                              (const char *)vy + (size_t)c * a_row, k);
+        return nrows;
+    }
+    float *B_d = (float *)malloc((size_t)ncols * (size_t)k_blocks * sizeof(float));
+    if (!B_d) return 0;
+    sgemm_q8_0_act_deltas(vy, ncols, k, B_d);
+    /* B_d is [ncols][k_blocks] fp32, so its row stride is k_blocks, NOT bs.
+     * Passing bs (= out's row stride, i.e. nrows) here made the delta read walk
+     * way past the array: on a 512x512 GEMM that is a stride of 512 floats for
+     * a 8-float row, which segfaulted inside sgemm_qg_qs_d4's m-tail cell loop.
+     * ldrd is an independent stride from ldc for exactly this reason. */
+    const int ok = picolm_sgemm_d(nrows, ncols, k_blocks, vx, k_blocks,
+                                  (const block_q8_0 *)vy, k_blocks,
+                                  B_d, k_blocks, out, (int)bs, Atype, ith, nth);
+    free(B_d);
+    if (!ok) return 0;
+    return nrows;
+}
+int sgemm_q8_0_q8_0_table(int nrows, int ncols, int k, const void *vx, const void *vy,
+                          float *out, size_t bs, int ith, int nth) {
+    return sgemm_q8fam_table(nrows, ncols, k, vx, vy, out, bs, GGUF_TYPE_Q8_0, ith, nth);
+}
+int sgemm_q4_0_q8_0_table(int nrows, int ncols, int k, const void *vx, const void *vy,
+                          float *out, size_t bs, int ith, int nth) {
+    return sgemm_q8fam_table(nrows, ncols, k, vx, vy, out, bs, GGUF_TYPE_Q4_0, ith, nth);
+}
+int sgemm_q5_0_q8_0_table(int nrows, int ncols, int k, const void *vx, const void *vy,
+                          float *out, size_t bs, int ith, int nth) {
+    return sgemm_q8fam_table(nrows, ncols, k, vx, vy, out, bs, GGUF_TYPE_Q5_0, ith, nth);
+}
+int sgemm_iq4_nl_q8_0_table(int nrows, int ncols, int k, const void *vx, const void *vy,
+                            float *out, size_t bs, int ith, int nth) {
+    return sgemm_q8fam_table(nrows, ncols, k, vx, vy, out, bs, GGUF_TYPE_IQ4_NL, ith, nth);
+}
+
 /* Q4_K_R4 table fn_gemm: decode-once R8 (VNNI / AVX2) for big shapes, else the original 1x4 kernel. */
 int sgemm_q4_k_r4_q8_k_best(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) {
     int r = kq_fast("sgemm_q4_k_r4_q8_k", sgemm_q4_k_r4_q8_k_r8v, sgemm_q4_k_r4_q8_k_r8t, nrows, ncols, k, vx, vy, out, bs, ith, nth);

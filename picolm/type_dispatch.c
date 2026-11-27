@@ -357,7 +357,10 @@ PICOLM_ALIGNED8 const type_info_t type_info_table[] = {
         .act_fmt = ACT_FMT_Q8_0,
         .rows_per_block = 1,
         .fn_gemv = gemv_q8_0_deltas,
-        .fn_gemm = NULL, /* uses picolm_sgemm_d */
+        /* Row-sliced table GEMM (see sgemm_iq6_k.c's adapter block) so the MoE
+         * multi-job engine can batch Q8_0 experts. picolm_sgemm_d remains the
+         * path matmul_batch takes for a single job. */
+        .fn_gemm = sgemm_q8_0_q8_0_table,
         .has_qgemm_d = 1,
         .fn_dequant_single = NULL,
         .needs_qx = 1,
@@ -369,7 +372,7 @@ PICOLM_ALIGNED8 const type_info_t type_info_table[] = {
         .act_fmt = ACT_FMT_Q8_0,
         .rows_per_block = 1,
         .fn_gemv = gemv_q4_0,
-        .fn_gemm = NULL, /* uses picolm_sgemm_d */
+        .fn_gemm = sgemm_q4_0_q8_0_table,   /* see Q8_0 above */
         .has_qgemm_d = 1,
         .fn_dequant_single = NULL,
         .needs_qx = 1,
@@ -394,7 +397,7 @@ PICOLM_ALIGNED8 const type_info_t type_info_table[] = {
         .act_fmt = ACT_FMT_Q8_0,
         .rows_per_block = 1,
         .fn_gemv = gemv_iq4_nl,
-        .fn_gemm = NULL,
+        .fn_gemm = sgemm_iq4_nl_q8_0_table,   /* see Q8_0's entry */
         .has_qgemm_d = 1,
         .fn_dequant_single = NULL,
         .needs_qx = 1,
@@ -460,14 +463,14 @@ PICOLM_ALIGNED8 const type_info_t type_info_table[] = {
         .fn_gemv = gemv_q4_K,
 #if defined(__ARM_NEON)
         /* sgemm_k_q8k_neon_fast.c is NEON-only, so this symbol exists only on
-         * ARM. On AVX2/AVX1 builds fn_gemm stays NULL on purpose:
-         * matmul_batch() has a dedicated Q4_K branch that reaches
-         * picolm_sgemm_d_q4k() (sgemm_q4k_q8k_d4 / sgemm_q4_k_q8_k_fast).
-         * Referencing the NEON symbol under an AVX guard is a link error --
-         * it broke the x86 CI. */
+         * ARM. Referencing it under an AVX guard is a link error -- it broke the
+         * x86 CI once. */
         .fn_gemm = sgemm_q4_k_q8_k_neon_fast,
 #else
-        .fn_gemm = NULL,
+        /* Non-NEON: the row-sliced adapter wraps picolm_sgemm_d_q4k(), which
+         * covers AVX2 / AVX1 / scalar. Before this the entry was NULL, so Q4_K
+         * MoE experts could not use the multi-job engine at all. */
+        .fn_gemm = sgemm_q4_k_q8_k_table,
 #endif
         .has_qgemm_d = 0,
         .fn_dequant_single = NULL,
@@ -919,7 +922,7 @@ PICOLM_ALIGNED8 const type_info_t type_info_table[] = {
         .act_fmt = ACT_FMT_Q8_0,
         .rows_per_block = 1,
         .fn_gemv = gemv_q5_0, /* portable Q5_0 x Q8_0 scalar dot */
-        .fn_gemm = NULL, /* picolm_sgemm handles Q5_0 */
+        .fn_gemm = sgemm_q5_0_q8_0_table,   /* see Q8_0's entry */
         .has_qgemm_d = 1, /* picolm_sgemm_d supports Q5_0 */
         .fn_dequant_single = NULL,
         .needs_qx = 1,

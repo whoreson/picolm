@@ -84,6 +84,29 @@ int picolm_sgemm_d(int m, int n, int k_blocks,
                    int Atype,
                    int ith, int nth);
 
+/* Per-block fp32 activation deltas for the Q8_0-family GEMMs (Q8_0/Q4_0/Q5_0/
+ * IQ4_NL). picolm_sgemm_d() needs this array separately from the block headers
+ * because the fp16 header scale is lossy; this reproduces matmul()'s amax/127
+ * convention from the int8 payload. `act` is n_batch rows of block_q8_0,
+ * `d` receives n_batch*(n/32) floats. */
+void sgemm_q8_0_act_deltas(const void *act, int n_batch, int n, float *d);
+
+/* Table fn_gemm adapters, for tensor_matmul_batch_multi()'s uniform
+ * "compute these rows, return nrows" contract. These exist because the types
+ * below either had fn_gemm == NULL (their GEMM lives in picolm_sgemm_d) or
+ * exposed only a 0/1 "handled" helper (Q4_K). See the comment block in
+ * sgemm_iq6_k.c. */
+int sgemm_q4_k_q8_k_table(int nrows, int ncols, int k, const void *vx, const void *vy,
+                          float *out, size_t bs, int ith, int nth);
+int sgemm_q8_0_q8_0_table(int nrows, int ncols, int k, const void *vx, const void *vy,
+                          float *out, size_t bs, int ith, int nth);
+int sgemm_q4_0_q8_0_table(int nrows, int ncols, int k, const void *vx, const void *vy,
+                          float *out, size_t bs, int ith, int nth);
+int sgemm_q5_0_q8_0_table(int nrows, int ncols, int k, const void *vx, const void *vy,
+                          float *out, size_t bs, int ith, int nth);
+int sgemm_iq4_nl_q8_0_table(int nrows, int ncols, int k, const void *vx, const void *vy,
+                            float *out, size_t bs, int ith, int nth);
+
 /* Q4_K x Q8_K GEMM (AVX2): C[n][m] = B[n][k] @ A^T[m][k]
  * m = weight rows (d), n = activation rows (n_batch)
  * k_blocks_q4k = k / 256 (number of block_q4_K per row) */

@@ -3865,6 +3865,41 @@ void picolm_gemm_selftest(void) {
     printf("SELFTEST: hash = %08x\n", hash);
 }
 
+/* Per-block fp32 deltas for a Q8_0-family activation buffer.
+ *
+ * picolm_sgemm_d() takes the activation scale twice: inside the block_q8_0
+ * header (fp16) and as a parallel fp32 array. The array cannot be recovered
+ * from the header alone, because fp16 rounding is lossy -- matmul() builds it
+ * from the ORIGINAL floats as amax/127, and using the fp16 round-trip instead
+ * shifts results by ~1.3e-4 relative (measured; it is exactly why a batched
+ * prefill once disagreed with the same row computed by matmul()).
+ *
+ * This recomputes amax/127 from the int8 payload. The quantiser produced each
+ * block with id = 127/amax, so amax = max|q| * delta and delta = amax/127
+ * follows -- reproducing matmul()'s deltas without the original floats, which
+ * the multi engine no longer has once a job has been quantised.
+ *
+ * `act` is n_batch rows of block_q8_0; writes n_batch*(n/32) floats into `d`. */
+void sgemm_q8_0_act_deltas(const void *act, int n_batch, int n, float *d)
+{
+    if (!act || !d || n_batch < 1 || n < 32 || (n % 32) != 0) return;
+    const int nb = n / 32;
+    const block_q8_0 *b = (const block_q8_0 *)act;
+    for (int r = 0; r < n_batch; r++) {
+        for (int i = 0; i < nb; i++) {
+            const block_q8_0 *blk = &b[(size_t)r * nb + i];
+            int amax = 0;
+            for (int j = 0; j < 32; j++) {
+                const int q = blk->qs[j];
+                const int a = q < 0 ? -q : q;
+                if (a > amax) amax = a;
+            }
+            const float dt = fp16_to_fp32(blk->d);
+            d[(size_t)r * nb + i] = (amax > 0) ? (float)amax * dt / 127.0f : dt;
+        }
+    }
+}
+
 /* Q4_K x Q8_K GEMM public API. Called from tensor.c.
  * m = weight rows (d), n = activation rows (n_batch)
  * k_blocks_q4k = n_values / 256
