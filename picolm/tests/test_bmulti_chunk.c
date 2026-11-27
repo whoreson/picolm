@@ -326,6 +326,11 @@ int main(void)
         { "q2_k",    GGUF_TYPE_Q2_K    },
         { "iq4_xs",  GGUF_TYPE_IQ4_XS  },
         { "iq2_k",   GGUF_TYPE_IQ2_K   },
+        { "iq4_k",   GGUF_TYPE_IQ4_K   },
+        /* NOTE: the rows_per_block > 1 (interleaved R4/R8) types are absent on
+         * purpose -- see the comment in tensor_matmul_batch_multi_ok(). Their
+         * logical-row stride is not row * row_size, so the chunked call this
+         * test performs cannot express them. */
         { "iq4_nl",  GGUF_TYPE_IQ4_NL  },
         { "q8_0",    GGUF_TYPE_Q8_0    },
         { "q4_0",    GGUF_TYPE_Q4_0    },

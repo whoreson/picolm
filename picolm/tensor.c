@@ -5933,19 +5933,28 @@ int tensor_matmul_batch_multi_ok(gguf_type_t qtype, int n, int d) {
      *   chunk-safe, table GEMM:  iq6_k, iq3_xxs, iq3_s, iq3_k, q6_k, q5_k,
      *                            q3_k, q2_k, iq4_xs, iq2_k
      *   listed here:             iq6_k, iq3_xxs, iq3_s
-     *   not yet listed:          iq3_k, q6_k, q5_k, q3_k, q2_k, iq4_xs, iq2_k
-     *     -> they PASS the chunk test; they are omitted only because nothing
-     *        in this tree has exercised them end-to-end as MoE experts yet.
-     *        Add them here once a model in that quant has been diffed against
-     *        the sequential reference (the check is the same one used for
-     *        IQ3_XXS: PICOLM_GLM5_MOE_EP=0 output vs default output).
+     *   not yet listed, but SHOULD BE TRIED (has a fn_gemm, untested):
+     *     iq4_k      -- sgemm_iq4_k_q8_k_best, same kq_best shape as the rest.
+     *                    Add "iq4_k" to tests/test_bmulti_chunk.c's type table
+     *                    first; it is missing there, so it has never been run.
      *
-     *   structurally CANNOT use this engine (no type_info fn_gemm; their GEMM
-     *   lives in a dedicated matmul_batch branch or in picolm_sgemm_d, which
-     *   this job-list interface cannot address):
-     *     q4_k (via picolm_sgemm_d_q4k), q8_0, q4_0, q5_0, iq4_nl (picolm_sgemm_d)
-     *     Supporting them means giving those types a proper row-slice fn_gemm
-     *     first -- a real piece of work, not a list edit.
+     *   structurally CANNOT use this engine: rows_per_block > 1
+     *     (iq2_k_r4, iq3_k_r4, iq4_k_r4, iq4_nl_r4, q5_k_r4, q4_k_r4, q2_k_r4,
+     *      iq3_xxs_r4, iq4_xs_r8, q6_k_r4, q4_0_r8, q8_k_r8, q4_0_4_4,
+     *      q4_0_4_8, q4_0_8_8, q4i_0_8_8, q8_0_r8)
+     *     These interleave 4 (or 8) logical rows inside every block, so the byte
+     *     offset of logical row r is NOT r * gguf_type_row_size(); it is
+     *     (r / rpb) * row_size * rpb + (r % rpb) within that group.
+     *     bmulti_gemm_task computes `W + r0 * row_bytes` and `out + r0`, which
+     *     is wrong for them by construction -- they would read the wrong rows
+     *     rather than merely split them badly. Supporting them needs the job
+     *     list to carry rows_per_block and the task to translate a logical row
+     *     range into whole interleaved groups. Real work; do not "just add them".
+     *
+     *   no fn_gemm at all (their GEMM lives in a dedicated matmul_batch branch,
+     *   or they have no table GEMM at all):
+     *     q4_1, q5_1, q1_0, q2_0, q6_0, q4_0_4_4/4_8/8_8, iq1_s, iq2_xxs,
+     *     iq2_xs, iq2_s, q8_k, and the F32/F16/BF16 family (no quantisation).
      *
      * To add one:
      *   1. run `PICOLM_BMULTI_TEST_TYPES=<name> make check-bmulti-chunk`
@@ -5974,6 +5983,7 @@ int tensor_matmul_batch_multi_ok(gguf_type_t qtype, int n, int d) {
     case GGUF_TYPE_Q2_K:
     case GGUF_TYPE_IQ4_XS:
     case GGUF_TYPE_IQ2_K:
+    case GGUF_TYPE_IQ4_K:
     /* These four/five reach their GEMM through the adapters at the bottom of
      * sgemm_iq6_k.c: picolm_sgemm_d for the Q8_0-activation family, and
      * picolm_sgemm_d_q4k for Q4_K (whose table entry was NULL on non-NEON). */
