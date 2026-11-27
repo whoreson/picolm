@@ -3012,10 +3012,26 @@ typedef struct {
 /* Table-driven GEMM task wrapper: dispatches through type_info_t->fn_gemm with
  * correct per-thread ith/nth. Used by matmul_batch's GEMM_table path. */
 typedef struct { int nrows, ncols, k; const void *w, *a; float *out; size_t bs;
-                 type_gemm_fn fn; int nth; } gemm_table_ctx_t;
+                 type_gemm_fn fn; int nth;
+                 /* Per-DISPATCH "someone computed something" flag. This used to
+                  * be a single file-scope `static volatile int
+                  * gemm_table_any_ok`, reset by the caller of every dispatch.
+                  *
+                  * That is only correct while exactly one dispatch is in
+                  * flight. glm5_moe_ffn_batch_ep_any() breaks that: it issues
+                  * matmul_batch() from INSIDE tensor_parallel_for worker tasks
+                  * (one task per expert), so several matmul_batch calls run
+                  * concurrently and each resets/reads the shared flag.
+                  * DeepSeek V3's routed experts are IQ3_XXS with n_e in 2..3,
+                  * which takes the GEMM_table path, so one expert's reset landed
+                  * between another expert's writes and its gemm_table_check() --
+                  * aborting with "fn_gemm returned 0" on a perfectly
+                  * implemented kernel. Keeping the flag in the ctx makes it
+                  * per-call by construction. */
+                 volatile int any_ok; } gemm_table_ctx_t;
 
-/* Set by any thread whose fn_gemm call did real work. See gemm_table_task. */
-static volatile int gemm_table_any_ok;
+/* Set by any thread whose fn_gemm call did real work. See gemm_table_task.
+ * Per-dispatch: belongs to gemm_table_ctx_t, not to the process. */
 
 static void gemm_table_task(int idx, void *ctxp) {
     gemm_table_ctx_t *c = (gemm_table_ctx_t *)ctxp;
@@ -3048,12 +3064,12 @@ static void gemm_table_task(int idx, void *ctxp) {
      *
      * So: record that *someone* succeeded, and only abort at the end if no
      * thread did. */
-    if (r != 0) gemm_table_any_ok = 1;
+    if (r != 0) c->any_ok = 1;
 }
 
 /* Called once after the dispatch completes; aborts if nothing was computed. */
-static void gemm_table_check(int nrows, int ncols, int k) {
-    if (gemm_table_any_ok) return;
+static void gemm_table_check(const gemm_table_ctx_t *c, int nrows, int ncols, int k) {
+    if (c->any_ok) return;
     fprintf(stderr,
             "FATAL: fn_gemm returned 0 (no implementation for this SIMD build).\n"
             "       nrows=%d ncols=%d k=%d nth=%d. Check the sgemm_*.c source.\n",
@@ -3601,8 +3617,10 @@ void matmul_batch(float *out, const float *x, int n_batch,
             if (qtype == GGUF_TYPE_BF16 && !panel_off) {
                 size_t pbytes = picolm_sgemm_bf16_panel_bytes(n_batch, n);
                 if (pbytes) {
-                    static void *bf16_panel = NULL;
-                    static size_t bf16_panel_size = 0;
+                    /* Per-thread, like act_scratch above: the MoE expert
+                     * tasks call matmul_batch() concurrently. */
+                    static PICOLM_TLS void *bf16_panel = NULL;
+                    static PICOLM_TLS size_t bf16_panel_size = 0;
                     if (pbytes > bf16_panel_size) {
                         void *np = realloc(bf16_panel, pbytes);
                         if (np) { bf16_panel = np; bf16_panel_size = pbytes; }
@@ -3675,9 +3693,19 @@ void matmul_batch(float *out, const float *x, int n_batch,
     }
 
     /* Quantized path: try GEMM first, then fall back to threaded worker.
-     * Use a persistent scratch buffer to avoid malloc/free per call. */
-    static void *act_scratch = NULL;
-    static size_t act_scratch_size = 0;
+     * Use a persistent scratch buffer to avoid malloc/free per call.
+     *
+     * These MUST be per-thread. matmul_batch() serialises its own pool
+     * dispatch when called from inside one (tl_in_parallel, above), but the
+     * buffer is still shared state: glm5_moe_ffn_batch_ep_any() dispatches
+     * one matmul_batch() per expert from tensor_parallel_for worker tasks,
+     * so N experts quantised their activations into this ONE buffer
+     * concurrently. Whoever lost the race computed its expert against another
+     * expert's activations -- silently, with no crash, which is exactly the
+     * garbage output it produced on DeepSeek V3. matmul()'s mm_scratch below
+     * was already PICOLM_TLS for the same reason; this one was missed. */
+    static PICOLM_TLS void *act_scratch = NULL;
+    static PICOLM_TLS size_t act_scratch_size = 0;
     /* Over-allocate for any activation format: Q8_0 is 34 bytes/32 vals, Q8_K is 260 bytes/256 vals.
      * Q8_K is the largest common format: 256 * (sizeof(block_q8_K)) / 256 + delta = ~264 bytes per 256 values.
      * Use a generous upper bound: n_batch * n * 2 bytes (covers all quant formats). */
@@ -3749,10 +3777,9 @@ void matmul_batch(float *out, const float *x, int n_batch,
         /* Row-partitioned kernels: use the full pool (see gemm_table_task). */
         int nth = n_threads;
         /* Use a task wrapper that passes the table's fn_gemm with correct ith */
-        gemm_table_ctx_t ctx = { d, n_batch, n, W, qb.qbuf, out, d, ti->fn_gemm, nth };
-        gemm_table_any_ok = 0;
+        gemm_table_ctx_t ctx = { d, n_batch, n, W, qb.qbuf, out, d, ti->fn_gemm, nth, 0 };
         tensor_parallel_for(nth, gemm_table_task, &ctx);
-        gemm_table_check(d, n_batch, n);
+        gemm_table_check(&ctx, d, n_batch, n);
         DISPATCH("GEMM_table");
         free_quant_buf(&qb, NULL);
         return;

@@ -1075,6 +1075,20 @@ float *model_forward_prefill_deepseek2(model_t *m, const int *tokens, int n_toke
     const int KHK = c->glm5_mla_head_dim;   /* NOPE + ROPE */
     const int LROW = KVL + ROPE;            /* cache row width */
     const int HVNH = NH * HV;               /* output concat width */
+    /* The batched path writes KV rows [start_pos, start_pos + n_tokens) with no
+     * per-row check (decode checks pos >= max_seq_len). A caller handing in more
+     * than fits would write past this layer's cache region into the next
+     * layer's rows / the rest of the state arena. Clamp instead. */
+    if (start_pos < 0 || start_pos >= c->max_seq_len) {
+        fprintf(stderr, "WARN: model_forward_prefill_deepseek2 start_pos=%d >= max_seq_len=%d\n",
+                start_pos, c->max_seq_len);
+        return s->logits;
+    }
+    if (n_tokens > c->max_seq_len - start_pos) {
+        fprintf(stderr, "WARN: model_forward_prefill_deepseek2 clamping %d tokens at pos %d to max_seq_len=%d\n",
+                n_tokens, start_pos, c->max_seq_len);
+        n_tokens = c->max_seq_len - start_pos;
+    }
     const size_t NT = (size_t)n_tokens;
 
     /* Per-token scratch arena. Buffers:
@@ -1779,6 +1793,9 @@ typedef struct {
     int n_tokens, start_pos, NH, KVL, ROPE, NOPE, KHK, LROW;
     float scale;
     int nTB, perm;            /* token blocks and stride permutation */
+    float *scratch;           /* [nslots][slot] heap scratch, one slot per pool thread */
+    size_t slot;              /* floats per slot: MAXR*(KVL + BK + LROW) */
+    int nslots;
 } ds2_pfa_t;
 
 static void ds2_pfa_task(int idx, void *vp)
@@ -1793,12 +1810,26 @@ static void ds2_pfa_task(int idx, void *vp)
     const int R = tn * hn;
     if (R <= 0) return;
 
-    /* Fixed-size stack arrays (matching glm5_pfa_task's strategy).
-     * Total stack: O=128KB, S=16KB, qcomb=~230KB, m/l=512B, qp/lim=~3KB = ~378 KB. */
-    float O[DS2_PFA_MAXR * DS2_PFA_MAXKVL];
-    float S[DS2_PFA_MAXR * DS2_PFA_BK];
+    /* O / S / qcomb (~295 KB at KVL=512) live in a per-thread HEAP slot, not
+     * on the stack: pool workers get the platform's default thread stack
+     * (512 KB on macOS, 1 MB bionic, 128 KB musl, RLIMIT_STACK on glibc) and
+     * this task segfaulted outright once the stack dropped below ~320 KB.
+     * Only the small per-row arrays stay on the stack (~1.3 KB). */
+    float *own = NULL, *slot_p;
+    {
+        const int tid = tensor_get_thread_id();
+        if (tid >= 0 && tid < x->nslots) {
+            slot_p = x->scratch + (size_t)tid * x->slot;
+        } else {   /* unexpected thread id: private scratch, never shared */
+            own = (float *)malloc(x->slot * sizeof(float));
+            if (!own) { fprintf(stderr, "ds2_pfa_task: out of memory\n"); abort(); }
+            slot_p = own;
+        }
+    }
+    float *O     = slot_p;
+    float *S     = O + (size_t)DS2_PFA_MAXR * KVL;
+    float *qcomb = S + (size_t)DS2_PFA_MAXR * DS2_PFA_BK;
     float m_arr[DS2_PFA_MAXR], l_arr[DS2_PFA_MAXR];
-    float qcomb[DS2_PFA_MAXR * DS2_PFA_MAXLROW];
     const float *qp[DS2_PFA_MAXR];
     int lim[DS2_PFA_MAXR];
 
@@ -1895,6 +1926,7 @@ static void ds2_pfa_task(int idx, void *vp)
             float *dst = x->ctx_batch + ((size_t)(t0 + tt) * NH + h0 + hh) * KVL;
             for (int d = 0; d < KVL; d++) dst[d] = o[d] * inv;
         }
+    free(own);
 }
 
 /* Returns 1 if it ran (caller falls back to the serial kernel on 0). */
@@ -1930,6 +1962,19 @@ static int ds2_prefill_attn_pfa(const model_t *m, int layer, run_state_t *s,
     x.NH = NH; x.KVL = KVL; x.ROPE = ROPE; x.NOPE = NOPE;
     x.KHK = KHK; x.LROW = LROW;
     x.scale = scale; x.nTB = nTB; x.perm = perm;
+    {
+        static float *buf = NULL; static size_t cap = 0;
+        int nslots = tensor_get_n_threads();
+        if (nslots < 1) nslots = 1;
+        const size_t slot = (size_t)DS2_PFA_MAXR * ((size_t)KVL + DS2_PFA_BK + (size_t)LROW);
+        const size_t need = slot * (size_t)nslots;
+        if (need > cap) {
+            float *nb = (float *)realloc(buf, need * sizeof(float));
+            if (!nb) return 0;            /* caller falls back to the serial loop */
+            buf = nb; cap = need;
+        }
+        x.scratch = buf; x.slot = slot; x.nslots = nslots;
+    }
 
     tensor_parallel_for(nHG * nTB, ds2_pfa_task, &x);
     return 1;

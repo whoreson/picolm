@@ -3430,10 +3430,25 @@ static void glm5_ep_expert_task(int e, void *vp)
     const int n_e = x->count[e];
     if (n_e <= 0) return;
 
-    const int *bk = x->bucket + x->cursor[e];
+    /* Each expert writes to its own slice of xbuf/gu/gu2/dwn, starting at
+     * cursor[e] (the bucket offset). Without this, concurrent experts
+     * clobber each other's intermediate buffers.
+     *
+     * xbuf belongs in this list too. The first cut of this fix sliced only
+     * gu/gu2/dwn, leaving xbuf a single shared NT*D buffer that every expert
+     * gathered its activations into at offset 0: each expert then GEMM'd
+     * whatever the last writer had left there. gate_stride/down_stride are
+     * unchanged (they index weight rows, not activations). */
+    const int pos = x->cursor[e];
+    float *xbuf = x->xbuf + (size_t)pos * x->D;
+    float *gu   = x->gu   + (size_t)pos * x->FF;
+    float *gu2  = x->gu2  + (size_t)pos * x->FF;
+    float *dwn  = x->dwn  + (size_t)pos * x->D;
+
+    const int *bk = x->bucket + pos;
     /* Gather activations: bk[i] = t*x->AK + k, so token = bk[i] / x->AK */
     for (int i = 0; i < n_e; i++)
-        memcpy(x->xbuf + (size_t)i * x->D,
+        memcpy(xbuf + (size_t)i * x->D,
                x->cur_b + (size_t)(bk[i] / x->AK) * x->D,
                (size_t)x->D * sizeof(float));
 
@@ -3442,17 +3457,17 @@ static void glm5_ep_expert_task(int e, void *vp)
     const void *down_w = (const uint8_t *)x->down_exps + (size_t)e * x->down_stride;
 
     if (n_e == 1) {
-        matmul(x->gu,  x->xbuf, gate_w, x->D, x->FF, x->gate_t);
-        matmul(x->gu2, x->xbuf, up_w,   x->D, x->FF, x->up_t);
+        matmul(gu,  xbuf, gate_w, x->D, x->FF, x->gate_t);
+        matmul(gu2, xbuf, up_w,   x->D, x->FF, x->up_t);
     } else {
-        matmul_batch(x->gu,  x->xbuf, n_e, gate_w, x->D, x->FF, x->gate_t);
-        matmul_batch(x->gu2, x->xbuf, n_e, up_w,   x->D, x->FF, x->up_t);
+        matmul_batch(gu,  xbuf, n_e, gate_w, x->D, x->FF, x->gate_t);
+        matmul_batch(gu2, xbuf, n_e, up_w,   x->D, x->FF, x->up_t);
     }
 
     /* SwiGLU */
     for (int i = 0; i < n_e; i++) {
-        float *g = x->gu  + (size_t)i * x->FF;
-        float *u = x->gu2 + (size_t)i * x->FF;
+        float *g = gu  + (size_t)i * x->FF;
+        float *u = gu2 + (size_t)i * x->FF;
         for (int j = 0; j < x->FF; j++) {
             float gv = g[j], uv = u[j];
             if (x->clamp_v > 0.0f) {
@@ -3463,13 +3478,13 @@ static void glm5_ep_expert_task(int e, void *vp)
         }
     }
 
-    if (n_e == 1) matmul(x->dwn, x->gu, down_w, x->FF, x->D, x->down_t);
-    else          matmul_batch(x->dwn, x->gu, n_e, down_w, x->FF, x->D, x->down_t);
+    if (n_e == 1) matmul(dwn, gu, down_w, x->FF, x->D, x->down_t);
+    else          matmul_batch(dwn, gu, n_e, down_w, x->FF, x->D, x->down_t);
 
     /* Scatter to slot_out (indexed by original bucket position) */
     for (int i = 0; i < n_e; i++)
         memcpy(x->slot_out + (size_t)bk[i] * x->D,
-               x->dwn + (size_t)i * x->D,
+               dwn + (size_t)i * x->D,
                (size_t)x->D * sizeof(float));
 }
 
@@ -3494,29 +3509,57 @@ static int glm5_moe_ffn_batch_ep_any(const model_t *m, const glm5_layer_weights_
         !ep_grow((void **)&count, &c_cnt,   (NE + 1) * sizeof(int)) ||
         !ep_grow((void **)&cursor,&c_cur,   (NE + 1) * sizeof(int)) ||
         !ep_grow((void **)&bucket,&c_bkt,   pairs * sizeof(int)) ||
-        !ep_grow((void **)&xbuf,  &c_xbuf,  NT * D * sizeof(float)) ||
+        !ep_grow((void **)&xbuf,  &c_xbuf,  pairs * D * sizeof(float)) ||
         !ep_grow((void **)&gu,    &c_gu,    NT * AK * FF * sizeof(float)) ||
         !ep_grow((void **)&gu2,   &c_gu2,   NT * AK * FF * sizeof(float)) ||
         !ep_grow((void **)&dwn,   &c_dwn,   NT * AK * D * sizeof(float)) ||
-        !ep_grow((void **)&slot_out, &c_slot, pairs * D * sizeof(float))) return 0;
+        !ep_grow((void **)&slot_out, &c_slot, pairs * D * sizeof(float))) {
+        return 0;
+    }
 
     /* Routing (serial, cheap: NE matmuls over [D]) */
-    memset(count, 0, (size_t)NE * sizeof(int));
+    static int *sel_count = NULL; static size_t c_sel_count = 0;
+    static float *sel_logits = NULL; static size_t c_sel_logits = 0;
+    if (!ep_grow((void **)&sel_count, &c_sel_count, (size_t)NE * sizeof(int))) return 0;
+    if (!ep_grow((void **)&sel_logits, &c_sel_logits, (size_t)NE * sizeof(float))) return 0;
+    memset(sel_count, 0, (size_t)NE * sizeof(int));
     for (int t = 0; t < NT; t++) {
         const float *cur = cur_b + (size_t)t * D;
         matmul(probs, cur, lw->ffn_gate_inp, D, NE, lw->type_ffn_gate_inp);
+        /* Selection logits (sigmoid(p) + bias) live in a heap buffer sized by
+         * NE, not a fixed `float logits_buf[512]` on the stack.
+         *
+         * The stack array had NO check against NE: the commit that added this
+         * path declared it for the largest expert count anyone was testing
+         * (GLM-5's 128) and DeepSeek-V3's 256 still happened to fit, so the
+         * overflow it causes on any model with NE > 512 was never seen -- but
+         * more importantly it was never *checked*. Note that `probs` above is
+         * a stack float[512] that IS checked (in glm5_moe_ffn, against
+         * NE > 512); this loop had no such guard. Ep_grow also keeps the
+         * allocation across layers, like every other buffer in this function.
+         *
+         * SEMANTICS (must match the reference exactly): probs[] holds the
+         * sigmoid PROBABILITIES -- they are the expert weights. sel_logits[] is
+         * a copy that gets the selection bias added and then the -1e30 marks
+         * from the top-k walk. An earlier version of this fix sigmoidized only
+         * sel_logits and left probs as raw router logits, so `wt[k] =
+         * probs[sl[k]]` below folded RAW LOGITS into the output weights: the
+         * whole layer came out ~30% wrong RMS on every token. The reference
+         * sigmoidizes probs in place and memcpy's the selection copy; do the
+         * same. (Note: negative router logits made the weights negative, which
+         * is why the DeepSeek-V3 failure looked like random text rather than
+         * a subtle drift.) */
         for (int i = 0; i < NE; i++) probs[i] = 1.0f / (1.0f + expf(-probs[i]));
-        float logits_buf[512];
-        memcpy(logits_buf, probs, (size_t)NE * sizeof(float));
+        memcpy(sel_logits, probs, (size_t)NE * sizeof(float));
         if (gw->exp_probs_b) {
             const float *bias = (const float *)gw->exp_probs_b;
-            for (int i = 0; i < NE; i++) logits_buf[i] += bias[i];
+            for (int i = 0; i < NE; i++) sel_logits[i] += bias[i];
         }
         int *sl = sel + (size_t)t * AK; float *wt = wts + (size_t)t * AK;
         for (int k = 0; k < AK; k++) {
             int best = -1; float bv = -1e30f;
-            for (int i = 0; i < NE; i++) if (logits_buf[i] > bv) { bv = logits_buf[i]; best = i; }
-            sl[k] = best; logits_buf[best] = -1e30f; count[best]++;
+            for (int i = 0; i < NE; i++) if (sel_logits[i] > bv) { bv = sel_logits[i]; best = i; }
+            sl[k] = best; sel_logits[best] = -1e30f; sel_count[best]++;
         }
         float sum = 0.f;
         for (int k = 0; k < AK; k++) { wt[k] = probs[sl[k]]; sum += wt[k]; }
@@ -3524,7 +3567,9 @@ static int glm5_moe_ffn_batch_ep_any(const model_t *m, const glm5_layer_weights_
         for (int k = 0; k < AK; k++) wt[k] *= sc2;
     }
 
-    /* Bucket */
+    /* Bucket: use sel_count (accumulated during routing) to build cursors,
+     * then use count as the fill counter. */
+    memcpy(count, sel_count, (size_t)NE * sizeof(int));
     { int acc = 0; for (int e = 0; e < NE; e++) { cursor[e] = acc; acc += count[e]; } cursor[NE] = acc; }
     memset(count, 0, (size_t)NE * sizeof(int));
     for (int t = 0; t < NT; t++)
