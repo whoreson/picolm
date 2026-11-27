@@ -3581,15 +3581,165 @@ static int glm5_moe_ffn_batch_ep_any(const model_t *m, const glm5_layer_weights_
     /* Zero output accumulators */
     memset(out_b, 0, (size_t)NT * D * sizeof(float));
 
-    /* Parallel expert dispatch */
-    size_t gate_stride = (size_t)FF * gguf_type_row_size(lw->type_ffn_gate_exps, D);
-    size_t down_stride = (size_t)D  * gguf_type_row_size(lw->type_ffn_down_exps, FF);
-    ep_task_t ctx = { cur_b, bucket, count, cursor,
-                      xbuf, gu, gu2, dwn, slot_out,
-                      gate_stride, down_stride,
-                      D, FF, AK, lw->type_ffn_gate_exps, lw->type_ffn_up_exps, lw->type_ffn_down_exps,
-                      clamp_v, lw->ffn_gate_exps, lw->ffn_up_exps, lw->ffn_down_exps };
-    tensor_parallel_for(NE, glm5_ep_expert_task, &ctx);
+    /* ---- Expert compute ----------------------------------------------------
+     *
+     * Two strategies, picked by what the weight quantisation supports:
+     *
+     *  BATCHED (preferred). Gather every routed pair into one [pairs][D] block,
+     *  then issue ALL experts' gate GEMMs as a single tensor_matmul_batch_multi()
+     *  job list, SwiGLU the whole block, then all UP GEMMs, SwiGLU again, then
+     *  all DOWN GEMMs. One dispatch per phase across the full pool, and each
+     *  expert's weights are streamed once for all its tokens.
+     *
+     *  PER-EXPERT (fallback). One tensor_parallel_for task per expert, each
+     *  calling matmul/matmul_batch internally. That is only correct-ish and
+     *  NOT faster: the tasks run with tl_in_parallel set, so matmul_batch
+     *  serialises its own pool dispatch and the whole GEMM runs on one thread.
+     *  Measured 378 ms/layer vs the sequential reference's 260 ms on
+     *  DeepSeek-V3, i.e. 25%% slower end-to-end. Kept for quant types that are
+     *  not yet on tensor_matmul_batch_multi_ok()'s trust list.
+     *
+     * The batched path needs a gather buffer laid out exactly like the bucket
+     * (pos, not i) because the job list addresses experts by cursor[e]. */
+    const size_t gate_stride = (size_t)FF * gguf_type_row_size(lw->type_ffn_gate_exps, D);
+    const size_t down_stride = (size_t)D  * gguf_type_row_size(lw->type_ffn_down_exps, FF);
+
+    int use_batched = tensor_matmul_batch_multi_ok(lw->type_ffn_gate_exps, D, FF) &&
+                      tensor_matmul_batch_multi_ok(lw->type_ffn_up_exps,   D, FF) &&
+                      tensor_matmul_batch_multi_ok(lw->type_ffn_down_exps, FF, D);
+    {
+        static int forced = -1;
+        if (forced < 0) {
+            const char *e = getenv("PICOLM_EP_BATCHED");
+            forced = e ? (atoi(e) ? 1 : -2) : 0;
+        }
+        if (forced == 1) use_batched = 1;
+        else if (forced == -2) use_batched = 0;
+    }
+
+    if (use_batched) {
+        /* 1. Gather: row q of xbuf holds the activation of bucket[q]'s token,
+         *    so expert e's input is the contiguous slice
+         *    [cursor[e], cursor[e]+count[e]). */
+        for (int q = 0; q < (int)pairs; q++) {
+            const int ts = bucket[q];
+            memcpy(xbuf + (size_t)q * D, cur_b + (size_t)(ts / AK) * D,
+                   (size_t)D * sizeof(float));
+        }
+
+        /* 2. Job list: gate+up for every expert with >= 2 rows (single-row
+         *    experts go through matmul() to keep the exact decode-path
+         *    kernel -- see the note in glm5_moe_ffn_batch_ref). */
+        static mm_bjob_t *jobs = NULL; static size_t c_jobs = 0;
+        const size_t need_jobs = 2 * (size_t)NE;
+        if (!ep_grow((void **)&jobs, &c_jobs, need_jobs * sizeof(mm_bjob_t))) return 0;
+
+        int nj = 0;
+        for (int e = 0; e < NE; e++) {
+            const int n_e = count[e];
+            if (n_e < 2) continue;
+            const int pos = cursor[e];
+            jobs[nj++] = (mm_bjob_t){ gu  + (size_t)pos * FF, xbuf + (size_t)pos * D,
+                                      (const uint8_t *)lw->ffn_gate_exps + (size_t)e * gate_stride,
+                                      n_e, D, FF, lw->type_ffn_gate_exps };
+            jobs[nj++] = (mm_bjob_t){ gu2 + (size_t)pos * FF, xbuf + (size_t)pos * D,
+                                      (const uint8_t *)lw->ffn_up_exps + (size_t)e * gate_stride,
+                                      n_e, D, FF, lw->type_ffn_up_exps };
+        }
+        /* Single-row experts still need matmul() -- but that is a serial call,
+         * so run them through the per-expert task on their own (cheap: at most
+         * NE of them, each one GEMV). */
+        if (nj && !tensor_matmul_batch_multi(jobs, nj)) {
+            for (int j = 0; j < nj; j++)
+                matmul_batch(jobs[j].out, jobs[j].x, jobs[j].n_batch, jobs[j].W,
+                             jobs[j].n, jobs[j].d, jobs[j].qtype);
+        }
+
+        /* 3. gate/up for the n_e == 1 experts, plus SwiGLU for those rows. */
+        for (int e = 0; e < NE; e++) {
+            const int n_e = count[e];
+            if (n_e != 1) continue;
+            const int pos = cursor[e];
+            float *g = gu + (size_t)pos * FF, *u = gu2 + (size_t)pos * FF;
+            const float *xin = xbuf + (size_t)pos * D;
+            matmul(g, xin, (const uint8_t *)lw->ffn_gate_exps + (size_t)e * gate_stride,
+                   D, FF, lw->type_ffn_gate_exps);
+            matmul(u, xin, (const uint8_t *)lw->ffn_up_exps + (size_t)e * gate_stride,
+                   D, FF, lw->type_ffn_up_exps);
+            for (int j = 0; j < FF; j++) {
+                float gv = g[j], uv = u[j];
+                if (clamp_v > 0.0f) {
+                    gv = fminf(gv, clamp_v);
+                    uv = fminf(fmaxf(uv, -clamp_v), clamp_v);
+                }
+                g[j] = gv / (1.0f + expf(-gv)) * uv;
+            }
+        }
+
+        /* 4. SwiGLU over every multi-row expert's staged rows.  gu/gu2 are
+         * indexed by bucket position with a per-expert offset, so the rows are
+         * not contiguous across experts: walk each expert's slice. */
+        for (int e = 0; e < NE; e++) {
+            const int n_e = count[e];
+            if (n_e < 2) continue;
+            const int pos = cursor[e];
+            float *g = gu + (size_t)pos * FF, *u = gu2 + (size_t)pos * FF;
+            for (int i = 0; i < n_e; i++) {
+                float *gr = g + (size_t)i * FF, *ur = u + (size_t)i * FF;
+                for (int j = 0; j < FF; j++) {
+                    float gv = gr[j], uv = ur[j];
+                    if (clamp_v > 0.0f) {
+                        gv = fminf(gv, clamp_v);
+                        uv = fminf(fmaxf(uv, -clamp_v), clamp_v);
+                    }
+                    gr[j] = gv / (1.0f + expf(-gv)) * uv;
+                }
+            }
+        }
+
+        /* 5. All DOWN GEMMs in one dispatch. */
+        nj = 0;
+        for (int e = 0; e < NE; e++) {
+            const int n_e = count[e];
+            if (n_e < 2) continue;
+            const int pos = cursor[e];
+            jobs[nj++] = (mm_bjob_t){ dwn + (size_t)pos * D, gu + (size_t)pos * FF,
+                                      (const uint8_t *)lw->ffn_down_exps + (size_t)e * down_stride,
+                                      n_e, FF, D, lw->type_ffn_down_exps };
+        }
+        if (nj && !tensor_matmul_batch_multi(jobs, nj)) {
+            for (int j = 0; j < nj; j++)
+                matmul_batch(jobs[j].out, jobs[j].x, jobs[j].n_batch, jobs[j].W,
+                             jobs[j].n, jobs[j].d, jobs[j].qtype);
+        }
+        for (int e = 0; e < NE; e++) {
+            const int n_e = count[e];
+            if (n_e != 1) continue;
+            const int pos = cursor[e];
+            matmul(dwn + (size_t)pos * D, gu + (size_t)pos * FF,
+                   (const uint8_t *)lw->ffn_down_exps + (size_t)e * down_stride,
+                   FF, D, lw->type_ffn_down_exps);
+        }
+
+        /* 6. Scatter each expert slice to its (token, slot) homes. */
+        for (int e = 0; e < NE; e++) {
+            const int n_e = count[e];
+            if (n_e <= 0) continue;
+            const int pos = cursor[e];
+            const int *bk = bucket + pos;
+            for (int i = 0; i < n_e; i++)
+                memcpy(slot_out + (size_t)bk[i] * D, dwn + (size_t)(pos + i) * D,
+                       (size_t)D * sizeof(float));
+        }
+    } else {
+        /* Per-expert fallback (see the comment above on why this is slow). */
+        ep_task_t ctx = { cur_b, bucket, count, cursor,
+                          xbuf, gu, gu2, dwn, slot_out,
+                          gate_stride, down_stride,
+                          D, FF, AK, lw->type_ffn_gate_exps, lw->type_ffn_up_exps, lw->type_ffn_down_exps,
+                          clamp_v, lw->ffn_gate_exps, lw->ffn_up_exps, lw->ffn_down_exps };
+        tensor_parallel_for(NE, glm5_ep_expert_task, &ctx);
+    }
 
     /* Reduce in slot order */
     for (int t = 0; t < NT; t++)

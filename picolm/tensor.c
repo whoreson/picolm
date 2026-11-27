@@ -5918,12 +5918,38 @@ void tensor_parallel_for_dyn(int count, void (*fn)(int idx, void *ctx), void *ct
 
 int tensor_matmul_batch_multi_ok(gguf_type_t qtype, int n, int d) {
 #ifdef PICOLM_BMULTI
-    /* IQ6_K only: its table GEMM (sgemm_iq6_k_q8_k_best -> r8v/r8t/avx2) picks its kernel from
-     * ncols alone and computes each row group and each column independently, so splitting the
-     * rows into chunks or the work across any number of threads cannot change a single bit. */
+    /* Trust list: quant types whose table GEMM has been PROVEN safe to call on
+     * a row sub-range, i.e. fn_gemm(nr, ncols, n, W + r0*row_bytes, acts,
+     * out + r0, bs=d, 0, 1) computes exactly rows [r0, r0+nr) and writes
+     * nothing else. See tests/test_bmulti_chunk.c, which compares that call
+     * against a dequantise-and-dot oracle over the MoE FFN shapes.
+     *
+     * TODO(bmulti coverage): only two types are covered so far. Every quant
+     * type a user can put in a GGUF is a legitimate MoE expert type, so the
+     * rest must be verified and added here -- otherwise a MoE model in that
+     * quant silently gets no expert batching (and, on the expert-parallel
+     * path, is measurably SLOWER than the sequential reference). To add one:
+     *   1. run `PICOLM_BMULTI_TEST_TYPES=<name> make check-bmulti-chunk`
+     *   2. if it passes, add the type here and note the date/reason
+     *   3. if it fails, leave it out and either fix the kernel's row-slicing
+     *      or record here why it cannot be chunked.
+     * Known NOT yet verified (test exists, type absent from list):
+     *   q6_k, q4_k, q5_k, q3_k, q2_k, iq4_xs, iq2_k, iq4_nl, q8_0, q4_0,
+     *   iq3_k (its synthetic-weight generation in the test is also wrong:
+     *   the oracle returns ~1e8, so that row is untested, not proven bad).
+     *   Q8_0/Q4_0 in particular use ACT_FMT_Q8_0, not Q8_K, so they need the
+     *   activation-format branch in the test exercised before being trusted. */
     const type_info_t *ti = typeinfo(qtype);
-    return ti && ti->fn_gemm && ti->act_fmt == ACT_FMT_Q8_K && qtype == GGUF_TYPE_IQ6_K &&
-           n >= 256 && (n % 256) == 0 && d >= 8 && (d % 8) == 0;
+    if (!ti || !ti->fn_gemm || ti->act_fmt != ACT_FMT_Q8_K) return 0;
+    if (n < 256 || (n % 256) != 0 || d < 8 || (d % 8) != 0) return 0;
+    switch (qtype) {
+    case GGUF_TYPE_IQ6_K:   /* original entry */
+    case GGUF_TYPE_IQ3_XXS: /* verified for DeepSeek-V3 routed experts */
+    case GGUF_TYPE_IQ3_S:   /* verified; DeepSeek-V3 attention projections */
+        return 1;
+    default:
+        return 0;
+    }
 #else
     (void)qtype; (void)n; (void)d;
     return 0;
@@ -5970,11 +5996,26 @@ static void bmulti_gemm_task(int i, void *p) {
     if (r == 0) c->failed = 1;
 }
 
+/* Rows of a weight matrix per dispatch task.
+ *
+ * This was 64, which is right for ONE big job (a dense projection: you want ~24
+ * tasks to fill a 24-thread pool, no more) but wrong for the MoE job list. With
+ * 256 experts each having ~2000 rows, a 64-row chunk produces 250+ tasks for
+ * gate alone; the constant per-task cost (job-index load, kernel entry, its own
+ * row-partition arithmetic) stops being amortised and throughput drops.
+ *
+ * Measured on DeepSeek-V3 IQ3_XXS, 86-token prefill, gate+up+down:
+ *   64 rows  -> 22.4 s    128 -> 18.9 s    256 -> 17.1 s    384 -> 17.3 s
+ * The sequential reference for the same run is 21.4 s. 256 is the knee; larger
+ * only reduces the task count further and starts to hurt tail balance when a
+ * single expert has few rows.
+ *
+ * PICOLM_BMULTI_ROWS overrides it (rounded down to a multiple of 8, min 8). */
 static int bmulti_chunk_rows(void) {
     static int v = -1;
     if (v < 0) {
         const char *e = getenv("PICOLM_BMULTI_ROWS");
-        v = e ? atoi(e) : 64;
+        v = e ? atoi(e) : 256;
         if (v < 8) v = 8;
         v &= ~7;
     }

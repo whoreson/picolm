@@ -159,6 +159,33 @@ extern "C" {
 float fp16_to_fp32(uint16_t h);
 float fp16_to_fp32_lookup(uint16_t h);
 float bf16_to_fp32(uint16_t x);
+
+/* ===================================================================
+ * fp16_table_init() -- CALL THIS BEFORE ANY DEQUANTISER OR QUANT GEMM.
+ * ===================================================================
+ *
+ * Every block-quant format stores its scale as an fp16 word, and quant.c reads
+ * it through a 64K-entry lookup table (fp16_to_fp32_lookup) rather than doing
+ * the conversion inline. That table is NOT initialised automatically and
+ * float zero-initialises to 0.0f.
+ *
+ * The failure mode is the worst kind: no crash, no warning, no wrong pointer.
+ * Every scale silently becomes 0.0, so every dequantised weight and every dot
+ * product is 0. Consequences that have actually bitten this tree:
+ *
+ *  - A test that compares two implementations "passes" because 0 == 0.
+ *  - A benchmark measures nothing, because the kernels have no data.
+ *  - Formats whose dequantiser does NOT use the table (F32, and F16 on SIMD
+ *    builds where it uses native cvt instructions) still look correct, so a
+ *    mixed-format run makes it look like a format-specific bug.
+ *
+ * Callers: picolm/main initialisation, model_gguf.c's loader, every test that
+ * touches quant.c (see tests/test_gemm_f16_gpu.cu and
+ * tests/test_bmulti_chunk.c), and anything that calls dequantize_row*(),
+ * vec_dot*(), matmul*() or picolm_sgemm*() on quantised data.
+ *
+ * It is idempotent and cheap (one 64K pass), so calling it defensively at the
+ * top of a tool's main() is always correct. */
 void fp16_table_init(void);
 
 /* ARMv8.2 SDOT/UDOT (vdotq_laneq_s32 etc). Distinct from PICOLM_NEON since

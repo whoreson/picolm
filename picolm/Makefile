@@ -1004,6 +1004,19 @@ check-batch1: test_batch1_equals_matmul
 	./test_batch1_equals_matmul 1
 	./test_batch1_equals_matmul 8
 
+# tensor_matmul_batch_multi() slices each expert's weight matrix into
+# BMULTI_ROWS-row chunks and calls that type's fn_gemm on the sub-range
+# (ith=0, nth=1, W+r0*row_bytes, out+r0). That is only valid if the kernel
+# computes exactly those rows. This test is how a quant type earns its place
+# in tensor_matmul_batch_multi_ok()'s trust list: it compares the chunked
+# result against one full matmul_batch over the shapes the MoE FFN uses.
+test_bmulti_chunk: tests/test_bmulti_chunk.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) type_dispatch.h quant.h tensor.h
+	$(CC) $(TEST_NATIVE_CFLAGS) -I. -O2 -o $@ tests/test_bmulti_chunk.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
+
+.PHONY: check-bmulti-chunk
+check-bmulti-chunk: test_bmulti_chunk
+	PICOLM_BMULTI_TEST_VERBOSE=1 ./test_bmulti_chunk
+
 # The BF16 GEMMs unroll their k loop and finish the remainder separately, so a
 # mismatch between the loop advance and the number of emitted steps silently
 # skips a slice of k (and still returns plausible numbers). This checks every
