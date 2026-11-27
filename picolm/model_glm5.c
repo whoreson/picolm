@@ -3399,6 +3399,180 @@ static int ep_grow(void **p, size_t *cap, size_t bytes) {
     return 1;
 }
 
+/* ---- Expert-parallel MoE (any quant type) ----------------------------------------------
+ *
+ * Replaces the sequential-expert loop in glm5_moe_ffn_batch_ref with a parallel
+ * dispatch: each expert is an independent task. Routing, bucketing, and the
+ * shared expert are done serially on the main thread (they are cheap). The
+ * expensive per-expert gate/up/swiglu/down runs in parallel across the pool.
+ *
+ * Uses persistent buffers (ep_grow) to avoid malloc/free per layer. Falls back
+ * to the reference path on OOM. Not bit-identical to the reference for the
+ * routed part (the reduction order differs), but accurate to float rounding.
+ * The shared expert is batched via matmul_batch, reading weights once.
+ *
+ * ON by default; PICOLM_GLM5_MOE_EP=0 disables. PICOLM_GLM5_SHEXP_BATCH=0
+ * keeps the shared expert per-token. */
+
+typedef struct {
+    const float *cur_b; const int *bucket; const int *count; const int *cursor;
+    float *xbuf, *gu, *gu2, *dwn, *slot_out;
+    size_t gate_stride, down_stride;
+    int D, FF, AK; gguf_type_t gate_t, up_t, down_t;
+    float clamp_v;
+    const void *gate_exps, *up_exps, *down_exps;
+} ep_task_t;
+
+static void glm5_ep_expert_task(int e, void *vp)
+{
+    const ep_task_t *x = (const ep_task_t *)vp;
+    if (e >= 0) { /* bounds check done by caller */ }
+    const int n_e = x->count[e];
+    if (n_e <= 0) return;
+
+    const int *bk = x->bucket + x->cursor[e];
+    /* Gather activations: bk[i] = t*x->AK + k, so token = bk[i] / x->AK */
+    for (int i = 0; i < n_e; i++)
+        memcpy(x->xbuf + (size_t)i * x->D,
+               x->cur_b + (size_t)(bk[i] / x->AK) * x->D,
+               (size_t)x->D * sizeof(float));
+
+    const void *gate_w = (const uint8_t *)x->gate_exps + (size_t)e * x->gate_stride;
+    const void *up_w   = (const uint8_t *)x->up_exps   + (size_t)e * x->gate_stride;
+    const void *down_w = (const uint8_t *)x->down_exps + (size_t)e * x->down_stride;
+
+    if (n_e == 1) {
+        matmul(x->gu,  x->xbuf, gate_w, x->D, x->FF, x->gate_t);
+        matmul(x->gu2, x->xbuf, up_w,   x->D, x->FF, x->up_t);
+    } else {
+        matmul_batch(x->gu,  x->xbuf, n_e, gate_w, x->D, x->FF, x->gate_t);
+        matmul_batch(x->gu2, x->xbuf, n_e, up_w,   x->D, x->FF, x->up_t);
+    }
+
+    /* SwiGLU */
+    for (int i = 0; i < n_e; i++) {
+        float *g = x->gu  + (size_t)i * x->FF;
+        float *u = x->gu2 + (size_t)i * x->FF;
+        for (int j = 0; j < x->FF; j++) {
+            float gv = g[j], uv = u[j];
+            if (x->clamp_v > 0.0f) {
+                gv = fminf(gv, x->clamp_v);
+                uv = fminf(fmaxf(uv, -x->clamp_v), x->clamp_v);
+            }
+            g[j] = gv / (1.0f + expf(-gv)) * uv;
+        }
+    }
+
+    if (n_e == 1) matmul(x->dwn, x->gu, down_w, x->FF, x->D, x->down_t);
+    else          matmul_batch(x->dwn, x->gu, n_e, down_w, x->FF, x->D, x->down_t);
+
+    /* Scatter to slot_out (indexed by original bucket position) */
+    for (int i = 0; i < n_e; i++)
+        memcpy(x->slot_out + (size_t)bk[i] * x->D,
+               x->dwn + (size_t)i * x->D,
+               (size_t)x->D * sizeof(float));
+}
+
+/* Returns 1 if it handled the layer, 0 to fall back to the reference path. */
+static int glm5_moe_ffn_batch_ep_any(const model_t *m, const glm5_layer_weights_t *gw,
+                                     const layer_weights_t *lw, run_state_t *s,
+                                     const float *cur_b, float *out_b, int NT, int layer_idx)
+{
+    const model_config_t *c = &m->config;
+    const int D = c->n_embd, NE = c->n_expert, AK = c->n_expert_used, FF = c->n_ff_exp;
+    const float clamp_v = glm5_clamp_value(c);
+    if (NT < 2 || NE > 512 || NE < 1 || AK < 1) return 0;
+
+    /* Persistent buffers */
+    static int *sel, *count, *cursor, *bucket;
+    static float *wts, *probs, *xbuf, *gu, *gu2, *dwn, *slot_out;
+    static size_t c_sel, c_cnt, c_cur, c_bkt, c_wts, c_probs, c_xbuf, c_gu, c_gu2, c_dwn, c_slot;
+    const size_t pairs = (size_t)NT * AK;
+    if (!ep_grow((void **)&sel,   &c_sel,   pairs * sizeof(int)) ||
+        !ep_grow((void **)&wts,   &c_wts,   pairs * sizeof(float)) ||
+        !ep_grow((void **)&probs, &c_probs, NE * sizeof(float)) ||
+        !ep_grow((void **)&count, &c_cnt,   (NE + 1) * sizeof(int)) ||
+        !ep_grow((void **)&cursor,&c_cur,   (NE + 1) * sizeof(int)) ||
+        !ep_grow((void **)&bucket,&c_bkt,   pairs * sizeof(int)) ||
+        !ep_grow((void **)&xbuf,  &c_xbuf,  NT * D * sizeof(float)) ||
+        !ep_grow((void **)&gu,    &c_gu,    NT * AK * FF * sizeof(float)) ||
+        !ep_grow((void **)&gu2,   &c_gu2,   NT * AK * FF * sizeof(float)) ||
+        !ep_grow((void **)&dwn,   &c_dwn,   NT * AK * D * sizeof(float)) ||
+        !ep_grow((void **)&slot_out, &c_slot, pairs * D * sizeof(float))) return 0;
+
+    /* Routing (serial, cheap: NE matmuls over [D]) */
+    memset(count, 0, (size_t)NE * sizeof(int));
+    for (int t = 0; t < NT; t++) {
+        const float *cur = cur_b + (size_t)t * D;
+        matmul(probs, cur, lw->ffn_gate_inp, D, NE, lw->type_ffn_gate_inp);
+        for (int i = 0; i < NE; i++) probs[i] = 1.0f / (1.0f + expf(-probs[i]));
+        float logits_buf[512];
+        memcpy(logits_buf, probs, (size_t)NE * sizeof(float));
+        if (gw->exp_probs_b) {
+            const float *bias = (const float *)gw->exp_probs_b;
+            for (int i = 0; i < NE; i++) logits_buf[i] += bias[i];
+        }
+        int *sl = sel + (size_t)t * AK; float *wt = wts + (size_t)t * AK;
+        for (int k = 0; k < AK; k++) {
+            int best = -1; float bv = -1e30f;
+            for (int i = 0; i < NE; i++) if (logits_buf[i] > bv) { bv = logits_buf[i]; best = i; }
+            sl[k] = best; logits_buf[best] = -1e30f; count[best]++;
+        }
+        float sum = 0.f;
+        for (int k = 0; k < AK; k++) { wt[k] = probs[sl[k]]; sum += wt[k]; }
+        float sc2 = (1.0f / sum) * c->glm5_moe_scale;
+        for (int k = 0; k < AK; k++) wt[k] *= sc2;
+    }
+
+    /* Bucket */
+    { int acc = 0; for (int e = 0; e < NE; e++) { cursor[e] = acc; acc += count[e]; } cursor[NE] = acc; }
+    memset(count, 0, (size_t)NE * sizeof(int));
+    for (int t = 0; t < NT; t++)
+        for (int k = 0; k < AK; k++) {
+            int e = sel[t * AK + k], pos = cursor[e] + count[e]++;
+            bucket[pos] = t * AK + k;
+        }
+
+    /* Zero output accumulators */
+    memset(out_b, 0, (size_t)NT * D * sizeof(float));
+
+    /* Parallel expert dispatch */
+    size_t gate_stride = (size_t)FF * gguf_type_row_size(lw->type_ffn_gate_exps, D);
+    size_t down_stride = (size_t)D  * gguf_type_row_size(lw->type_ffn_down_exps, FF);
+    ep_task_t ctx = { cur_b, bucket, count, cursor,
+                      xbuf, gu, gu2, dwn, slot_out,
+                      gate_stride, down_stride,
+                      D, FF, AK, lw->type_ffn_gate_exps, lw->type_ffn_up_exps, lw->type_ffn_down_exps,
+                      clamp_v, lw->ffn_gate_exps, lw->ffn_up_exps, lw->ffn_down_exps };
+    tensor_parallel_for(NE, glm5_ep_expert_task, &ctx);
+
+    /* Reduce in slot order */
+    for (int t = 0; t < NT; t++)
+        for (int k = 0; k < AK; k++) {
+            float w = wts[t * AK + k];
+            const float *dd = slot_out + ((size_t)t * AK + k) * D;
+            float *o = out_b + (size_t)t * D;
+            for (int j = 0; j < D; j++) o[j] += w * dd[j];
+        }
+
+    /* Shared expert, batched */
+    if (lw->ffn_gate_shexp) {
+        const int SFF = c->n_ff_shexp;
+        if (glm5_shexp_batch_enabled()) {
+            matmul_batch(gu,  cur_b, NT, lw->ffn_gate_shexp, D, SFF, lw->type_ffn_gate_shexp);
+            matmul_batch(gu2, cur_b, NT, lw->ffn_up_shexp,   D, SFF, lw->type_ffn_up_shexp);
+            { ep_swiglu_t sw = { gu, gu2, SFF, NT, glm5_clamp_value_shexp(c) };
+              tensor_parallel_for_dyn((NT + 7) / 8, ep_swiglu_task, &sw); }
+            matmul_batch(dwn, gu, NT, lw->ffn_down_shexp, SFF, D, lw->type_ffn_down_shexp);
+            { ep_add_t ac = { out_b, dwn, D }; tensor_parallel_for_dyn(NT, ep_add_task, &ac); }
+        } else {
+            for (int t = 0; t < NT; t++)
+                glm5_moe_shared_expert(m, lw, s, cur_b + (size_t)t * D, out_b + (size_t)t * D, SFF);
+        }
+    }
+    return 1;
+}
+
 /* Returns 1 if it handled the layer, 0 to fall back to the reference path (nothing was written). */
 static int glm5_moe_ffn_batch_ep(const model_t *m, const glm5_layer_weights_t *gw,
                                  const layer_weights_t *lw, run_state_t *s,
@@ -3553,18 +3727,31 @@ void glm5_moe_ffn_batch(const model_t *m, const glm5_layer_weights_t *gw,
         fprintf(stderr, "[moechk L%d] moe_in rms=%.6f  ep_enabled=%d\n", layer_idx,
                 (float)sqrt(ss/m->config.n_embd), glm5_moe_ep_enabled());
     }
-    if (glm5_moe_ep_enabled() && glm5_moe_ffn_batch_ep(m, gw, lw, s, cur_b, out_b, n_tokens, layer_idx)) {
-        if (prof) { g_epp_mode = 1; g_epp_calls++; }
-        /* Report the batched MoE output so a prefill can be diffed against
-         * ik's ffn_moe_out-<il> at all; without this the whole FFN was
-         * invisible on the batched path and only the per-token decode path
-         * emitted x.moe.* tags. */
-        if (glm5_stats_wanted()) {
-            char t2[96];
-            snprintf(t2, sizeof(t2), "l%02d.moe.out", layer_idx);
-            glm5_stats(t2, out_b, m->config.n_embd);
+    if (glm5_moe_ep_enabled()) {
+        /* Try the any-quant EP path first (works for all types), then the IQ6_K-specific multi-GEMM path. */
+        if (glm5_moe_ffn_batch_ep_any(m, gw, lw, s, cur_b, out_b, n_tokens, layer_idx)) {
+            if (prof) { g_epp_mode = 1; g_epp_calls++; }
+            /* Report the batched MoE output so a prefill can be diffed against
+             * ik's ffn_moe_out-<il> at all; without this the whole FFN was
+             * invisible on the batched path and only the per-token decode path
+             * emitted x.moe.* tags. */
+            if (glm5_stats_wanted()) {
+                char t2[96];
+                snprintf(t2, sizeof(t2), "l%02d.moe.out", layer_idx);
+                glm5_stats(t2, out_b, m->config.n_embd);
+            }
+            return;
         }
-        return;
+        /* Fallback: try the IQ6_K-specific multi-GEMM path. */
+        if (glm5_moe_ffn_batch_ep(m, gw, lw, s, cur_b, out_b, n_tokens, layer_idx)) {
+            if (prof) { g_epp_mode = 1; g_epp_calls++; }
+            if (glm5_stats_wanted()) {
+                char t2[96];
+                snprintf(t2, sizeof(t2), "l%02d.moe.out", layer_idx);
+                glm5_stats(t2, out_b, m->config.n_embd);
+            }
+            return;
+        }
     }
     const double t0 = prof ? glm5_prof_now() : 0.0;
     glm5_moe_ffn_batch_ref(m, gw, lw, s, cur_b, out_b, n_tokens, layer_idx);
