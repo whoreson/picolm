@@ -77,9 +77,48 @@ static size_t block_bytes_of(gguf_type_t t, int n)
     return rb;
 }
 
-/* Weights with a sane numeric range and random index bits. Only the scale
- * slots are constrained; every index encoding is valid for these formats, so
- * random bits give a well-distributed but structurally legal tensor. */
+/* Where the fp16 scale word(s) live inside one block.
+ *
+ * Most formats put `d` first, but three do not, and guessing wrong leaves the
+ * REAL scale as random fp16 exponent bits (up to ~1e5):
+ *   Q2_K: scales[16] qs[64] d dmin   -> d at 82, dmin at 82+2 (84-byte block)
+ *   Q3_K: hmask[32] qs[64] scales[12] d -> d at 108 (110-byte block)
+ *   Q6_K: ... scales[16] at 192, d at 208 (210-byte block)
+ * Everything else (Q4_K/Q5_K/IQ*, Q8_0/Q4_0/Q5_0/IQ4_NL/Q1_0/Q2_0) starts
+ * with d, and K-quant superblocks have dmin right after it. */
+static void stomp_block_scales(uint8_t *blk, size_t bb, gguf_type_t t)
+{
+    switch (t) {
+    case GGUF_TYPE_Q2_K:
+        if (bb >= 84) { memcpy(blk + 82, &k_scale_half, 2); memcpy(blk + 80, &k_scale2_half, 2); }
+        return;
+    case GGUF_TYPE_Q3_K:
+        if (bb >= 110) memcpy(blk + 108, &k_scale_half, 2);
+        return;
+    case GGUF_TYPE_Q6_K:
+        if (bb >= 210) memcpy(blk + 208, &k_scale_half, 2);
+        return;
+    default:
+        break;
+    }
+    /* Leading-d formats. */
+    if (bb >= 4) {
+        memcpy(blk, &k_scale_half, 2);
+        memcpy(blk + 2, &k_scale2_half, 2);
+    } else if (bb >= 2) {
+        memcpy(blk, &k_scale_half, 2);
+    }
+}
+
+/* Write a weights buffer for `t` with a sane numeric range, index bits random.
+ *
+ * Every block (not just the row!) needs its scale stomped. Stomping only the
+ * first block of each row leaves the other blocks' `d` as random fp16 bits, and
+ * a random fp16 exponent is routinely 1e4..1e5 -- enough that the oracle itself
+ * returns 1e9 and every comparison is meaningless. (That is precisely how the
+ * first version of this test managed to "fail" on IQ6_K and Q8_0, the two
+ * simplest layouts.) data_is_sane() now checks for this before any comparison
+ * and reports DATA-BAD instead of a bogus CHUNK-UNSAFE verdict. */
 static void *make_weights(gguf_type_t t, int n, int d)
 {
     const size_t rb = gguf_type_row_size(t, n);
@@ -90,17 +129,7 @@ static void *make_weights(gguf_type_t t, int n, int d)
     for (int r = 0; r < d; r++) {
         uint8_t *row = W + (size_t)r * rb;
         for (size_t b = 0; b < rb; b++) row[b] = (uint8_t)(rnd() & 0xFF);
-        for (size_t o = 0; o + bb <= rb; o += bb) {
-            uint8_t *blk = row + o;
-            if (bb >= 4) {
-                memcpy(blk, &k_scale_half, 2);
-                memcpy(blk + 2, &k_scale2_half, 2);
-            } else {
-                memcpy(blk, &k_scale_half, 2);
-            }
-            /* Q6_K keeps d at the very end of its 210-byte superblock. */
-            if (t == GGUF_TYPE_Q6_K && bb >= 210) memcpy(blk + 208, &k_scale_half, 2);
-        }
+        for (size_t o = 0; o + bb <= rb; o += bb) stomp_block_scales(row + o, bb, t);
     }
     return W;
 }
@@ -164,6 +193,32 @@ static void oracle(const void *W, const char *qbuf, gguf_type_t t,
     }
     free(wrow);
     free(arow);
+}
+
+/* Sanity of the SYNTHETIC data, checked once per type before any comparison.
+ *
+ * A quant format whose scale/offset slots we fail to stomp produces weights
+ * with fp16 exponent bits left random -- routinely 1e4..1e9 -- and then the
+ * oracle overflows, every comparison fails, and it looks exactly like a
+ * chunk-safety bug. That wastes an afternoon. So separate the two verdicts:
+ * if the data is bad, report DATA-BAD and do not claim the type is unsafe. */
+static int data_is_sane(gguf_type_t t, int n, int verbose)
+{
+    void *W = make_weights(t, n, 1);
+    if (!W) return 0;
+    float *row = (float *)malloc((size_t)n * sizeof(float));
+    dequantize_row(W, row, n, t);
+    double mx = 0;
+    for (int i = 0; i < n; i++) {
+        const double v = fabs((double)row[i]);
+        if (v > mx) mx = v;
+    }
+    const int ok = (mx > 1e-6) && (mx < 1e3) && !isnan(mx);
+    if (!ok || verbose)
+        printf("  [data] %-8s n=%-5d dequant |max| = %.3e%s\n",
+               " ", n, mx, ok ? "" : "   <-- generator cannot produce sane weights for this type");
+    free(W); free(row);
+    return ok;
 }
 
 static int run_case(gguf_type_t t, const char *name, int n, int ncols, int d, int chunk,
@@ -268,10 +323,21 @@ int main(void)
     static const int kns[]     = { 2048, 7168 };
     static const int kds[]     = { 2048, 7168 };
 
-    int fails = 0, cases = 0, skipped = 0;
+    int fails = 0, cases = 0, skipped = 0, data_bad = 0;
     for (int ti = 0; types[ti].n; ti++) {
         if (only && !strstr(only, types[ti].n)) continue;
         printf("== %s ==\n", types[ti].n);
+        const type_info_t *ti_ = typeinfo(types[ti].t);
+        if (!ti_ || !ti_->fn_gemm) {
+            printf("   -> no table GEMM for this type; not applicable\n");
+            continue;
+        }
+        if (!data_is_sane(types[ti].t, 2048, verbose)) {
+            printf("   -> DATA-BAD: synthetic weights unsupported for this type.\n"
+                   "      NOT a chunk-safety verdict. Fix make_weights() first.\n");
+            data_bad++;
+            continue;
+        }
         int t_fails = 0, t_cases = 0;
         for (unsigned a = 0; a < sizeof kns / sizeof kns[0]; a++)
         for (unsigned b = 0; b < sizeof kds / sizeof kds[0]; b++)
@@ -287,6 +353,7 @@ int main(void)
         printf("   -> %s (%d/%d failed)\n", t_fails ? "CHUNK-UNSAFE" : "chunk-safe",
                t_fails, t_cases);
     }
-    printf("\n%d cases, %d failures\n", cases, fails);
+    printf("\n%d cases, %d failures, %d types skipped as DATA-BAD\n",
+           cases, fails, data_bad);
     return fails ? 1 : 0;
 }

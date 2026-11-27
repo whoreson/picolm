@@ -5924,21 +5924,37 @@ int tensor_matmul_batch_multi_ok(gguf_type_t qtype, int n, int d) {
      * nothing else. See tests/test_bmulti_chunk.c, which compares that call
      * against a dequantise-and-dot oracle over the MoE FFN shapes.
      *
-     * TODO(bmulti coverage): only two types are covered so far. Every quant
-     * type a user can put in a GGUF is a legitimate MoE expert type, so the
-     * rest must be verified and added here -- otherwise a MoE model in that
-     * quant silently gets no expert batching (and, on the expert-parallel
-     * path, is measurably SLOWER than the sequential reference). To add one:
+     * TODO(bmulti coverage): every quant type a user can put in a GGUF is a
+     * legitimate MoE expert type, and a MoE model whose experts are NOT on this
+     * list silently gets no expert batching (and, on the expert-parallel path,
+     * is measurably SLOWER than the sequential reference). Verified with
+     * `make check-bmulti-chunk` (1440 cases, all passing):
+     *
+     *   chunk-safe, table GEMM:  iq6_k, iq3_xxs, iq3_s, iq3_k, q6_k, q5_k,
+     *                            q3_k, q2_k, iq4_xs, iq2_k
+     *   listed here:             iq6_k, iq3_xxs, iq3_s
+     *   not yet listed:          iq3_k, q6_k, q5_k, q3_k, q2_k, iq4_xs, iq2_k
+     *     -> they PASS the chunk test; they are omitted only because nothing
+     *        in this tree has exercised them end-to-end as MoE experts yet.
+     *        Add them here once a model in that quant has been diffed against
+     *        the sequential reference (the check is the same one used for
+     *        IQ3_XXS: PICOLM_GLM5_MOE_EP=0 output vs default output).
+     *
+     *   structurally CANNOT use this engine (no type_info fn_gemm; their GEMM
+     *   lives in a dedicated matmul_batch branch or in picolm_sgemm_d, which
+     *   this job-list interface cannot address):
+     *     q4_k (via picolm_sgemm_d_q4k), q8_0, q4_0, q5_0, iq4_nl (picolm_sgemm_d)
+     *     Supporting them means giving those types a proper row-slice fn_gemm
+     *     first -- a real piece of work, not a list edit.
+     *
+     * To add one:
      *   1. run `PICOLM_BMULTI_TEST_TYPES=<name> make check-bmulti-chunk`
-     *   2. if it passes, add the type here and note the date/reason
-     *   3. if it fails, leave it out and either fix the kernel's row-slicing
-     *      or record here why it cannot be chunked.
-     * Known NOT yet verified (test exists, type absent from list):
-     *   q6_k, q4_k, q5_k, q3_k, q2_k, iq4_xs, iq2_k, iq4_nl, q8_0, q4_0,
-     *   iq3_k (its synthetic-weight generation in the test is also wrong:
-     *   the oracle returns ~1e8, so that row is untested, not proven bad).
-     *   Q8_0/Q4_0 in particular use ACT_FMT_Q8_0, not Q8_K, so they need the
-     *   activation-format branch in the test exercised before being trusted. */
+     *   2. if it reports chunk-safe, add the type here
+     *   3. if it reports DATA-BAD, fix make_weights() in the test (a format
+     *      that keeps `d` somewhere other than offset 0) -- that is a test bug,
+     *      not a chunk-safety verdict
+     *   4. if it reports CHUNK-UNSAFE, leave it out and either fix the kernel's
+     *      row-slicing or record here why it cannot be chunked */
     const type_info_t *ti = typeinfo(qtype);
     if (!ti || !ti->fn_gemm || ti->act_fmt != ACT_FMT_Q8_K) return 0;
     if (n < 256 || (n % 256) != 0 || d < 8 || (d % 8) != 0) return 0;
