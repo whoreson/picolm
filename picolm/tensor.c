@@ -6028,6 +6028,93 @@ static size_t bmulti_act_bytes(gguf_type_t qtype, int n_batch, int n)
     }
 }
 
+/* ---- One-time runtime cross-check per quant type -------------------------
+ *
+ * The chunk contract (fn_gemm computes exactly rows [r0,r0+nr)) is verified
+ * offline by tests/test_bmulti_chunk.c for every type on the trust list. That
+ * test cannot see a user's actual GGUF, though: a build/platform with a
+ * different SIMD tier compiles DIFFERENT kernels under the same type id, and a
+ * kernel bug in one of those paths would be silent -- tensor_matmul_batch_multi
+ * only notices fn_gemm returning 0, not a kernel that writes the wrong rows.
+ *
+ * So the first time a type is used, recompute ONE job through matmul_batch (the
+ * proven path, already validated against a float oracle) and compare. A
+ * mismatch disables the type for the rest of the process and says so, rather
+ * than silently producing wrong logits. Cost: one extra GEMM per type per run.
+ *
+ * PICOLM_BMULTI_VERIFY=0 skips the check (not recommended);
+ * PICOLM_BMULTI_VERIFY=strict aborts instead of falling back.
+ *
+ * State is per-process and monotonic (0 = untried, 1 = ok, -1 = failed), so it
+ * needs no locking: tensor_matmul_batch_multi runs on the orchestrator thread.
+ */
+#define BMULTI_VERIFY_TYPES 64
+static int bmulti_verify_state[BMULTI_VERIFY_TYPES];
+
+static int bmulti_verify_mode(void)
+{
+    static int m = -1;
+    if (m < 0) {
+        const char *e = getenv("PICOLM_BMULTI_VERIFY");
+        if (!e) m = 1;
+        else if (e[0] == '0') m = 0;
+        else if (e[0] == 's' || e[0] == 'S') m = 2;   /* strict */
+        else m = 1;
+    }
+    return m;
+}
+
+/* Returns 1 to proceed with the multi engine, 0 to make the caller fall back. */
+static int bmulti_verify(const mm_bjob_t *J)
+{
+    const int mode = bmulti_verify_mode();
+    if (!mode) return 1;
+    const int qt = (int)J->qtype;
+    if (qt < 0 || qt >= BMULTI_VERIFY_TYPES) return 1;
+
+    if (bmulti_verify_state[qt] == 0) {
+        const size_t row_bytes = gguf_type_row_size(J->qtype, J->n);
+        float *ref = (float *)malloc((size_t)J->n_batch * (size_t)J->d * sizeof(float));
+        if (!ref) { bmulti_verify_state[qt] = 1; return 1; }
+        matmul_batch(ref, J->x, J->n_batch, J->W, J->n, J->d, J->qtype);
+
+        double worst = 0.0, scale = 0.0, sum = 0.0;
+        for (size_t i = 0; i < (size_t)J->n_batch * (size_t)J->d; i++) {
+            const double a = (double)ref[i], b = (double)J->out[i];
+            if (isnan(a) != isnan(b)) { worst = INFINITY; break; }
+            const double df = fabs(a - b);
+            if (df > worst) worst = df;
+            /* Compare against the mean magnitude, not the max: a max element
+             * can be orders of magnitude above the rest and would hide a
+             * relative error that matters. */
+            sum += fabs(a);
+        }
+        scale = sum / (double)((size_t)J->n_batch * (size_t)J->d);
+        if (scale < 1e-9) scale = 1.0;
+        /* Chunked vs full-batch differ only by fp32 association order, ~1e-6
+         * relative. 1e-3 relative to the mean leaves a wide margin for
+         * different tiling while still catching structural corruption (wrong
+         * row, unwritten chunk, neighbour clobber), which is O(1). */
+        const int bad = !(worst / scale <= 1e-3);
+        if (bad) {
+            bmulti_verify_state[qt] = -1;
+            fprintf(stderr,
+                    "ERROR: multi-GEMM self-check FAILED for qtype %d (n=%d d=%d ncols=%d):\n"
+                    "       max deviation %.3e vs mean magnitude %.3e.\n"
+                    "       This build's kernel for that type does not produce the same rows as\n"
+                    "       matmul_batch, so expert batching is DISABLED for it.\n"
+                    "       Device: please report; workaround PICOLM_GLM5_MOE_EP=0.\n",
+                    qt, J->n, J->d, J->n_batch, worst, scale);
+            if (mode == 2) abort();
+            free(ref);
+            return 0;
+        }
+        bmulti_verify_state[qt] = 1;
+        free(ref);
+    }
+    return bmulti_verify_state[qt] > 0;
+}
+
 static void bmulti_quant_task(int j, void *p) {
     bmulti_t *c = (bmulti_t *)p;
     const mm_bjob_t *J = &c->jobs[j];
@@ -6142,6 +6229,21 @@ int tensor_matmul_batch_multi(const mm_bjob_t *jobs, int n_jobs) {
     c.n_tasks = t;
     tensor_parallel_for_dyn(n_jobs, bmulti_quant_task, &c);
     if (!c.failed) tensor_parallel_for_dyn(c.n_tasks, bmulti_gemm_task, &c);
+
+    /* One-time per-type cross-check against matmul_batch. Runs AFTER the
+     * dispatch, so it compares the real output this build produced. On failure
+     * it disables the type and we report "not handled" so the caller recomputes
+     * everything through the proven path. */
+    if (!c.failed) {
+        for (int j = 0; j < n_jobs; j++) {
+            if (!bmulti_verify(&jobs[j])) {
+                for (int q = 0; q < n_jobs; q++)
+                    matmul_batch(jobs[q].out, jobs[q].x, jobs[q].n_batch, jobs[q].W,
+                                 jobs[q].n, jobs[q].d, jobs[q].qtype);
+                return 0;
+            }
+        }
+    }
     if (c.failed) {      /* never expected; recompute through the proven path so the result is right */
         for (int j = 0; j < n_jobs; j++)
             matmul_batch(jobs[j].out, jobs[j].x, jobs[j].n_batch, jobs[j].W, jobs[j].n, jobs[j].d, jobs[j].qtype);
