@@ -676,7 +676,8 @@ static struct _server_state {
     uint8_t *rolling_checkpoint_data;     /* pre-allocated rolling snapshot buffer */
     int rolling_checkpoint_n_tokens;      /* current position of rolling checkpoint */
     double rolling_checkpoint_last_ms;    /* wall-clock ms of last rolling update */
-    int rolling_checkpoint_active;        /* 1 during decode, 0 otherwise */
+    int rolling_checkpoint_active;        /* 1 = updates enabled (set at decode start) */
+    int rolling_checkpoint_valid;         /* 1 = buffer holds a real snapshot at rolling_checkpoint_n_tokens */
 
 #ifdef PICOLM_VIZ
     int viz_initialized;                  /* 1 if viz_init succeeded */
@@ -1069,6 +1070,7 @@ static void checkpoint_rolling_update(int n_tokens) {
     if (written == 0) return;
 
     srv.rolling_checkpoint_n_tokens = n_tokens;
+    srv.rolling_checkpoint_valid = 1;
     srv.rolling_checkpoint_last_ms = now;
     double creation_ms = get_time_ms() - t_create_start;
     fprintf(stderr, "  [ssm rolling checkpoint] updated (n_tokens=%d, %.1f ms)\n", n_tokens, creation_ms);
@@ -1113,7 +1115,7 @@ static int checkpoint_restore(int n_tokens, int *actual_n_tokens) {
     /* Allow restore even when checkpoint-max=0, as long as checkpoints
      * were loaded from a slot save file. Saving is gated by max_checkpoints. */
     if (srv.checkpoint_snapshot_size == 0) return -1;
-    if (!srv.checkpoints && !srv.rolling_checkpoint_active) return -1;
+    if (!srv.checkpoints && !srv.rolling_checkpoint_valid) return -1;
 
     /* Find the latest checkpoint with n_tokens <= target.
      * Consider BOTH the linked list and the rolling checkpoint. */
@@ -1127,7 +1129,7 @@ static int checkpoint_restore(int n_tokens, int *actual_n_tokens) {
         }
     }
     /* Also consider the rolling checkpoint if it's more recent */
-    if (srv.rolling_checkpoint_active && srv.rolling_checkpoint_data) {
+    if (srv.rolling_checkpoint_valid && srv.rolling_checkpoint_data) {
         if (srv.rolling_checkpoint_n_tokens <= n_tokens) {
             if (!best || srv.rolling_checkpoint_n_tokens > best->n_tokens) {
                 best = NULL; /* sentinel: use rolling */
@@ -1145,8 +1147,8 @@ static int checkpoint_restore(int n_tokens, int *actual_n_tokens) {
     /* Invalidate the rolling checkpoint if we're NOT restoring from it:
      * its data represents a position beyond the rewind point and is now stale.
      * The next decode loop will reactivate it from scratch. */
-    if (!from_rolling) {
-        srv.rolling_checkpoint_active = 0;
+    if (!from_rolling && srv.rolling_checkpoint_n_tokens > rewind_pos) {
+        srv.rolling_checkpoint_valid = 0;
     }
 
     /* Restore SSM state from checkpoint */
@@ -1181,7 +1183,7 @@ static void checkpoint_restore_log(int target, int actual, int kv_match, int suc
 static void cache_adjust_stepback(model_t *model, int n_prompt, int *start_pos) {
     if (*start_pos < n_prompt || *start_pos <= 0) return;
 
-    if (model_has_recurrent_state(model) && srv.checkpoints) {
+    if (model_has_recurrent_state(model) && (srv.checkpoints || srv.rolling_checkpoint_valid)) {
         int target = n_prompt - 1;
         int actual = 0;
         if (checkpoint_restore(target, &actual) == 0) {
@@ -1209,7 +1211,7 @@ static void cache_adjust_stepback(model_t *model, int n_prompt, int *start_pos) 
 /* Clear all checkpoints and free their memory */
 static void checkpoint_clear(void) {
     int n = checkpoint_count();
-    if (n == 0 && !srv.rolling_checkpoint_active) return;
+    if (n == 0 && !srv.rolling_checkpoint_valid) return;
     /* Commented out: too verbose */
     /*
     fprintf(stderr, "  [ssm checkpoint] clearing %d checkpoints\n", n);
@@ -1224,10 +1226,12 @@ static void checkpoint_clear(void) {
         cp = next;
     }
     srv.checkpoints = NULL;
-    /* Also clear rolling checkpoint */
-    free(srv.rolling_checkpoint_data);
-    srv.rolling_checkpoint_data = NULL;
-    srv.rolling_checkpoint_active = 0;
+    /* Invalidate the rolling checkpoint but KEEP its pre-allocated buffer.
+     * It is allocated once in server init; freeing it here (as this used to)
+     * left rolling_checkpoint_data == NULL for the rest of the process, so
+     * every decode-start guard `if (srv.rolling_checkpoint_data && ...)`
+     * failed and the rolling checkpoint was never created again. */
+    srv.rolling_checkpoint_valid = 0;
     srv.rolling_checkpoint_last_ms = 0;
     srv.rolling_checkpoint_n_tokens = 0;
 }
@@ -1702,6 +1706,7 @@ static int server_init(const char *model_path, int num_threads, int do_prefault,
     srv.checkpoint_scratch = NULL;
     srv.rolling_checkpoint_data = NULL;
     srv.rolling_checkpoint_active = 0;
+    srv.rolling_checkpoint_valid = 0;
     srv.rolling_checkpoint_last_ms = 0;
     srv.rolling_checkpoint_n_tokens = 0;
     if (srv.max_checkpoints > 0 && srv.checkpoint_snapshot_size > 0) {
@@ -1730,6 +1735,9 @@ static int server_init(const char *model_path, int num_threads, int do_prefault,
 
 static void server_free(void) {
     checkpoint_clear();
+    free(srv.rolling_checkpoint_data);
+    srv.rolling_checkpoint_data = NULL;
+    srv.rolling_checkpoint_active = 0;
     free(srv.checkpoint_scratch);
     srv.checkpoint_scratch = NULL;
 
@@ -2068,7 +2076,7 @@ static void handle_slots_post(SOCKET sock, const char *body) {
          * Includes the rolling checkpoint if active, written after linked-list
          * checkpoints since it's typically the most recent. */
         int n_cps = checkpoint_count();
-        int has_rolling = (srv.rolling_checkpoint_active && srv.rolling_checkpoint_data != NULL);
+        int has_rolling = (srv.rolling_checkpoint_valid && srv.rolling_checkpoint_data != NULL);
         if ((n_cps > 0 || has_rolling) && srv.checkpoint_snapshot_size > 0) {
             /* Open file for appending */
 #ifdef _WIN32
