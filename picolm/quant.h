@@ -709,6 +709,34 @@ static inline __m512 picolm_expf16_avx512(__m512 x)
 }
 #endif
 
+#ifdef PICOLM_AVX2
+/* Vectorised expf for 8 float lanes (AVX-2).
+ * Same Cephes range-reduction + degree-6 polynomial as the AVX-512 variant.
+ * 2^fx is formed by bit-casting (fx + 127) << 23 into a float mantissa=1.0.
+ * Max error ~2 ULP vs glibc expf.  Used by flash-style PFA softmax on AVX-2. */
+static inline __m256 picolm_expf8_avx2(__m256 x)
+{
+    x = _mm256_min_ps(_mm256_max_ps(x, _mm256_set1_ps(-104.0f)), _mm256_set1_ps(89.0f));
+    const __m256 log2e = _mm256_set1_ps(1.44269504088896341f);
+    const __m256 c1 = _mm256_set1_ps(0.693359375f), c2 = _mm256_set1_ps(-2.12194440e-4f);
+    __m256 fx_f = _mm256_round_ps(_mm256_mul_ps(x, log2e), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    __m256 r = _mm256_fnmadd_ps(fx_f, c1, x);
+    r = _mm256_fnmadd_ps(fx_f, c2, r);
+    __m256 y = _mm256_set1_ps(1.9875691500E-4f);
+    y = _mm256_fmadd_ps(y, r, _mm256_set1_ps(1.3981999507E-3f));
+    y = _mm256_fmadd_ps(y, r, _mm256_set1_ps(8.3334519073E-3f));
+    y = _mm256_fmadd_ps(y, r, _mm256_set1_ps(4.1665795894E-2f));
+    y = _mm256_fmadd_ps(y, r, _mm256_set1_ps(1.6666665459E-1f));
+    y = _mm256_fmadd_ps(y, r, _mm256_set1_ps(5.0000001201E-1f));
+    const __m256 r2 = _mm256_mul_ps(r, r);
+    y = _mm256_fmadd_ps(y, r2, _mm256_add_ps(r, _mm256_set1_ps(1.0f)));
+    /* 2^fx via bit-cast: (fx + 127) << 23  (fx is already rounded to int) */
+    const __m256i ei = _mm256_cvttps_epi32(fx_f);
+    const __m256i eb = _mm256_slli_epi32(_mm256_add_epi32(ei, _mm256_set1_epi32(127)), 23);
+    return _mm256_mul_ps(y, _mm256_castsi256_ps(eb));
+}
+#endif
+
 /* GGUF tensor data types */
 typedef enum {
     GGUF_TYPE_F32   = 0,

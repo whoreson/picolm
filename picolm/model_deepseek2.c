@@ -1954,6 +1954,43 @@ static void ds2_pfa_task(int idx, void *vp)
                 for (int d = 0; d < KVL; d++) o[d] *= alpha;
             }
             m_arr[r] = mn;
+#elif defined(PICOLM_AVX2)
+            if (nv == 0) { for (int j = 0; j < nk; j++) sr[j] = 0.f; continue; }
+            {   /* AVX-2: 8-lane max + vec-expf, scalar tail */
+                const int nv8 = (nv >> 3) << 3;  /* round down to multiple of 8 */
+                /* Max over the full SIMD lanes */
+                __m256 vmx = _mm256_set1_ps(-INFINITY);
+                for (int j = 0; j < nv8; j += 8)
+                    vmx = _mm256_max_ps(vmx, _mm256_loadu_ps(sr + j));
+                __m256 vmxh = _mm256_max_ps(vmx, _mm256_permute2f128_ps(vmx, vmx, 0x31));
+                vmxh = _mm256_max_ps(vmxh, _mm256_shuffle_ps(vmxh, vmxh, 0x08));
+                vmxh = _mm256_max_ps(vmxh, _mm256_shuffle_ps(vmxh, vmxh, 0x1e));
+                float bm = _mm256_cvtss_f32(vmxh);
+                /* Scalar tail for max */
+                for (int j = nv8; j < nv; j++) if (sr[j] > bm) bm = sr[j];
+                const float mn = bm > m_arr[r] ? bm : m_arr[r];
+                const float alpha = expf(m_arr[r] - mn);
+                const __m256 vmn = _mm256_set1_ps(mn);
+                __m256 vsum = _mm256_setzero_ps();
+                for (int j = 0; j < nv8; j += 8) {
+                    const __m256 e = picolm_expf8_avx2(_mm256_sub_ps(_mm256_loadu_ps(sr + j), vmn));
+                    _mm256_storeu_ps(sr + j, e);
+                    vsum = _mm256_add_ps(vsum, e);
+                }
+                __m256 vsumh = _mm256_add_ps(vsum, _mm256_permute2f128_ps(vsum, vsum, 0x31));
+                vsumh = _mm256_add_ps(vsumh, _mm256_shuffle_ps(vsumh, vsumh, 0x08));
+                vsumh = _mm256_add_ps(vsumh, _mm256_shuffle_ps(vsumh, vsumh, 0x1e));
+                float sum = _mm256_cvtss_f32(vsumh);
+                /* Scalar tail for expf+sum */
+                for (int j = nv8; j < nv; j++) { float e = expf(sr[j] - mn); sr[j] = e; sum += e; }
+                for (int j = nv; j < nk; j++) sr[j] = 0.f;
+                l_arr[r] = l_arr[r] * alpha + sum;
+                if (alpha != 1.0f) {
+                    float *o = O + (size_t)r * KVL;
+                    for (int d = 0; d < KVL; d++) o[d] *= alpha;
+                }
+                m_arr[r] = mn;
+            }
 #else
             for (int j = nv; j < nk; j++) sr[j] = -INFINITY;
             float bm = -INFINITY;
@@ -2246,6 +2283,38 @@ static void ds2_mha_softmax(float *S, int R, int nk, int kbase, int lim0,
         const float sum = _mm512_reduce_add_ps(vsum);
         for (int j = (nv + 15) & ~15; j < nk; j++) sr[j] = 0.f;
         lv[r] = lv[r] * alpha + sum;
+        if (alpha != 1.0f) { float *o = O + (size_t)r * HV; for (int d = 0; d < HV; d++) o[d] *= alpha; }
+        mv[r] = mn;
+#elif defined(PICOLM_AVX2)
+        if (nv == 0) { for (int j = 0; j < nk; j++) sr[j] = 0.f; continue; }
+        {
+            const int nv8 = (nv >> 3) << 3;
+            __m256 _z_v = _mm256_set1_ps(-INFINITY);
+            for (int j = 0; j < nv8; j += 8)
+                _z_v = _mm256_max_ps(_z_v, _mm256_loadu_ps(sr + j));
+            __m256 _z_h = _mm256_max_ps(_z_v, _mm256_permute2f128_ps(_z_v, _z_v, 0x31));
+            _z_h = _mm256_max_ps(_z_h, _mm256_shuffle_ps(_z_h, _z_h, 0x08));
+            _z_h = _mm256_max_ps(_z_h, _mm256_shuffle_ps(_z_h, _z_h, 0x1e));
+            float _z_bm = _mm256_cvtss_f32(_z_h);
+            for (int j = nv8; j < nv; j++) if (sr[j] > _z_bm) _z_bm = sr[j];
+            const float mn = _z_bm > mv[r] ? _z_bm : mv[r];
+            const float alpha = expf(mv[r] - mn);
+            const __m256 _z_mn = _mm256_set1_ps(mn);
+            __m256 _z_s = _mm256_setzero_ps();
+            for (int j = 0; j < nv8; j += 8) {
+                const __m256 e = picolm_expf8_avx2(_mm256_sub_ps(_mm256_loadu_ps(sr + j), _z_mn));
+                _mm256_storeu_ps(sr + j, e); _z_s = _mm256_add_ps(_z_s, e);
+            }
+            __m256 _z_sh = _mm256_add_ps(_z_s, _mm256_permute2f128_ps(_z_s, _z_s, 0x31));
+            _z_sh = _mm256_add_ps(_z_sh, _mm256_shuffle_ps(_z_sh, _z_sh, 0x08));
+            _z_sh = _mm256_add_ps(_z_sh, _mm256_shuffle_ps(_z_sh, _z_sh, 0x1e));
+            float _z_su = _mm256_cvtss_f32(_z_sh);
+            for (int j = nv8; j < nv; j++) { float e = expf(sr[j] - mn); sr[j] = e; _z_su += e; }
+            for (int j = nv; j < nk; j++) sr[j] = 0.f;
+            lv[r] = lv[r] * alpha + _z_su;
+            if (alpha != 1.0f) { float *o = O + (size_t)r * HV; for (int d = 0; d < HV; d++) o[d] *= alpha; }
+            mv[r] = mn;
+        }
 #else
         for (int j = nv; j < nk; j++) sr[j] = -INFINITY;
         float bm = -INFINITY;
@@ -2257,12 +2326,9 @@ static void ds2_mha_softmax(float *S, int R, int nk, int kbase, int lim0,
         for (int j = 0; j < nv; j++) { float e = expf(sr[j] - mn); sr[j] = e; sum += e; }
         for (int j = nv; j < nk; j++) sr[j] = 0.f;
         lv[r] = lv[r] * alpha + sum;
-#endif
-        if (alpha != 1.0f) {
-            float *o = O + (size_t)r * HV;
-            for (int d = 0; d < HV; d++) o[d] *= alpha;
-        }
+        if (alpha != 1.0f) { float *o = O + (size_t)r * HV; for (int d = 0; d < HV; d++) o[d] *= alpha; }
         mv[r] = mn;
+#endif
     }
 }
 
