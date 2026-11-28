@@ -1040,15 +1040,55 @@ typedef struct {
     const void *wk; gguf_type_t wk_t; size_t wk_head_sz;
     const float *q;      /* [T][NH*KHK] */
     float *qabs;         /* [T][NH*KVL] */
+    float *wt; size_t wt_slot; int nslots;   /* per-thread transposed F32 panel scratch; NULL = old GEMV path */
 } ds2_absorb_ctx_t;
 typedef struct {
     int T, NH, HV, KVL;
     const void *wv; gguf_type_t wv_t; size_t wv_head_sz;
     const float *ctx;    /* [T][NH*KVL] */
     float *o;            /* [T][NH*HV] */
+    float *wt; size_t wt_slot; int nslots;   /* per-thread transposed F32 panel scratch; NULL = old GEMV path */
 } ds2_vproj_ctx_t;
+static int ds2_tokgemm_ok(gguf_type_t t, int T, int n, int d);
+static float *ds2_wt_scratch(size_t slot, int *nslots);
 static void ds2_absorb_task(int idx, void *p);
 static void ds2_vproj_task(int idx, void *p);
+
+static int g_ds2_f_pfprof = -1;
+enum { DS2_PF_PRE, DS2_PF_ABS, DS2_PF_PFA, DS2_PF_VPROJ, DS2_PF_OUTP, DS2_PF_RESID, DS2_PF_FFN, DS2_PF_TOTAL, DS2_PF_N };
+static double g_ds2_pf_ms[DS2_PF_N]; static long g_ds2_pf_layers;
+
+/* Per-token pre-attention work: latent RMSNorm, RoPE on every q head and on k_pe, and the
+ * cache-row store [k_pe(ROPE); latent(KVL)]. Tokens are independent. */
+typedef struct {
+    const float *kv_norm_w; float eps; int KVL, LROW, ROPE, NH, KHK, NOPE, start_pos;
+    float *q_batch, *kvr_batch; const float *rope_cos, *rope_sin; float *cache;
+} ds2_pre_ctx_t;
+static void ds2_pre_task(int t, void *vp)
+{
+    const ds2_pre_ctx_t *x = (const ds2_pre_ctx_t *)vp;
+    float *kvr = x->kvr_batch + (size_t)t * x->LROW;
+    float ss = 0.f;
+    for (int i = 0; i < x->KVL; i++) ss += kvr[i] * kvr[i];
+    const float inv = 1.0f / sqrtf(ss / x->KVL + x->eps);
+    for (int i = 0; i < x->KVL; i++) kvr[i] *= inv * x->kv_norm_w[i];
+    const int half = x->ROPE / 2, pos = x->start_pos + t;
+    const float *cos_pos = x->rope_cos + (size_t)pos * half, *sin_pos = x->rope_sin + (size_t)pos * half;
+    float *qb = x->q_batch + (size_t)t * (size_t)x->NH * x->KHK;
+    for (int h = 0; h < x->NH; h++)
+        rope(qb + (size_t)h * x->KHK + x->NOPE, NULL, x->ROPE, 1, 0, cos_pos, sin_pos, 0, half);
+    rope(kvr + x->KVL, NULL, x->ROPE, 1, 0, cos_pos, sin_pos, 0, half);
+    float *row = x->cache + (size_t)pos * x->LROW;
+    memcpy(row, kvr + x->KVL, (size_t)x->ROPE * sizeof(float));     /* k_pe */
+    memcpy(row + x->ROPE, kvr, (size_t)x->KVL * sizeof(float));     /* latent */
+}
+
+typedef struct { float *x; const float *a; int D; } ds2_resid_ctx_t;
+static void ds2_resid_task(int t, void *vp)
+{
+    const ds2_resid_ctx_t *r = (const ds2_resid_ctx_t *)vp;
+    vec_add(r->x + (size_t)t * r->D, r->a + (size_t)t * r->D, r->D);
+}
 
 float *model_forward_prefill_deepseek2(model_t *m, const int *tokens, int n_tokens,
                                        int start_pos, volatile int *interrupt)
@@ -1143,6 +1183,9 @@ float *model_forward_prefill_deepseek2(model_t *m, const int *tokens, int n_toke
         dequantize_row(embd_row, x_batch + (size_t)t * D, D, w->type_token_embd);
     }
 
+    const int pfp = ds2_envflag("PICOLM_DS2_PFPROF", &g_ds2_f_pfprof);
+    memset(g_ds2_pf_ms, 0, sizeof g_ds2_pf_ms); g_ds2_pf_layers = 0;
+
     /* ---- Layer loop ---- */
     for (int il = 0; il < c->n_layers; il++) {
 #ifdef PICOLM_VIZ
@@ -1153,6 +1196,8 @@ float *model_forward_prefill_deepseek2(model_t *m, const int *tokens, int n_toke
         const layer_weights_t *lw = &w->layers[l];
         const glm5_layer_weights_t *gw = &w->glm5[l];
         BENCH_LAYER_START();
+        const double pf_t0 = pfp ? get_time_ms() : 0.0;
+        double pf_t1 = 0, pf_t2 = 0, pf_t3 = 0, pf_t4 = 0, pf_t5 = 0, pf_t6 = 0;
 
         if (interrupt && *interrupt) { free(pf); return NULL; }
 
@@ -1196,45 +1241,18 @@ float *model_forward_prefill_deepseek2(model_t *m, const int *tokens, int n_toke
         tensor_set_repacked(NULL);
         matmul_batch(kvr_batch, xb_batch, n_tokens, gw->mla_kv_a_mqa, D, LROW,
                      gw->type_mla_kv_a_mqa);
+        /* Latent RMSNorm, RoPE (q heads + k_pe) and the cache-row store are independent per
+         * token. They used to run as separate serial loops on the calling thread (NH+1 rope()
+         * calls per token); one pool task per token does all three, same arithmetic. */
         {
-            const float *kv_norm_w = (const float *)gw->mla_kv_a_norm;
-            for (int t = 0; t < n_tokens; t++) {
-                float *kvr = kvr_batch + (size_t)t * LROW;
-                float ss = 0.f;
-                for (int i = 0; i < KVL; i++) ss += kvr[i] * kvr[i];
-                const float inv = 1.0f / sqrtf(ss / KVL + c->rms_norm_eps);
-                for (int i = 0; i < KVL; i++) kvr[i] *= inv * kv_norm_w[i];
-            }
+            ds2_pre_ctx_t pc = { (const float *)gw->mla_kv_a_norm, c->rms_norm_eps, KVL, LROW, ROPE, NH, KHK, NOPE,
+                                 start_pos, q_batch, kvr_batch,
+                                 s->ds2.rope_cos, s->ds2.rope_sin,
+                                 s->ds2.mla_kv + (size_t)l * s->ds2.mla_kv_layer_stride };
+            tensor_parallel_for_dyn(n_tokens, ds2_pre_task, &pc);
         }
 
-        /* RoPE on q_rope (per head, last ROPE dims, pairwise) and on k_pe
-         * via tensor.c's rope() (AVX-512/AVX/NEON). */
-        {
-            const int half = ROPE / 2;
-            for (int t = 0; t < n_tokens; t++) {
-                const int pos = start_pos + t;
-                const float *cos_pos = s->ds2.rope_cos + (size_t)pos * half;
-                const float *sin_pos = s->ds2.rope_sin + (size_t)pos * half;
-                float *qb = q_batch + (size_t)t * (size_t)NH * KHK;
-                for (int h = 0; h < NH; h++)
-                    rope(qb + (size_t)h * KHK + NOPE, NULL, ROPE, 1, 0,
-                         cos_pos, sin_pos, 0, half);
-                rope(kvr_batch + (size_t)t * LROW + KVL, NULL, ROPE, 1, 0,
-                     cos_pos, sin_pos, 0, half);
-            }
-        }
-
-        /* Store cache rows for all tokens: [k_pe(ROPE); kv_latent(KVL)] */
-        {
-            float *cache = s->ds2.mla_kv + (size_t)l * s->ds2.mla_kv_layer_stride;
-            for (int t = 0; t < n_tokens; t++) {
-                float *row = cache + (size_t)(start_pos + t) * LROW;
-                const float *kvr = kvr_batch + (size_t)t * LROW;
-                memcpy(row, kvr + KVL, (size_t)ROPE * sizeof(float));    /* k_pe */
-                memcpy(row + ROPE, kvr, (size_t)KVL * sizeof(float));    /* latent */
-            }
-        }
-
+        if (pfp) pf_t1 = get_time_ms();
         /* ---- MLA attention, batched: head-partitioned absorb + V ----
          * Each head's W (128 KB F16) streams once and serves ALL tokens
          * from L2; scores+PV stay per token (causal ranges differ).
@@ -1246,8 +1264,13 @@ float *model_forward_prefill_deepseek2(model_t *m, const int *tokens, int n_toke
             ds2_kv_b_ptrs(m, l, &wk, &wk_t, &wk_head_sz, &wv, &wv_t, &wv_head_sz);
 
             ds2_absorb_ctx_t actx = { n_tokens, NH, NOPE, KVL, KHK,
-                                      wk, wk_t, wk_head_sz, q_batch, qabs_batch };
+                                      wk, wk_t, wk_head_sz, q_batch, qabs_batch, NULL, 0, 0 };
+            if (ds2_tokgemm_ok(wk_t, n_tokens, NOPE, KVL)) {
+                actx.wt_slot = (size_t)NOPE * KVL;
+                actx.wt = ds2_wt_scratch(actx.wt_slot, &actx.nslots);
+            }
             tensor_parallel_for(NH, ds2_absorb_task, &actx);
+            if (pfp) pf_t2 = get_time_ms();
 
             if (!ds2_prefill_attn_pfa(m, l, s, q_batch, qabs_batch, ctx_batch,
                                       n_tokens, start_pos, NH, KVL, ROPE, NOPE, KHK, LROW)) {
@@ -1270,26 +1293,33 @@ float *model_forward_prefill_deepseek2(model_t *m, const int *tokens, int n_toke
             }
             }
 
+            if (pfp) pf_t3 = get_time_ms();
             ds2_vproj_ctx_t vctx = { n_tokens, NH, HV, KVL,
-                                     wv, wv_t, wv_head_sz, ctx_batch, o_batch };
+                                     wv, wv_t, wv_head_sz, ctx_batch, o_batch, NULL, 0, 0 };
+            if (ds2_tokgemm_ok(wv_t, n_tokens, KVL, HV)) {
+                vctx.wt_slot = (size_t)KVL * HV;
+                vctx.wt = ds2_wt_scratch(vctx.wt_slot, &vctx.nslots);
+            }
             tensor_parallel_for(NH, ds2_vproj_task, &vctx);
+            if (pfp) pf_t4 = get_time_ms();
 
             /* outproj: ONE row-partitioned batch (W streamed once for the
              * whole batch instead of once per token) */
             matmul_batch(attn_batch, o_batch, n_tokens,
                          lw->attn_output, HVNH, D, lw->type_attn_output);
+            if (pfp) pf_t5 = get_time_ms();
         }
 
         /* Residual add: x += attn_out */
-        for (int t = 0; t < n_tokens; t++) {
-            vec_add(x_batch + (size_t)t * D, attn_batch + (size_t)t * D, D);
-        }
+        { ds2_resid_ctx_t rc = { x_batch, attn_batch, D };
+          tensor_parallel_for_dyn(n_tokens, ds2_resid_task, &rc); }
 
         /* ---- FFN block ---- */
         { ds2_batch_rmsnorm_ctx_t rctx =
               { xb_batch, x_batch, s->post_attn_norm_w[l], D, c->rms_norm_eps };
           tensor_parallel_for(n_tokens, ds2_batch_rmsnorm_task, &rctx); }
 
+        if (pfp) pf_t6 = get_time_ms();
         if (l < c->n_layer_dense_lead) {
             /* Dense SwiGLU, batched */
             matmul_dual_batch(hb_batch, hb2_batch, xb_batch, n_tokens,
@@ -1307,9 +1337,8 @@ float *model_forward_prefill_deepseek2(model_t *m, const int *tokens, int n_toke
         }
 
         /* Residual add: x += ffn_out */
-        for (int t = 0; t < n_tokens; t++) {
-            vec_add(x_batch + (size_t)t * D, attn_batch + (size_t)t * D, D);
-        }
+        { ds2_resid_ctx_t rc = { x_batch, attn_batch, D };
+          tensor_parallel_for_dyn(n_tokens, ds2_resid_task, &rc); }
 
 #ifdef PICOLM_VIZ
         for (int t = 0; t < n_tokens; t++)
@@ -1317,6 +1346,13 @@ float *model_forward_prefill_deepseek2(model_t *m, const int *tokens, int n_toke
 #endif
         steer_hook(l, x_batch, n_tokens, D, start_pos);
 
+        if (pfp) {
+            const double pf_t7 = get_time_ms();
+            const double d[DS2_PF_N] = { pf_t1 - pf_t0, pf_t2 - pf_t1, pf_t3 - pf_t2, pf_t4 - pf_t3,
+                                         pf_t5 - pf_t4, pf_t6 - pf_t5, pf_t7 - pf_t6, pf_t7 - pf_t0 };
+            for (int k = 0; k < DS2_PF_N; k++) g_ds2_pf_ms[k] += d[k];
+            g_ds2_pf_layers++;
+        }
         BENCH_LAYER_END(l, 1);
     }
 
@@ -1327,6 +1363,17 @@ float *model_forward_prefill_deepseek2(model_t *m, const int *tokens, int n_toke
         memcpy(cur, x_batch + (size_t)(n_tokens - 1) * D, D * sizeof(float));
         rmsnorm(cur, cur, s->output_norm_w, D, c->rms_norm_eps);
         matmul(s->logits, cur, w->output, D, c->vocab_size, w->type_output);
+    }
+    if (pfp && g_ds2_pf_layers) {
+        static const char *nm[DS2_PF_N] = { "pre-attn (norm,q,kv,rope,cache)", "absorb (k_b)", "attention core (PFA)",
+                                            "v_b proj", "out projection", "residual + post-attn norm",
+                                            "ffn / moe", "LAYER TOTAL" };
+        const double tot = g_ds2_pf_ms[DS2_PF_N - 1] / g_ds2_pf_layers;
+        fprintf(stderr, "\nDS2 prefill: %d tokens at pos %d, mean ms per layer (%ld layers):\n",
+                n_tokens, start_pos, g_ds2_pf_layers);
+        for (int k = 0; k < DS2_PF_N; k++)
+            fprintf(stderr, "  %-34s %9.2f ms  %5.1f%%\n", nm[k], g_ds2_pf_ms[k] / g_ds2_pf_layers,
+                    100.0 * (g_ds2_pf_ms[k] / g_ds2_pf_layers) / tot);
     }
     free(pf);
     return s->logits;
@@ -1988,11 +2035,137 @@ static int ds2_prefill_attn_pfa(const model_t *m, int layer, run_state_t *s,
  * against all T tokens' activations, one serial GEMV per (token, head).
  * This is compute-bound (~1 GMAC/layer) and reads each W once per layer,
  * versus the per-token path which re-dispatches 128-job batches T times. */
+/* ---- Token-tiled per-head GEMM for the batched absorb / v_b projections ----------------
+ *
+ * Both are, per head h, out[t][0:d] = W_h (d rows x n cols) . x[t][0:n] for every token t.
+ * They ran as one matmul() GEMV per (token, head): the head's 128 KB panel is re-read per
+ * token and nothing is shared across tokens, which measured ~5-6 GMAC/s per core against
+ * ~40 for the PFA core next to it (1 core, 128 heads, B=1200: absorb 1963 ms + v_b 1604 ms
+ * vs 2475 ms for the whole attention core, per layer).
+ *
+ * Here the panel is dequantized ONCE per head into a transposed F32 scratch Wt[n][d] (exact
+ * for F16/F32/BF16), then an 8-token x 32-column register tile streams it: every Wt vector
+ * load feeds 16 FMAs. Only the summation order differs from the GEMV (sequential in i with
+ * FMA, vs lane partials + hsum), so logits agree to float rounding, not bit for bit.
+ * Used for T >= 8 and F16/F32/BF16 panels; quantized panels keep the matmul() path because
+ * that path quantizes the activations (an F32 path would not reproduce it). d % 32 == 0. */
+#define DS2_TG_MIN_T 8
+static int ds2_tokgemm_enabled(void) {
+    static int en = -1;
+    if (en < 0) { const char *e = getenv("PICOLM_DS2_TOKGEMM"); en = !(e && atoi(e) == 0); }
+    return en;
+}
+static int ds2_tokgemm_ok(gguf_type_t t, int T, int n, int d) {
+    return ds2_tokgemm_enabled() && T >= DS2_TG_MIN_T && n >= 1 && n <= 1024 && d % 32 == 0 &&
+           (t == GGUF_TYPE_F16 || t == GGUF_TYPE_F32 || t == GGUF_TYPE_BF16);
+}
+/* Wt[i*d + j] = W[j][i] as F32 (W: d rows of n elements in `type`). */
+static void ds2_panel_T(float *Wt, const void *W, gguf_type_t type, int n, int d)
+{
+    const size_t rb = gguf_type_row_size(type, n);
+    float tmp[1024];
+    for (int j = 0; j < d; j++) {
+        dequantize_row((const uint8_t *)W + (size_t)j * rb, tmp, n, type);
+        for (int i = 0; i < n; i++) Wt[(size_t)i * d + j] = tmp[i];
+    }
+}
+/* out[t*os + j] = sum_i x[t*xs + i] * Wt[i*d + j],  t < T, j < d (d % 32 == 0) */
+static void ds2_tok_gemm(float *out, size_t os, const float *x, size_t xs, int T,
+                         const float *Wt, int n, int d)
+{
+#if defined(PICOLM_AVX512)
+#define TG_DECL(k) __m512 a##k##0 = _mm512_setzero_ps(), a##k##1 = _mm512_setzero_ps();
+#define TG_STEP(k) { const __m512 b = _mm512_set1_ps(xp[k][i]);                   \
+                     a##k##0 = _mm512_fmadd_ps(b, w0, a##k##0);                     \
+                     a##k##1 = _mm512_fmadd_ps(b, w1, a##k##1); }
+#define TG_STORE(k) if (k < nt) { float *o = out + (size_t)(t0 + k) * os + j0;      \
+                     _mm512_storeu_ps(o, a##k##0); _mm512_storeu_ps(o + 16, a##k##1); }
+    for (int t0 = 0; t0 < T; t0 += 8) {
+        const int nt = (T - t0 < 8) ? T - t0 : 8;
+        const float *xp[8];
+        for (int k = 0; k < 8; k++) xp[k] = x + (size_t)(t0 + (k < nt ? k : nt - 1)) * xs;
+        for (int j0 = 0; j0 < d; j0 += 32) {
+            TG_DECL(0) TG_DECL(1) TG_DECL(2) TG_DECL(3) TG_DECL(4) TG_DECL(5) TG_DECL(6) TG_DECL(7)
+            const float *w = Wt + j0;
+            for (int i = 0; i < n; i++, w += d) {
+                const __m512 w0 = _mm512_loadu_ps(w), w1 = _mm512_loadu_ps(w + 16);
+                TG_STEP(0) TG_STEP(1) TG_STEP(2) TG_STEP(3) TG_STEP(4) TG_STEP(5) TG_STEP(6) TG_STEP(7)
+            }
+            TG_STORE(0) TG_STORE(1) TG_STORE(2) TG_STORE(3) TG_STORE(4) TG_STORE(5) TG_STORE(6) TG_STORE(7)
+        }
+    }
+#undef TG_DECL
+#undef TG_STEP
+#undef TG_STORE
+#elif defined(PICOLM_AVX2)
+#define TG_DECL(k) __m256 a##k##0 = _mm256_setzero_ps(), a##k##1 = _mm256_setzero_ps();
+#define TG_STEP(k) { const __m256 b = _mm256_set1_ps(xp[k][i]);                   \
+                     a##k##0 = _mm256_fmadd_ps(b, w0, a##k##0);                     \
+                     a##k##1 = _mm256_fmadd_ps(b, w1, a##k##1); }
+#define TG_STORE(k) if (k < nt) { float *o = out + (size_t)(t0 + k) * os + j0;      \
+                     _mm256_storeu_ps(o, a##k##0); _mm256_storeu_ps(o + 8, a##k##1); }
+    for (int t0 = 0; t0 < T; t0 += 4) {
+        const int nt = (T - t0 < 4) ? T - t0 : 4;
+        const float *xp[4];
+        for (int k = 0; k < 4; k++) xp[k] = x + (size_t)(t0 + (k < nt ? k : nt - 1)) * xs;
+        for (int j0 = 0; j0 < d; j0 += 16) {
+            TG_DECL(0) TG_DECL(1) TG_DECL(2) TG_DECL(3)
+            const float *w = Wt + j0;
+            for (int i = 0; i < n; i++, w += d) {
+                const __m256 w0 = _mm256_loadu_ps(w), w1 = _mm256_loadu_ps(w + 8);
+                TG_STEP(0) TG_STEP(1) TG_STEP(2) TG_STEP(3)
+            }
+            TG_STORE(0) TG_STORE(1) TG_STORE(2) TG_STORE(3)
+        }
+    }
+#undef TG_DECL
+#undef TG_STEP
+#undef TG_STORE
+#else
+    for (int t = 0; t < T; t++)
+        for (int j = 0; j < d; j++) {
+            float sum = 0.f;
+            for (int i = 0; i < n; i++) sum += x[(size_t)t * xs + i] * Wt[(size_t)i * d + j];
+            out[(size_t)t * os + j] = sum;
+        }
+#endif
+}
+/* Per-thread Wt scratch (n*d floats per pool thread), grown on demand. NULL on OOM. */
+static float *ds2_wt_scratch(size_t slot, int *nslots)
+{
+    static float *buf = NULL; static size_t cap = 0;
+    int ns = tensor_get_n_threads(); if (ns < 1) ns = 1;
+    if (slot * (size_t)ns > cap) {
+        float *nb = (float *)realloc(buf, slot * (size_t)ns * sizeof(float));
+        if (!nb) return NULL;
+        buf = nb; cap = slot * (size_t)ns;
+    }
+    *nslots = ns;
+    return buf;
+}
+static float *ds2_wt_slot(float *base, size_t slot, int nslots, float **own)
+{
+    const int tid = tensor_get_thread_id();
+    *own = NULL;
+    if (tid >= 0 && tid < nslots) return base + (size_t)tid * slot;
+    *own = (float *)malloc(slot * sizeof(float));
+    if (!*own) { fprintf(stderr, "ds2 token gemm: out of memory\n"); abort(); }
+    return *own;
+}
+
 static void ds2_absorb_task(int idx, void *p) {
     const ds2_absorb_ctx_t *c = (const ds2_absorb_ctx_t *)p;
     const int h = idx;
     if (h >= c->NH) return;
     const uint8_t *W = (const uint8_t *)c->wk + (size_t)h * c->wk_head_sz;
+    if (c->wt) {
+        float *own; float *Wt = ds2_wt_slot(c->wt, c->wt_slot, c->nslots, &own);
+        ds2_panel_T(Wt, W, c->wk_t, c->NOPE, c->KVL);
+        ds2_tok_gemm(c->qabs + (size_t)h * c->KVL, (size_t)c->NH * c->KVL,
+                     c->q + (size_t)h * c->KHK, (size_t)c->NH * c->KHK, c->T, Wt, c->NOPE, c->KVL);
+        free(own);
+        return;
+    }
     for (int t = 0; t < c->T; t++)
         matmul(c->qabs + ((size_t)t * c->NH + h) * c->KVL,
                c->q + (size_t)t * c->NH * c->KHK + (size_t)h * c->KHK,
@@ -2004,6 +2177,14 @@ static void ds2_vproj_task(int idx, void *p) {
     const int h = idx;
     if (h >= c->NH) return;
     const uint8_t *W = (const uint8_t *)c->wv + (size_t)h * c->wv_head_sz;
+    if (c->wt) {
+        float *own; float *Wt = ds2_wt_slot(c->wt, c->wt_slot, c->nslots, &own);
+        ds2_panel_T(Wt, W, c->wv_t, c->KVL, c->HV);
+        ds2_tok_gemm(c->o + (size_t)h * c->HV, (size_t)c->NH * c->HV,
+                     c->ctx + (size_t)h * c->KVL, (size_t)c->NH * c->KVL, c->T, Wt, c->KVL, c->HV);
+        free(own);
+        return;
+    }
     for (int t = 0; t < c->T; t++)
         matmul(c->o + ((size_t)t * c->NH + h) * c->HV,
                c->ctx + ((size_t)t * c->NH + h) * c->KVL,

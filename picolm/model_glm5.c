@@ -3517,6 +3517,7 @@ static int glm5_moe_ffn_batch_ep_any(const model_t *m, const glm5_layer_weights_
         return 0;
     }
 
+    EPP_BEGIN(t_rt);
     /* Routing (serial, cheap: NE matmuls over [D]) */
     static int *sel_count = NULL; static size_t c_sel_count = 0;
     static float *sel_logits = NULL; static size_t c_sel_logits = 0;
@@ -3567,6 +3568,8 @@ static int glm5_moe_ffn_batch_ep_any(const model_t *m, const glm5_layer_weights_
         for (int k = 0; k < AK; k++) wt[k] *= sc2;
     }
 
+    EPP_END(t_rt, EPP_ROUTE);
+    EPP_BEGIN(t_bk);
     /* Bucket: use sel_count (accumulated during routing) to build cursors,
      * then use count as the fill counter. */
     memcpy(count, sel_count, (size_t)NE * sizeof(int));
@@ -3617,7 +3620,9 @@ static int glm5_moe_ffn_batch_ep_any(const model_t *m, const glm5_layer_weights_
         else if (forced == -2) use_batched = 0;
     }
 
+    EPP_END(t_bk, EPP_BUCKET);
     if (use_batched) {
+        EPP_BEGIN(t_ga);
         /* 1. Gather: row q of xbuf holds the activation of bucket[q]'s token,
          *    so expert e's input is the contiguous slice
          *    [cursor[e], cursor[e]+count[e]). */
@@ -3627,6 +3632,8 @@ static int glm5_moe_ffn_batch_ep_any(const model_t *m, const glm5_layer_weights_
                    (size_t)D * sizeof(float));
         }
 
+        EPP_END(t_ga, EPP_BUCKET);
+        EPP_BEGIN(t_gu);
         /* 2. Job list: gate+up for every expert with >= 2 rows (single-row
          *    experts go through matmul() to keep the exact decode-path
          *    kernel -- see the note in glm5_moe_ffn_batch_ref). */
@@ -3655,6 +3662,8 @@ static int glm5_moe_ffn_batch_ep_any(const model_t *m, const glm5_layer_weights_
                              jobs[j].n, jobs[j].d, jobs[j].qtype);
         }
 
+        EPP_END(t_gu, EPP_GATEUP);
+        EPP_BEGIN(t_s1);
         /* 3. gate/up for the n_e == 1 experts, plus SwiGLU for those rows. */
         for (int e = 0; e < NE; e++) {
             const int n_e = count[e];
@@ -3676,6 +3685,8 @@ static int glm5_moe_ffn_batch_ep_any(const model_t *m, const glm5_layer_weights_
             }
         }
 
+        EPP_END(t_s1, EPP_SINGLES);
+        EPP_BEGIN(t_sw);
         /* 4. SwiGLU over every multi-row expert's staged rows.  gu/gu2 are
          * indexed by bucket position with a per-expert offset, so the rows are
          * not contiguous across experts: walk each expert's slice. */
@@ -3697,6 +3708,8 @@ static int glm5_moe_ffn_batch_ep_any(const model_t *m, const glm5_layer_weights_
             }
         }
 
+        EPP_END(t_sw, EPP_SWIGLU);
+        EPP_BEGIN(t_dn);
         /* 5. All DOWN GEMMs in one dispatch. */
         nj = 0;
         for (int e = 0; e < NE; e++) {
@@ -3721,6 +3734,8 @@ static int glm5_moe_ffn_batch_ep_any(const model_t *m, const glm5_layer_weights_
                    FF, D, lw->type_ffn_down_exps);
         }
 
+        EPP_END(t_dn, EPP_DOWN);
+        EPP_BEGIN(t_sc);
         /* 6. Scatter each expert slice to its (token, slot) homes. */
         for (int e = 0; e < NE; e++) {
             const int n_e = count[e];
@@ -3731,6 +3746,7 @@ static int glm5_moe_ffn_batch_ep_any(const model_t *m, const glm5_layer_weights_
                 memcpy(slot_out + (size_t)bk[i] * D, dwn + (size_t)(pos + i) * D,
                        (size_t)D * sizeof(float));
         }
+        EPP_END(t_sc, EPP_REDUCE);   /* scatter counted with reduce */
     } else {
         /* Per-expert fallback (see the comment above on why this is slow). */
         ep_task_t ctx = { cur_b, bucket, count, cursor,
@@ -3741,6 +3757,7 @@ static int glm5_moe_ffn_batch_ep_any(const model_t *m, const glm5_layer_weights_
         tensor_parallel_for(NE, glm5_ep_expert_task, &ctx);
     }
 
+    EPP_BEGIN(t_rd);
     /* Reduce in slot order */
     for (int t = 0; t < NT; t++)
         for (int k = 0; k < AK; k++) {
@@ -3750,6 +3767,8 @@ static int glm5_moe_ffn_batch_ep_any(const model_t *m, const glm5_layer_weights_
             for (int j = 0; j < D; j++) o[j] += w * dd[j];
         }
 
+    EPP_END(t_rd, EPP_REDUCE);
+    EPP_BEGIN(t_sh);
     /* Shared expert, batched */
     if (lw->ffn_gate_shexp) {
         const int SFF = c->n_ff_shexp;
@@ -3765,6 +3784,7 @@ static int glm5_moe_ffn_batch_ep_any(const model_t *m, const glm5_layer_weights_
                 glm5_moe_shared_expert(m, lw, s, cur_b + (size_t)t * D, out_b + (size_t)t * D, SFF);
         }
     }
+    EPP_END(t_sh, EPP_SHARED);
     return 1;
 }
 
@@ -3923,23 +3943,26 @@ void glm5_moe_ffn_batch(const model_t *m, const glm5_layer_weights_t *gw,
                 (float)sqrt(ss/m->config.n_embd), glm5_moe_ep_enabled());
     }
     if (glm5_moe_ep_enabled()) {
-        /* Try the any-quant EP path first (works for all types), then the IQ6_K-specific multi-GEMM path. */
-        if (glm5_moe_ffn_batch_ep_any(m, gw, lw, s, cur_b, out_b, n_tokens, layer_idx)) {
+        /* Order matters. glm5_moe_ffn_batch_ep() is the engine with parallel routing, gather,
+         * SwiGLU and reduce (one pool dispatch each, no scatter copy) and one multi-GEMM per
+         * phase, but it only accepts quant types on tensor_matmul_batch_multi_ok()'s trust list
+         * (it returns 0 otherwise). glm5_moe_ffn_batch_ep_any() accepts every type, but its
+         * batched branch does routing, gather, SwiGLU, scatter and reduce SERIALLY on the calling
+         * thread (~150 us per token per layer on V3 shapes, while the other cores idle), and its
+         * per-expert branch is slower than the sequential reference. Trying _any first meant the
+         * fast engine was unreachable for any model whose experts it could have handled. */
+        static int any_first = -1;   /* PICOLM_GLM5_MOE_ANY_FIRST=1: old order, for A/B timing */
+        if (any_first < 0) { const char *e = getenv("PICOLM_GLM5_MOE_ANY_FIRST"); any_first = (e && atoi(e) > 0); }
+        if (any_first
+              ? (glm5_moe_ffn_batch_ep_any(m, gw, lw, s, cur_b, out_b, n_tokens, layer_idx) ||
+                 glm5_moe_ffn_batch_ep(m, gw, lw, s, cur_b, out_b, n_tokens, layer_idx))
+              : (glm5_moe_ffn_batch_ep(m, gw, lw, s, cur_b, out_b, n_tokens, layer_idx) ||
+                 glm5_moe_ffn_batch_ep_any(m, gw, lw, s, cur_b, out_b, n_tokens, layer_idx))) {
             if (prof) { g_epp_mode = 1; g_epp_calls++; }
             /* Report the batched MoE output so a prefill can be diffed against
              * ik's ffn_moe_out-<il> at all; without this the whole FFN was
              * invisible on the batched path and only the per-token decode path
              * emitted x.moe.* tags. */
-            if (glm5_stats_wanted()) {
-                char t2[96];
-                snprintf(t2, sizeof(t2), "l%02d.moe.out", layer_idx);
-                glm5_stats(t2, out_b, m->config.n_embd);
-            }
-            return;
-        }
-        /* Fallback: try the IQ6_K-specific multi-GEMM path. */
-        if (glm5_moe_ffn_batch_ep(m, gw, lw, s, cur_b, out_b, n_tokens, layer_idx)) {
-            if (prof) { g_epp_mode = 1; g_epp_calls++; }
             if (glm5_stats_wanted()) {
                 char t2[96];
                 snprintf(t2, sizeof(t2), "l%02d.moe.out", layer_idx);
