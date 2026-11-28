@@ -1050,6 +1050,11 @@ typedef struct {
     float *wt; size_t wt_slot; int nslots;   /* per-thread transposed F32 panel scratch; NULL = old GEMV path */
 } ds2_vproj_ctx_t;
 static int ds2_tokgemm_ok(gguf_type_t t, int T, int n, int d);
+static int ds2_mha_prefill(const model_t *m, int layer, run_state_t *s, const float *q_batch,
+                           float *o_batch, int T, int start_pos,
+                           int NH, int NOPE, int ROPE, int KVL, int KHK, int HV, int LROW,
+                           const void *wk, gguf_type_t wk_t, size_t wk_head_sz,
+                           const void *wv, gguf_type_t wv_t, size_t wv_head_sz);
 static float *ds2_wt_scratch(size_t slot, int *nslots);
 static void ds2_absorb_task(int idx, void *p);
 static void ds2_vproj_task(int idx, void *p);
@@ -1263,6 +1268,13 @@ float *model_forward_prefill_deepseek2(model_t *m, const int *tokens, int n_toke
             const void *wv; gguf_type_t wv_t; size_t wv_head_sz;
             ds2_kv_b_ptrs(m, l, &wk, &wk_t, &wk_head_sz, &wv, &wv_t, &wv_head_sz);
 
+            const int mha_done = ds2_mha_prefill(m, l, s, q_batch, o_batch, n_tokens, start_pos,
+                                                 NH, NOPE, ROPE, KVL, KHK, HV, LROW,
+                                                 wk, wk_t, wk_head_sz, wv, wv_t, wv_head_sz);
+            if (mha_done) {
+                /* expanded-MHA path: absorb + PFA + v_b collapsed into one phase */
+                if (pfp) { pf_t2 = pf_t1; pf_t3 = get_time_ms(); pf_t4 = pf_t3; }
+            } else {
             ds2_absorb_ctx_t actx = { n_tokens, NH, NOPE, KVL, KHK,
                                       wk, wk_t, wk_head_sz, q_batch, qabs_batch, NULL, 0, 0 };
             if (ds2_tokgemm_ok(wk_t, n_tokens, NOPE, KVL)) {
@@ -1302,6 +1314,7 @@ float *model_forward_prefill_deepseek2(model_t *m, const int *tokens, int n_toke
             }
             tensor_parallel_for(NH, ds2_vproj_task, &vctx);
             if (pfp) pf_t4 = get_time_ms();
+            }
 
             /* outproj: ONE row-partitioned batch (W streamed once for the
              * whole batch instead of once per token) */
@@ -2151,6 +2164,201 @@ static float *ds2_wt_slot(float *base, size_t slot, int nslots, float **own)
     *own = (float *)malloc(slot * sizeof(float));
     if (!*own) { fprintf(stderr, "ds2 token gemm: out of memory\n"); abort(); }
     return *own;
+}
+
+/* ---- Expanded-MHA prefill attention (the "naive"/MHA form of MLA) ------------------------
+ *
+ * The absorbed form scores a query against the shared 576-wide latent row: per (token, key,
+ * head) that is 576 + 512 = 1088 MACs, which is why prefill attention grows with every cached
+ * position (36 ms/layer at pos 1 -> 566 ms at pos 4234 for a 466-token batch on 24 threads).
+ * Expanding the latent per head into K = [W_k . latent | k_pe] (192 wide) and V = W_v . latent
+ * (128 wide) makes it 192 + 128 = 320 MACs per (token, key, head), at a one-off cost of
+ * 2 * 512 * 128 MACs per key per head per batch. Every cached key is attended by all B tokens
+ * of the batch, so the expansion amortizes B-fold: break-even is B ~ 170 for deep contexts and
+ * the expanded form always wins when start_pos == 0; ik_llama's FlashMLA-3 does the same.
+ *
+ * One task per head: walk the keys in tiles of 128 (expand K/V once into L2-resident tiles),
+ * run EVERY token block against the tile with the existing PFA score/PV kernels and the same
+ * online softmax, keep (m, l, O) for all B tokens of the head, normalize at the end. Output
+ * lands directly in o_batch [T][NH*HV] so the absorb and v_b phases disappear. Same math as
+ * the absorbed path (float rounding differs). Needs F16/F32/BF16 panels and T >= 192
+ * (PICOLM_DS2_MHA=0 disables, =N sets the minimum T). */
+#define DS2_MHA_KT 128
+static int ds2_mha_min_t(void) {
+    static int v = -2;
+    if (v == -2) {
+        const char *e = getenv("PICOLM_DS2_MHA");
+        const int n = e ? atoi(e) : 1;
+        v = n <= 0 ? 0 : (n == 1 ? 192 : n);
+    }
+    return v;
+}
+static int ds2_mha_ok(gguf_type_t wk_t, gguf_type_t wv_t, int T,
+                      int NOPE, int ROPE, int KVL, int KHK, int HV)
+{
+    const int mn = ds2_mha_min_t();
+    const int tok = (wk_t == GGUF_TYPE_F16 || wk_t == GGUF_TYPE_F32 || wk_t == GGUF_TYPE_BF16) &&
+                    (wv_t == GGUF_TYPE_F16 || wv_t == GGUF_TYPE_F32 || wv_t == GGUF_TYPE_BF16);
+    return mn > 0 && T >= mn && tok && KHK == NOPE + ROPE && (KHK & 15) == 0 &&
+           NOPE % 32 == 0 && HV % 64 == 0 && KVL >= 1 && KVL <= 1024;
+}
+typedef struct {
+    int NH, NOPE, ROPE, KVL, KHK, HV, LROW, T, start_pos;
+    float scale;
+    const float *cache;             /* layer cache, rows [k_pe(ROPE) | latent(KVL)] */
+    const float *q_batch;           /* [T][NH*KHK], RoPE already applied */
+    float *o_batch;                 /* [T][NH*HV] */
+    const void *wk; gguf_type_t wk_t; size_t wk_head_sz;
+    const void *wv; gguf_type_t wv_t; size_t wv_head_sz;
+    float *scratch; size_t slot; int nslots;
+} ds2_mha_t;
+
+/* Online-softmax update of R score rows (S, stride DS2_PFA_BK) against keys [kbase, kbase+nk):
+ * row r may see keys <= lim0 + r. Updates m/l/O (O rows HV wide) exactly like ds2_pfa_task. */
+static void ds2_mha_softmax(float *S, int R, int nk, int kbase, int lim0,
+                            float *mv, float *lv, float *O, int HV)
+{
+    for (int r = 0; r < R; r++) {
+        float *sr = S + (size_t)r * DS2_PFA_BK;
+        const int vis = lim0 + r - kbase + 1;
+        const int nv = vis < 0 ? 0 : (vis > nk ? nk : vis);
+#if defined(PICOLM_AVX512)
+        if (nv == 0) { for (int j = 0; j < nk; j++) sr[j] = 0.f; continue; }
+        __m512 vmx = _mm512_set1_ps(-INFINITY);
+        for (int j = 0; j < nv; j += 16) {
+            const int rem = nv - j;
+            const __mmask16 mk = rem >= 16 ? (__mmask16)0xFFFF : (__mmask16)((1u << rem) - 1u);
+            vmx = _mm512_mask_max_ps(vmx, mk, vmx, _mm512_loadu_ps(sr + j));
+        }
+        const float bm = _mm512_reduce_max_ps(vmx);
+        const float mn = bm > mv[r] ? bm : mv[r];
+        const float alpha = expf(mv[r] - mn);
+        const __m512 vmn = _mm512_set1_ps(mn);
+        __m512 vsum = _mm512_setzero_ps();
+        for (int j = 0; j < nv; j += 16) {
+            const int rem = nv - j;
+            const __mmask16 mk = rem >= 16 ? (__mmask16)0xFFFF : (__mmask16)((1u << rem) - 1u);
+            const __m512 e = _mm512_maskz_mov_ps(mk,
+                picolm_expf16_avx512(_mm512_sub_ps(_mm512_loadu_ps(sr + j), vmn)));
+            _mm512_storeu_ps(sr + j, e);
+            vsum = _mm512_add_ps(vsum, e);
+        }
+        const float sum = _mm512_reduce_add_ps(vsum);
+        for (int j = (nv + 15) & ~15; j < nk; j++) sr[j] = 0.f;
+        lv[r] = lv[r] * alpha + sum;
+#else
+        for (int j = nv; j < nk; j++) sr[j] = -INFINITY;
+        float bm = -INFINITY;
+        for (int j = 0; j < nv; j++) if (sr[j] > bm) bm = sr[j];
+        if (nv == 0) { for (int j = 0; j < nk; j++) sr[j] = 0.f; continue; }
+        const float mn = bm > mv[r] ? bm : mv[r];
+        const float alpha = expf(mv[r] - mn);
+        float sum = 0.f;
+        for (int j = 0; j < nv; j++) { float e = expf(sr[j] - mn); sr[j] = e; sum += e; }
+        for (int j = nv; j < nk; j++) sr[j] = 0.f;
+        lv[r] = lv[r] * alpha + sum;
+#endif
+        if (alpha != 1.0f) {
+            float *o = O + (size_t)r * HV;
+            for (int d = 0; d < HV; d++) o[d] *= alpha;
+        }
+        mv[r] = mn;
+    }
+}
+
+static void ds2_mha_task(int h, void *vp)
+{
+    const ds2_mha_t *x = (const ds2_mha_t *)vp;
+    if (h >= x->NH) return;
+    const int NH = x->NH, NOPE = x->NOPE, ROPE = x->ROPE, KVL = x->KVL, KHK = x->KHK;
+    const int HV = x->HV, LROW = x->LROW, T = x->T, start = x->start_pos, N = start + T;
+    float *own; float *sl = ds2_wt_slot(x->scratch, x->slot, x->nslots, &own);
+    float *Wk = sl, *WvT = Wk + (size_t)KVL * NOPE, *Kt = WvT + (size_t)KVL * HV;
+    float *Vt = Kt + (size_t)DS2_MHA_KT * KHK, *S = Vt + (size_t)DS2_MHA_KT * HV;
+    float *O = S + (size_t)DS2_PFA_MAXR * DS2_PFA_BK, *mv = O + (size_t)T * HV, *lv = mv + T;
+
+    /* Per-head panels as F32: Wk [KVL][NOPE] is already the [n][d] layout of the K expansion;
+     * W_v needs the transpose (same helper the token-tiled v_b path uses). */
+    const uint8_t *Wkh = (const uint8_t *)x->wk + (size_t)h * x->wk_head_sz;
+    const uint8_t *Wvh = (const uint8_t *)x->wv + (size_t)h * x->wv_head_sz;
+    const float *WkP;
+    if (x->wk_t == GGUF_TYPE_F32) WkP = (const float *)Wkh;
+    else {
+        const size_t rb = gguf_type_row_size(x->wk_t, NOPE);
+        for (int j = 0; j < KVL; j++)
+            dequantize_row(Wkh + (size_t)j * rb, Wk + (size_t)j * NOPE, NOPE, x->wk_t);
+        WkP = Wk;
+    }
+    ds2_panel_T(WvT, Wvh, x->wv_t, KVL, HV);
+
+    memset(O, 0, (size_t)T * HV * sizeof(float));
+    for (int t = 0; t < T; t++) { mv[t] = -INFINITY; lv[t] = 0.f; }
+
+    for (int k0 = 0; k0 < N; k0 += DS2_MHA_KT) {
+        const int nk = (N - k0 < DS2_MHA_KT) ? N - k0 : DS2_MHA_KT;
+        const float *lat = x->cache + (size_t)k0 * LROW + ROPE;
+        ds2_tok_gemm(Kt, (size_t)KHK, lat, (size_t)LROW, nk, WkP, KVL, NOPE);
+        ds2_tok_gemm(Vt, (size_t)HV, lat, (size_t)LROW, nk, WvT, KVL, HV);
+        for (int j = 0; j < nk; j++)
+            memcpy(Kt + (size_t)j * KHK + NOPE, x->cache + (size_t)(k0 + j) * LROW,
+                   (size_t)ROPE * sizeof(float));
+
+        /* first token that can see key k0 (token t sees keys <= start + t), 64-aligned */
+        int t_lo = k0 - start; if (t_lo < 0) t_lo = 0;
+        for (int t0 = (t_lo / 64) * 64; t0 < T; t0 += 64) {
+            const int R = (T - t0 < 64) ? T - t0 : 64;
+            const float *qp[64];
+            for (int r = 0; r < R; r++)
+                qp[r] = x->q_batch + (size_t)(t0 + r) * NH * KHK + (size_t)h * KHK;
+            for (int kb = 0; kb < nk; kb += DS2_PFA_BK) {
+                const int nkb = (nk - kb < DS2_PFA_BK) ? nk - kb : DS2_PFA_BK;
+                if (start + t0 + R - 1 < k0 + kb) continue;     /* no row sees any of these keys */
+                ds2_pfa_scores(qp, R, Kt + (size_t)kb * KHK, nkb, KHK, KHK, S, x->scale);
+                ds2_mha_softmax(S, R, nkb, k0 + kb, start + t0, mv + t0, lv + t0,
+                                O + (size_t)t0 * HV, HV);
+                ds2_pfa_pv(O + (size_t)t0 * HV, R, S, nkb, Vt + (size_t)kb * HV, HV, HV);
+            }
+        }
+    }
+    for (int t = 0; t < T; t++) {
+        const float inv = (lv[t] > 0.f) ? 1.0f / lv[t] : 1.0f;
+        const float *o = O + (size_t)t * HV;
+        float *dst = x->o_batch + (size_t)t * NH * HV + (size_t)h * HV;
+        for (int d = 0; d < HV; d++) dst[d] = o[d] * inv;
+    }
+    free(own);
+}
+
+/* Returns 1 if it ran (caller skips absorb / PFA / v_b), 0 to use the absorbed path. */
+static int ds2_mha_prefill(const model_t *m, int layer, run_state_t *s, const float *q_batch,
+                           float *o_batch, int T, int start_pos,
+                           int NH, int NOPE, int ROPE, int KVL, int KHK, int HV, int LROW,
+                           const void *wk, gguf_type_t wk_t, size_t wk_head_sz,
+                           const void *wv, gguf_type_t wv_t, size_t wv_head_sz)
+{
+    (void)m;
+    if (!ds2_mha_ok(wk_t, wv_t, T, NOPE, ROPE, KVL, KHK, HV)) return 0;
+    static float *buf = NULL; static size_t cap = 0;
+    int nslots = tensor_get_n_threads(); if (nslots < 1) nslots = 1;
+    const size_t slot = (size_t)KVL * NOPE + (size_t)KVL * HV + (size_t)DS2_MHA_KT * KHK +
+                        (size_t)DS2_MHA_KT * HV + (size_t)DS2_PFA_MAXR * DS2_PFA_BK +
+                        (size_t)T * HV + 2 * (size_t)T;
+    const size_t need = slot * (size_t)nslots;
+    if (need > cap) {
+        float *nb = (float *)realloc(buf, need * sizeof(float));
+        if (!nb) return 0;
+        buf = nb; cap = need;
+    }
+    ds2_mha_t x;
+    x.NH = NH; x.NOPE = NOPE; x.ROPE = ROPE; x.KVL = KVL; x.KHK = KHK; x.HV = HV; x.LROW = LROW;
+    x.T = T; x.start_pos = start_pos; x.scale = s->ds2.kq_scale;
+    x.cache = s->ds2.mla_kv + (size_t)layer * s->ds2.mla_kv_layer_stride;
+    x.q_batch = q_batch; x.o_batch = o_batch;
+    x.wk = wk; x.wk_t = wk_t; x.wk_head_sz = wk_head_sz;
+    x.wv = wv; x.wv_t = wv_t; x.wv_head_sz = wv_head_sz;
+    x.scratch = buf; x.slot = slot; x.nslots = nslots;
+    tensor_parallel_for_dyn(NH, ds2_mha_task, &x);
+    return 1;
 }
 
 static void ds2_absorb_task(int idx, void *p) {
