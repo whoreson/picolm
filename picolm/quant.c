@@ -11341,6 +11341,96 @@ IQ3_DOTN_DEF(8)
 #undef IQ3_MADD2
 #endif /* __AVX2__ */
 
+/* ---- AVX-512 VNNI flavour of the multi-column kernel -----------------------------------
+ *
+ * Same decode-once structure, but a 64-weight tile is ONE zmm of grid bytes plus a 64-bit
+ * sign mask, and per column the MAC part is: mask-negate the activations where the weight
+ * is negative, dpbusd (u8 grid x s8 act -> 16 int32, each a 4-product partial), and
+ * dpwssd with the per-32-group scale (2*ls+1) folded in (lanes 0-7 = first group, 8-15 =
+ * second). That is 3 ALU uops per 64 MACs per column against 8 for the 256-bit kernel.
+ * Integer-exact (|partial| <= 4*62*127 fits the int16 view dpwssd takes); the two zmm
+ * halves are folded to the 8-lane layout the single-column dot accumulates in, so the
+ * float accumulation order -- and therefore every output bit -- is unchanged. */
+#if defined(__AVX2__) && defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+static inline uint32_t iq3xxs_mask32(const uint32_t a) {
+    return (uint32_t)ksigns_iq2xs[a & 127] | ((uint32_t)ksigns_iq2xs[(a >> 7) & 127] << 8) |
+           ((uint32_t)ksigns_iq2xs[(a >> 14) & 127] << 16) | ((uint32_t)ksigns_iq2xs[(a >> 21) & 127] << 24);
+}
+static inline uint64_t iq3xxs_mask64(const uint32_t a0, const uint32_t a1) {
+    /* (A gather + pack version of this measured SLOWER than 8 scalar table loads.) */
+    return (uint64_t)iq3xxs_mask32(a0) | ((uint64_t)iq3xxs_mask32(a1) << 32);
+}
+#define IQZ_INIT(c) if ((c) < nc_) { accf[c] = _mm256_setzero_ps(); yp[c] = (const block_q8_K *)(yb + (size_t)(c) * ys); }
+#define IQZ_ZERO(c) if ((c) < nc_) { s[c] = _mm512_setzero_si512(); q8p[c] = yp[c][i].qs; }
+#define IQZ_ACC(c) if ((c) < nc_) {                                                          \
+        const __m512i a_ = _mm512_loadu_si512((const void *)q8p[c]); q8p[c] += 64;            \
+        const __m512i as_ = _mm512_mask_sub_epi8(a_, kmask, zero, a_);                        \
+        const __m512i t_ = _mm512_dpbusd_epi32(zero, G, as_);                                 \
+        s[c] = _mm512_dpwssd_epi32(s[c], t_, scv); }
+#define IQZ_FIN(c) if ((c) < nc_) {                                                          \
+        const __m256i s8_ = _mm256_add_epi32(_mm512_castsi512_si256(s[c]),                    \
+                                             _mm512_extracti64x4_epi64(s[c], 1));             \
+        accf[c] = _mm256_fmadd_ps(_mm256_set1_ps(dw * yp[c][i].d), _mm256_cvtepi32_ps(s8_), accf[c]); }
+#define IQZ_OUT(c) if ((c) < nc_) res[c] = 0.25f * iq3xxs_hsum(accf[c]);
+#define IQZ_ALL(M) M(0) M(1) M(2) M(3) M(4) M(5) M(6) M(7)
+#define IQZ_DOTN_DEF(NC)                                                                     \
+static void iq3xxs_dotz_##NC(const block_iq3_xxs *x, const char *yb, size_t ys, int nb,       \
+                             float *res) {                                                   \
+    const int nc_ = NC; __m256 accf[8]; __m512i s[8];                                        \
+    const block_q8_K *yp[8]; const int8_t *q8p[8];                                           \
+    const __m512i zero = _mm512_setzero_si512();                                             \
+    IQZ_ALL(IQZ_INIT)                                                                        \
+    for (int i = 0; i < nb; ++i) {                                                           \
+        const float dw = fp16_to_fp32_lookup(x[i].d);                                        \
+        const uint8_t *q3 = x[i].qs, *gas = x[i].qs + QK_K / 4;                              \
+        IQZ_ALL(IQZ_ZERO)                                                                    \
+        for (int ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {                                    \
+            const __m512i G = _mm512_i32gather_epi32(                                        \
+                    _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)q3)),              \
+                    (const void *)iq3xxs_grid, 4);                                           \
+            q3 += 16;                                                                        \
+            uint32_t aux32[2]; memcpy(aux32, gas, 8); gas += 8;                              \
+            const __mmask64 kmask = _cvtu64_mask64(iq3xxs_mask64(aux32[0], aux32[1]));       \
+            const __m512i scv = _mm512_mask_blend_epi32((__mmask16)0xFF00,                   \
+                    _mm512_set1_epi32(2 * (int)(aux32[0] >> 28) + 1),                        \
+                    _mm512_set1_epi32(2 * (int)(aux32[1] >> 28) + 1));                       \
+            IQZ_ALL(IQZ_ACC)                                                                 \
+        }                                                                                    \
+        IQZ_ALL(IQZ_FIN)                                                                     \
+    }                                                                                        \
+    IQZ_ALL(IQZ_OUT)                                                                         \
+}
+IQZ_DOTN_DEF(1)
+IQZ_DOTN_DEF(2)
+IQZ_DOTN_DEF(3)
+IQZ_DOTN_DEF(4)
+IQZ_DOTN_DEF(5)
+IQZ_DOTN_DEF(6)
+IQZ_DOTN_DEF(7)
+IQZ_DOTN_DEF(8)
+#undef IQZ_DOTN_DEF
+#undef IQZ_ALL
+#undef IQZ_OUT
+#undef IQZ_FIN
+#undef IQZ_ACC
+#undef IQZ_ZERO
+#undef IQZ_INIT
+#define IQ3_HAVE_Z 1
+#endif
+
+/* Column count from which the decode-once R8 engine beats the fused multi-column dot, measured
+ * single-thread on the MoE shapes (2048x7168, 7168x2048): equal at 32 columns with the AVX-512
+ * VNNI kernel (0.35 ms/col vs R8's 7.3 ms fixed + ~0.14 ms/col), at ~18 with the 256-bit one. */
+int picolm_iq3xxs_cols_gate(void)
+{
+#if defined(IQ3_HAVE_Z)
+    const char *e = getenv("PICOLM_IQ3_Z");
+    return (e && atoi(e) == 0) ? 18 : 32;
+#else
+    return 18;
+#endif
+}
+
 void vec_dot_iq3_xxs_q8_k_cols(const void *vx, const void *vy, size_t ystride, int nc, int n,
                                float *res)
 {
@@ -11351,6 +11441,29 @@ void vec_dot_iq3_xxs_q8_k_cols(const void *vx, const void *vy, size_t ystride, i
         const char *y = (const char *)vy;
         const int nb = n / QK_K;
         /* One decode per group of up to 8 columns: remainders get their own exact-NC kernel. */
+#if defined(IQ3_HAVE_Z)
+        static int use_z = -1;                 /* PICOLM_IQ3_Z=0: 256-bit kernels, for A/B timing */
+        if (use_z < 0) { const char *e = getenv("PICOLM_IQ3_Z"); use_z = !(e && atoi(e) == 0); }
+        if (use_z) {
+            int c = 0;
+            while (c < nc) {
+                const int g = (nc - c >= 8) ? 8 : (nc - c);
+                const char *yc = y + (size_t)c * ystride; float *rc = res + c;
+                switch (g) {
+                case 8: iq3xxs_dotz_8(x, yc, ystride, nb, rc); break;
+                case 7: iq3xxs_dotz_7(x, yc, ystride, nb, rc); break;
+                case 6: iq3xxs_dotz_6(x, yc, ystride, nb, rc); break;
+                case 5: iq3xxs_dotz_5(x, yc, ystride, nb, rc); break;
+                case 4: iq3xxs_dotz_4(x, yc, ystride, nb, rc); break;
+                case 3: iq3xxs_dotz_3(x, yc, ystride, nb, rc); break;
+                case 2: iq3xxs_dotz_2(x, yc, ystride, nb, rc); break;
+                default: iq3xxs_dotz_1(x, yc, ystride, nb, rc); break;
+                }
+                c += g;
+            }
+            return;
+        }
+#endif
         int c = 0;
         while (c < nc) {
             const int g = (nc - c >= 8) ? 8 : (nc - c);

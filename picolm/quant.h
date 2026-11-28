@@ -2156,6 +2156,8 @@ float vec_dot_iq3_xxs_q8_k(const void *vx, const void *vy, int n);
 /* NC columns at once for one weight row: decode shared, bit-identical to NC calls of the above.
  * ystride = byte stride between activation columns; res[c] gets column c's dot. */
 void vec_dot_iq3_xxs_q8_k_cols(const void *vx, const void *vy, size_t ystride, int nc, int n, float *res);
+/* ncols from which the decode-once R8 engine wins over the fused multi-column dot (kernel dependent). */
+int picolm_iq3xxs_cols_gate(void);
 /* Scalar (integer-exact) reference for vec_dot_iq3_xxs_q8_k, used as the
  * validation oracle by tests/kq_gemm_check.c. */
 float vec_dot_iq3_xxs_q8_k_ref(const void *vx, const void *vy, int n);

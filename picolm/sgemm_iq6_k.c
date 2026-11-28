@@ -1894,13 +1894,13 @@ static int kq_best(const char *name, kq_r8_fn r8v, kq_r8_fn r8t, float (*dot)(co
                    kq_cols_fn cols) {
     /* Types with a multi-column fused dot keep the repack-based decode-once R8 engine only
      * where it actually wins. Measured single-thread on the MoE shapes (2048x7168 and
-     * 7168x2048, IQ3_XXS, AVX-512 VNNI): fused 8 cols 3.8 ms, 16 cols 7.5 ms (0.47 ms/col);
-     * R8 costs ~7.3 ms fixed + 0.14 ms/col. They cross at ~18 columns (R8 was gated at 16).
-     * PICOLM_KQ_R8_MIN_N still overrides. */
+     * 7168x2048, IQ3_XXS): the fused kernel costs ~0.35 ms/col (AVX-512 VNNI) and R8 ~7.3 ms
+     * fixed + 0.14 ms/col, so they cross at 32 columns (18 with the 256-bit kernel); see
+     * picolm_iq3xxs_cols_gate(). PICOLM_KQ_R8_MIN_N still overrides. */
     int r = 0;
     {
         static int mn = -1;
-        if (mn < 0) { const char *e = getenv("PICOLM_KQ_R8_MIN_N"); mn = (e && atoi(e) > 0) ? 0 : 18; }
+        if (mn < 0) { const char *e = getenv("PICOLM_KQ_R8_MIN_N"); mn = (e && atoi(e) > 0) ? 0 : picolm_iq3xxs_cols_gate(); }
         if (!(cols && mn && ncols < mn))
             r = kq_fast(name, r8v, r8t, nrows, ncols, k, vx, vy, out, bs, ith, nth);
     }

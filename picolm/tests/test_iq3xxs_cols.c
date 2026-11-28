@@ -51,7 +51,7 @@ static int run(int n, int d, int ncols)
     /* Through the table GEMM (below the R8 gate it must equal the per-column dot too). */
     memset(out, 0, (size_t)ncols * d * sizeof(float));
     ti->fn_gemm(d, ncols, n, W, q, out, (size_t)d, 0, 1);
-    if (ncols < 16)
+    if (ncols < picolm_iq3xxs_cols_gate())   /* below the R8 gate it must equal the per-column dot */
         for (int i = 0; i < d; i++)
             for (int c = 0; c < ncols; c++) {
                 float ref = vec_dot_iq3_xxs_q8_k(W + (size_t)i * rb, q + c * qs, n);
