@@ -36,6 +36,7 @@ static size_t row_bytes_of(int fmt, int I) {
     case 5: return (size_t)(I / 256) * 176;   /* Q5_K */
     case 6: return (size_t)(I / 256) * 210;   /* Q6_K */
     case 7: return (size_t)(I / 256) * 212;   /* IQ6_K */
+    case 9: return (size_t)(I / 256) * 144;   /* IQ4_K */
     default: return (size_t)(I / 32) * 34;    /* Q8_0 */
     }
 }
@@ -55,6 +56,11 @@ static void make_weights(std::vector<uint8_t> &w, int fmt, int I, int O) {
                 memcpy(blk, &d, 2);
                 for (int k = 0; k < 16; k++) blk[4 + k] = (uint8_t)(int8_t)((int)(rnd() % 41) - 20);
                 b += 212; }
+            else if (fmt == 9) { /* IQ4_K: d at 0, uint16 extra, scales_h[4]+scales_l[8]
+                                  * (random bytes cover all 6-bit scale / LUT-select
+                                  * combinations); qs stays random. */
+                memcpy(blk, &d, 2);
+                b += 144; }
             else { memcpy(blk, &d, 2); b += 34; }
         }
 }
@@ -71,7 +77,8 @@ static void check(const float *y, int ys, const std::vector<float> &x, int S, in
     for (int j = 0; j < NO; j++) {
         const uint8_t *r = &w[(size_t)oo[j] * rb];
         if (fmt == 5) dequantize_row_q5_K(r, Wr[j].data(), I); else if (fmt == 6) dequantize_row_q6_K(r, Wr[j].data(), I);
-        else if (fmt == 7) dequantize_row_iq6_k(r, Wr[j].data(), I); else dequantize_row_q8_0(r, Wr[j].data(), I);
+        else if (fmt == 7) dequantize_row_iq6_k(r, Wr[j].data(), I);
+        else if (fmt == 9) dequantize_row_iq4_k(r, Wr[j].data(), I); else dequantize_row_q8_0(r, Wr[j].data(), I);
         for (int k = 0; k < I; k++) Wr[j][k] = h2f(f2h(Wr[j][k]));
     }
     *worst_rel = 0; *nonfinite_total = 0;
@@ -161,8 +168,8 @@ int main(void) {
     if (prop.major < 8) { printf("needs sm_80+: skipped\n"); return 0; }
     fp16_table_init();     /* quant.c's Q6_K / Q8_0 dequantisers read d through a lookup table */
     int f = 0;
-    const int fmts[4] = {5, 6, 7, 8};
-    for (int i = 0; i < 4; i++) {
+    const int fmts[5] = {5, 6, 7, 9, 8};
+    for (int i = 0; i < 5; i++) {
         const int fmt = fmts[i];
         /* correctness: ragged shapes, then the real Qwen3.6-27B projections */
         f |= run(fmt, 100, 512, 136, "ragged");

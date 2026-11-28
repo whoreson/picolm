@@ -545,6 +545,7 @@ static int gguf_block_size(gguf_type_t qtype) {
      * the Q8_0_R8 branch there), so it runs the ordinary Q8_0 kernels. */
     case 203: return 34;
     case 141: return GPU_BLOCK_IQ6_K_SIZE; /* IQ6_K: 212 bytes per 256 values */
+    case 139: return 144;  /* IQ4_K: d(2)+extra(2)+scales_h(4)+scales_l(8)+qs(128) per 256 */
     default: return 0;
     }
 }
@@ -668,8 +669,9 @@ int picolm_gpu_tensor_upload(void **tensor,
     /* Native K-quant upload path. All K-quant types (Q2_K through Q6_K)
      * use native IMMA fast path when eligible. Fall back to scalar
      * dequant when IMMA cannot fire (small S/O, non-256-aligned I). */
-    if ((qtype == 10 || qtype == 11 || qtype == 12 || qtype == 13 || qtype == 14 || qtype == 141) && (I % 256) == 0 && O >= 8) {
+    if ((qtype == 10 || qtype == 11 || qtype == 12 || qtype == 13 || qtype == 14 || qtype == 141 || qtype == 139) && (I % 256) == 0 && O >= 8) {
         size_t blk_size = (qtype == 141) ? GPU_BLOCK_IQ6_K_SIZE :
+                          (qtype == 139) ? 144 :
                           (qtype == 14) ? GPU_BLOCK_Q6_K_SIZE :
                           (qtype == 13) ? GPU_BLOCK_Q5_K_SIZE :
                           (qtype == 12) ? GPU_BLOCK_Q4_K_SIZE :
@@ -694,7 +696,9 @@ int picolm_gpu_tensor_upload(void **tensor,
                 const char *qname = (qtype == 10) ? "Q2_K" :
                                     (qtype == 11) ? "Q3_K" :
                                     (qtype == 12) ? "Q4_K" :
-                                    (qtype == 13) ? "Q5_K" : "Q6_K";
+                                    (qtype == 13) ? "Q5_K" :
+                                    (qtype == 139) ? "IQ4_K" :
+                                    (qtype == 141) ? "IQ6_K" : "Q6_K";
                 /* Check if IMMA is available on this GPU */
                 const char *path = "GPU dequant + IMMA";
                 if (!ctx->has_imma) path = "GPU dequant (no IMMA, scalar fallback)";
@@ -1657,16 +1661,18 @@ matmul_dev_impl(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
     int I = t->I, O = t->O;
     int ys = y_stride > 0 ? y_stride : O;
 
-    /* fp16 tensor-core GEMM with in-smem dequant (Q5_K / Q6_K / IQ6_K / Q8_0) for prefill
-     * batches. No Q8_0 activation quantisation and no per-sub-block epilogue; see
-     * backend_gpu_gemm_f16.cuh. Opt in with PICOLM_F16_GEMM=1 until it has been validated
-     * on the target GPU (tests/test_gemm_f16_gpu), then invert this check.
+    /* fp16 tensor-core GEMM with in-smem dequant (Q5_K / Q6_K / IQ6_K / IQ4_K / Q8_0)
+     * for prefill batches. No Q8_0 activation quantisation and no per-sub-block
+     * epilogue; see backend_gpu_gemm_f16.cuh. Opt in with PICOLM_F16_GEMM=1 until it
+     * has been validated on the target GPU (tests/test_gemm_f16_gpu), then invert
+     * this check.
      * PICOLM_F16_GEMM_MIN_S sets the smallest batch it takes (default 32);
      * PICOLM_GEMM_F16_TILE=BMxBN forces a tile shape. Falls through to the int8 kernels
      * whenever the launcher declines (alignment, shape, shared memory).
      * Q8_0_R8 (type 203) tensors are repacked to plain Q8_0 at upload time, so they
-     * arrive here as GGUF_TYPE_Q8_0 and take this path for free. IQ6_K (141) needs
-     * S >= f16g_min_s to beat its int8 path (S==1 keeps the GEMV below). */
+     * arrive here as GGUF_TYPE_Q8_0 and take this path for free. IQ6_K (141) and
+     * IQ4_K (139) need S >= f16g_min_s to beat their int8 paths (S==1 keeps the
+     * GEMV below). */
     {
         static int f16g = -1, f16g_min_s = 32;
         if (f16g < 0) {
@@ -1677,7 +1683,8 @@ matmul_dev_impl(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
         if (f16g && ctx->has_imma && !picolm_gpu_no_imma() && S >= f16g_min_s) {
             const int fmt = t->qtype == GGUF_TYPE_Q5_K ? 5 : t->qtype == GGUF_TYPE_Q6_K ? 6
                           : t->qtype == GGUF_TYPE_IQ6_K ? 7
-                          : t->qtype == GGUF_TYPE_Q8_0 ? 8 : 0;
+                          : t->qtype == GGUF_TYPE_Q8_0 ? 8
+                          : t->qtype == GGUF_TYPE_IQ4_K ? 9 : 0;
             if (fmt && picolm_gpu_gemm_f16_launch(ctx->stream, fmt, y_dev, x_dev, t->weights,
                                                   S, I, O, (size_t)t->row_bytes, x_stride, y_stride)) {
                 gpu_dispatch_print("matmul_f16_gemm_dev");

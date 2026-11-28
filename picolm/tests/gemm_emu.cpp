@@ -34,6 +34,7 @@ static size_t row_bytes_of(int fmt, int I) {
     case 5: return (size_t)(I / 256) * 176;   /* Q5_K */
     case 6: return (size_t)(I / 256) * 210;   /* Q6_K */
     case 7: return (size_t)(I / 256) * 212;   /* IQ6_K */
+    case 9: return (size_t)(I / 256) * 144;   /* IQ4_K */
     default: return (size_t)(I / 32) * 34;    /* Q8_0 */
     }
 }
@@ -55,6 +56,13 @@ static void make_weights(std::vector<uint8_t> &w, int fmt, int I, int O) {
                 memcpy(blk, &d, 2);                       /* d at byte 0 */
                 for (int k = 0; k < 16; k++) blk[4 + k] = (uint8_t)(int8_t)((int)(rnd() % 41) - 20);
                 b += 212; }
+            else if (fmt == 9) { /* IQ4_K: d, extra, scales_h[4], scales_l[8]; qs stays random.
+                                  * scales_l nibbles are 6-bit magnitudes biased by -32 and
+                                  * scales_h carries the top 2 bits of each pair, so random
+                                  * bytes give scales in [-32,31] -- dl*lut stays in fp16
+                                  * range for any lut value, no clamping needed. */
+                memcpy(blk, &d, 2);                       /* d at byte 0 */
+                b += 144; }
             else { memcpy(blk, &d, 2); b += 34; }
         }
 }
@@ -64,7 +72,8 @@ static void ref_dequant(const std::vector<uint8_t> &w, int fmt, int I, int O, st
     for (int o = 0; o < O; o++) {
         const uint8_t *r = &w[(size_t)o * rb]; float *d = &out[(size_t)o * I];
         if (fmt == 5) dequantize_row_q5_K(r, d, I); else if (fmt == 6) dequantize_row_q6_K(r, d, I);
-        else if (fmt == 7) dequantize_row_iq6_k(r, d, I); else dequantize_row_q8_0(r, d, I);
+        else if (fmt == 7) dequantize_row_iq6_k(r, d, I);
+        else if (fmt == 9) dequantize_row_iq4_k(r, d, I); else dequantize_row_q8_0(r, d, I);
     }
 }
 
@@ -154,6 +163,7 @@ int main(int argc, char **argv) {
     f |= run_fmt<GEMMF_Q5_K>(quick);
     f |= run_fmt<GEMMF_Q6_K>(quick);
     f |= run_fmt<GEMMF_IQ6_K>(quick);
+    f |= run_fmt<GEMMF_IQ4_K>(quick);
     printf(f ? "FAILED\n" : "all ok\n");
     return f;
 }

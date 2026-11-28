@@ -2010,6 +2010,8 @@ int sgemm_iq3_k_r4_q8_k_avx2(int nrows, int ncols, int k,
 void vec_dot_iq4_k_q8_k_avx2(const void *vx, const void *wy, int n, float *out);
 /* IQ4_K plain x Q8_K scalar vec_dot. */
 float vec_dot_iq4_k_q8_k(const void *vx, const void *wy, int n);
+/* IQ4_K plain row dequantizer (GPU fp16-GEMM emulator reference). */
+void dequantize_row_iq4_k(const void *src, float *dst, int n);
 /* IQ6_K plain (GGUF type 141): 6-bit non-linear quant, 212-byte blocks. */
 void dequantize_row_iq6_k(const void *src, float *dst, int n);
 /* Max activation rows decoded-weight reuse covers per kernel call. */

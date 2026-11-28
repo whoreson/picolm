@@ -14,6 +14,30 @@ __device__ static const uint8_t iq6nl_lut_dev[64] = {
    175, 179, 183, 187, 191, 196, 200, 205, 210, 215, 220, 226, 231, 237, 243, 249,
 };
 
+/* iq4k_values (quant.c): IQ4_K's two 16-entry tables, table 1 selected by the
+ * sub-block's `extra` bit. Verbatim from ggml-common.h GGML_TABLE_BEGIN. */
+__device__ static const int8_t iq4k_values_dev[32] = {
+   -127, -104,  -83,  -65,  -49,  -35,  -22,  -10,    1,   13,   25,   38,   53,   69,   89,  113,
+   -123, -100,  -79,  -61,  -45,  -31,  -18,   -6,    5,   17,   29,   42,   57,   73,   93,  117,
+};
+
+/* kvalues_iq4nl (quant.c): IQ4_NL / IQ4_XS 16-entry non-linear table. */
+__device__ static const int8_t kvalues_iq4nl_dev[16] = {
+   -127, -104,  -83,  -65,  -49,  -35,  -22,  -10,
+     1,   13,   25,   38,   53,   69,   89,  113,
+};
+
+/* iq3nl_values (quant.c): IQ3_K's two 16-entry tables, table 1 selected by
+ * the sub-block extra bit. */
+__device__ static const int8_t iq3nl_values_dev[16] = {
+    -63,  -40,  -23,  -10,    1,   13,   28,   47,
+    -59,  -36,  -19,   -6,    5,   17,   32,   51,
+};
+
+/* iq2nl_values (quant.c): IQ2_K's 8-entry table (two 4-entry tables selected
+ * by the sub-block extra bit: indices 0-3 vs 4-7). */
+__device__ static const int8_t iq2nl_values_dev[8] = { -31, -13, 1, 17, -26, -8, 6, 22 };
+
 __device__ static inline float dequant_q4_0(const void *blk, int i) {
     const uint8_t *b = (const uint8_t *)blk;
     uint16_t d_raw = b[0] | ((uint16_t)b[1] << 8);
@@ -380,6 +404,38 @@ __device__ static inline float dequant_iq6_K(const void *blk, int i) {
 
     const int mn = (extra >> (4 * ib64 + g)) & 1;
     return d * (float)sl[4 * ib64 + g] * (float)((int)iq6nl_lut_dev[q] - 128 + mn);
+}
+
+/* IQ4_K dequant: 256 values in 144 bytes. Non-linear 4-bit: the nibble
+ * indexes one of two 16-entry tables (iq4k_values_dev), selected per 32-value
+ * sub-block by the `extra` bits. Ported from dequantize_row_iq4_k() in
+ * quant.c.
+ *
+ * Layout: d(2) extra(2) scales_h[4] scales_l[8] qs[128]. Eight 32-value
+ * sub-blocks. Sub-block jj:
+ *   sh  = scales_h[jj/2] >> (4*(jj%2))         (4 bits, two 2-bit fields)
+ *   dl1 = d * (((scales_l[jj] & 0xf) | ((sh << 4) & 0x30)) - 32)  values  0..15
+ *   dl2 = d * (((scales_l[jj] >> 4)   | ((sh << 2) & 0x30)) - 32)  values 16..31
+ *   LUT table for values 0..15  = bit (2*jj)   of extra
+ *   LUT table for values 16..31 = bit (2*jj+1) of extra
+ */
+__device__ static inline float dequant_iq4_K(const void *blk, int i) {
+    const uint8_t *b = (const uint8_t *)blk;
+    const float d = gpu_fp16_to_fp32((uint16_t)(b[0] | ((uint16_t)b[1] << 8)));
+    const uint16_t extra = (uint16_t)(b[2] | ((uint16_t)b[3] << 8));
+    const uint8_t *scales_h = b + 4;
+    const uint8_t *scales_l = b + 8;
+    const uint8_t *qs = b + 16;
+
+    const int jj = i >> 5;               /* 32-value sub-block 0..7 */
+    const int rem = i & 31;              /* position inside it      */
+    const uint8_t sh = scales_h[jj >> 1] >> (4 * (jj & 1));
+    const int sc1 = (scales_l[jj] & 0xf) | ((sh << 4) & 0x30);
+    const int sc2 = (scales_l[jj] >> 4) | ((sh << 2) & 0x30);
+    const float dl = (rem < 16) ? d * (float)(sc1 - 32) : d * (float)(sc2 - 32);
+    const int tbl = (int)((extra >> (2 * jj + (rem >= 16))) & 1) * 16;
+    const uint8_t q = (rem < 16) ? (qs[jj * 16 + rem] & 0xF) : (qs[jj * 16 + rem - 16] >> 4);
+    return dl * (float)iq4k_values_dev[tbl + q];
 }
 
 /* IQ4_NL dequant: 32 values in 18 bytes, same layout as Q4_0.
