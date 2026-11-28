@@ -11262,6 +11262,118 @@ float vec_dot_iq3_xxs_q8_k(const void *vx, const void *vy, int n) {
 #endif
 }
 
+/* ---- Multi-column IQ3_XXS dot: decode each weight block ONCE, apply to NC columns ----
+ *
+ * vec_dot_iq3_xxs_q8_k() above redoes the expensive part (8 scalar grid loads, 4
+ * sign-table loads, per 64 weights) for every activation column. In MoE prefill each
+ * expert only sees a handful of rows, which is below the decode-once R8 engine's gate
+ * (its repack costs ~5x the per-weight decode of this dot, so it only pays from about
+ * 6 columns up), so the table GEMM ran this single-column dot ncols times:
+ * flat ~1.6 ms per column for a 2048x7168 matrix, no amortisation at all.
+ *
+ * This kernel does the same integer work per column, in the same order, with the same
+ * float accumulation (per-column accumulator, fmadd(d_w*d_y, sumi) per block, hsum,
+ * *0.25), so results are BIT-IDENTICAL to calling vec_dot_iq3_xxs_q8_k per column:
+ * the integer part is exact (maddubs cannot saturate here: grid <= 62, |q8| <= 127)
+ * and folding sumi1/sumi2 into one accumulator only reorders exact int32 additions.
+ * Columns are processed 8/4/2/1 at a time; ystride is the byte stride between
+ * activation columns (nb * sizeof(block_q8_K)). */
+#if defined(__AVX2__)
+/* s += d1*sc1 + d2*sc2 (int16 pairs -> int32). With AVX512-VNNI+VL the madd and the add
+ * fuse into one dpwssd; same exact int32 sums, one fewer uop per 32 weights. */
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+#define IQ3_MADD2(s_, d1_, sc1_, d2_, sc2_) \
+    (s_) = _mm256_dpwssd_epi32(_mm256_dpwssd_epi32((s_), (d1_), (sc1_)), (d2_), (sc2_));
+#else
+#define IQ3_MADD2(s_, d1_, sc1_, d2_, sc2_) \
+    (s_) = _mm256_add_epi32((s_), _mm256_add_epi32(_mm256_madd_epi16((d1_), (sc1_)), \
+                                                   _mm256_madd_epi16((d2_), (sc2_))));
+#endif
+#define IQ3_INIT(c) if ((c) < nc_) { accf[c] = _mm256_setzero_ps(); yp[c] = (const block_q8_K *)(yb + (size_t)(c) * ys); }
+#define IQ3_ZERO(c) if ((c) < nc_) { s[c] = _mm256_setzero_si256(); q8p[c] = yp[c][i].qs; }
+#define IQ3_ACC(c) if ((c) < nc_) {                                                           \
+        const __m256i a1 = _mm256_loadu_si256((const __m256i *)q8p[c]);                       \
+        const __m256i a2 = _mm256_loadu_si256((const __m256i *)(q8p[c] + 32)); q8p[c] += 64;   \
+        const __m256i d1 = _mm256_maddubs_epi16(q2_1, _mm256_sign_epi8(a1, sg1));             \
+        const __m256i d2 = _mm256_maddubs_epi16(q2_2, _mm256_sign_epi8(a2, sg2));             \
+        IQ3_MADD2(s[c], d1, sc1, d2, sc2) }
+#define IQ3_FIN(c) if ((c) < nc_) accf[c] = _mm256_fmadd_ps(_mm256_set1_ps(dw * yp[c][i].d),   \
+                                          _mm256_cvtepi32_ps(s[c]), accf[c]);
+#define IQ3_OUT(c) if ((c) < nc_) res[c] = 0.25f * iq3xxs_hsum(accf[c]);
+#define IQ3_ALL(M) M(0) M(1) M(2) M(3) M(4) M(5) M(6) M(7)
+#define IQ3_DOTN_DEF(NC)                                                                     \
+static void iq3xxs_dotn_##NC(const block_iq3_xxs *x, const char *yb, size_t ys, int nb,       \
+                             float *res) {                                                   \
+    const int nc_ = NC; __m256 accf[8]; __m256i s[8]; const block_q8_K *yp[8]; const int8_t *q8p[8];             \
+    IQ3_ALL(IQ3_INIT)                                                                        \
+    for (int i = 0; i < nb; ++i) {                                                           \
+        const float dw = fp16_to_fp32_lookup(x[i].d);                                        \
+        const uint8_t *q3 = x[i].qs, *gas = x[i].qs + QK_K / 4;                              \
+        IQ3_ALL(IQ3_ZERO)                                                                    \
+        for (int ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {                                    \
+            const __m256i q2_1 = iq3xxs_grid8(q3); q3 += 8;                                  \
+            const __m256i q2_2 = iq3xxs_grid8(q3); q3 += 8;                                  \
+            uint32_t aux32[2]; memcpy(aux32, gas, 8); gas += 8;                              \
+            const __m256i sg1 = iq3xxs_signs(aux32[0]), sg2 = iq3xxs_signs(aux32[1]);        \
+            const __m256i sc1 = _mm256_set1_epi16((short)(2 * (int)(aux32[0] >> 28) + 1));   \
+            const __m256i sc2 = _mm256_set1_epi16((short)(2 * (int)(aux32[1] >> 28) + 1));   \
+            IQ3_ALL(IQ3_ACC)                                                                 \
+        }                                                                                    \
+        IQ3_ALL(IQ3_FIN)                                                                     \
+    }                                                                                        \
+    IQ3_ALL(IQ3_OUT)                                                                         \
+}
+IQ3_DOTN_DEF(1)
+IQ3_DOTN_DEF(2)
+IQ3_DOTN_DEF(3)
+IQ3_DOTN_DEF(4)
+IQ3_DOTN_DEF(5)
+IQ3_DOTN_DEF(6)
+IQ3_DOTN_DEF(7)
+IQ3_DOTN_DEF(8)
+#undef IQ3_DOTN_DEF
+#undef IQ3_ALL
+#undef IQ3_OUT
+#undef IQ3_FIN
+#undef IQ3_ACC
+#undef IQ3_ZERO
+#undef IQ3_INIT
+#undef IQ3_MADD2
+#endif /* __AVX2__ */
+
+void vec_dot_iq3_xxs_q8_k_cols(const void *vx, const void *vy, size_t ystride, int nc, int n,
+                               float *res)
+{
+#if defined(__AVX2__)
+    if (n % QK_K == 0) {
+        iq3xxs_sign_init();
+        const block_iq3_xxs *x = (const block_iq3_xxs *)vx;
+        const char *y = (const char *)vy;
+        const int nb = n / QK_K;
+        /* One decode per group of up to 8 columns: remainders get their own exact-NC kernel. */
+        int c = 0;
+        while (c < nc) {
+            const int g = (nc - c >= 8) ? 8 : (nc - c);
+            const char *yc = y + (size_t)c * ystride; float *rc = res + c;
+            switch (g) {
+            case 8: iq3xxs_dotn_8(x, yc, ystride, nb, rc); break;
+            case 7: iq3xxs_dotn_7(x, yc, ystride, nb, rc); break;
+            case 6: iq3xxs_dotn_6(x, yc, ystride, nb, rc); break;
+            case 5: iq3xxs_dotn_5(x, yc, ystride, nb, rc); break;
+            case 4: iq3xxs_dotn_4(x, yc, ystride, nb, rc); break;
+            case 3: iq3xxs_dotn_3(x, yc, ystride, nb, rc); break;
+            case 2: iq3xxs_dotn_2(x, yc, ystride, nb, rc); break;
+            default: iq3xxs_dotn_1(x, yc, ystride, nb, rc); break;
+            }
+            c += g;
+        }
+        return;
+    }
+#endif
+    for (int c = 0; c < nc; ++c)
+        res[c] = vec_dot_iq3_xxs_q8_k(vx, (const char *)vy + (size_t)c * ystride, n);
+}
+
 /* Scalars exposed for the kernel checker (tests/kq_gemm_check.c). */
 float vec_dot_iq3_xxs_q8_k_ref(const void *vx, const void *vy, int n) {
     iq3xxs_sign_init();

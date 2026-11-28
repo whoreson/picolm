@@ -1017,6 +1017,15 @@ test_bmulti_chunk: tests/test_bmulti_chunk.c tensor.c type_dispatch.c quant.c $(
 check-bmulti-chunk: test_bmulti_chunk
 	PICOLM_BMULTI_TEST_VERBOSE=1 ./test_bmulti_chunk
 
+# vec_dot_iq3_xxs_q8_k_cols() (decode-once multi-column IQ3_XXS dot, used by the table GEMM
+# below the R8 gate) must equal the single-column dot bit for bit, for every column count.
+test_iq3xxs_cols: tests/test_iq3xxs_cols.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) type_dispatch.h quant.h tensor.h
+	$(CC) $(TEST_NATIVE_CFLAGS) -I. -O2 -o $@ tests/test_iq3xxs_cols.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
+
+.PHONY: check-iq3xxs-cols
+check-iq3xxs-cols: test_iq3xxs_cols
+	./test_iq3xxs_cols
+
 # The BF16 GEMMs unroll their k loop and finish the remainder separately, so a
 # mismatch between the loop advance and the number of emitted steps silently
 # skips a slice of k (and still returns plausible numbers). This checks every

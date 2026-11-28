@@ -1888,12 +1888,39 @@ static int kq_fast(const char *name, kq_r8_fn r8v, kq_r8_fn r8t,
  * values): the fast path, else a per-column dot over this thread's rows, which is exactly what these
  * types ran before (bit-identical). PICOLM_KQ_R8=0 disables the fast path, PICOLM_KQ_VNNI=0 forces
  * AVX2, PICOLM_KQ_R8_MIN_N (default 16) sets the smallest batch; size gate: picolm_r8_big_enough. */
+typedef void (*kq_cols_fn)(const void *vx, const void *vy, size_t ystride, int nc, int n, float *res);
 static int kq_best(const char *name, kq_r8_fn r8v, kq_r8_fn r8t, float (*dot)(const void *, const void *, int), size_t wblock,
-                   int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) {
-    int r = kq_fast(name, r8v, r8t, nrows, ncols, k, vx, vy, out, bs, ith, nth);
+                   int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth,
+                   kq_cols_fn cols) {
+    /* Types with a multi-column fused dot keep the repack-based decode-once R8 engine only
+     * where it actually wins. Measured single-thread on the MoE shapes (2048x7168 and
+     * 7168x2048, IQ3_XXS, AVX-512 VNNI): fused 8 cols 3.8 ms, 16 cols 7.5 ms (0.47 ms/col);
+     * R8 costs ~7.3 ms fixed + 0.14 ms/col. They cross at ~18 columns (R8 was gated at 16).
+     * PICOLM_KQ_R8_MIN_N still overrides. */
+    int r = 0;
+    {
+        static int mn = -1;
+        if (mn < 0) { const char *e = getenv("PICOLM_KQ_R8_MIN_N"); mn = (e && atoi(e) > 0) ? 0 : 18; }
+        if (!(cols && mn && ncols < mn))
+            r = kq_fast(name, r8v, r8t, nrows, ncols, k, vx, vy, out, bs, ith, nth);
+    }
     if (r) return r;
     const int nb = k / QK_K, gpt = (nrows + nth - 1) / nth;
     const int r0 = ith * gpt, r1 = (ith + 1) * gpt < nrows ? (ith + 1) * gpt : nrows;
+    if (cols && k % QK_K == 0) {
+        /* Decode-once multi-column dot (bit-identical to the per-column loop below). */
+        const size_t ys = (size_t)nb * sizeof(block_q8_K);
+        float tmp[64];
+        for (int i = r0; i < r1; ++i) {
+            const char *wr = (const char *)vx + (size_t)i * nb * wblock;
+            for (int c0 = 0; c0 < ncols; c0 += 64) {
+                const int nc = ncols - c0 < 64 ? ncols - c0 : 64;
+                cols(wr, (const char *)vy + (size_t)c0 * ys, ys, nc, k, tmp);
+                for (int c = 0; c < nc; ++c) out[(size_t)(c0 + c) * bs + i] = tmp[c];
+            }
+        }
+        return 1;
+    }
     for (int i = r0; i < r1; ++i)
         for (int c = 0; c < ncols; ++c)
             out[(size_t)c * bs + i] = dot((const char *)vx + (size_t)i * nb * wblock, (const char *)vy + (size_t)c * nb * sizeof(block_q8_K), k);
@@ -1911,19 +1938,20 @@ int sgemm_iq3_xxs_q8_k_best(int nrows, int ncols, int k, const void *vx, const v
     }
 #endif
     return kq_best("sgemm_iq3_xxs_q8_k", sgemm_iq3_xxs_q8_k_r8v, sgemm_iq3_xxs_q8_k_r8t,
-                   vec_dot_iq3_xxs_q8_k, sizeof(block_iq3_xxs), nrows, ncols, k, vx, vy, out, bs, ith, nth);
+                   vec_dot_iq3_xxs_q8_k, sizeof(block_iq3_xxs), nrows, ncols, k, vx, vy, out, bs, ith, nth,
+                   vec_dot_iq3_xxs_q8_k_cols);
 }
 int sgemm_q6_k_q8_k_best(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) {
-    return kq_best("sgemm_q6_k_q8_k", sgemm_q6_k_q8_k_r8v, sgemm_q6_k_q8_k_r8t, vec_dot_q6_K_q8_K, sizeof(block_q6_K), nrows, ncols, k, vx, vy, out, bs, ith, nth);
+    return kq_best("sgemm_q6_k_q8_k", sgemm_q6_k_q8_k_r8v, sgemm_q6_k_q8_k_r8t, vec_dot_q6_K_q8_K, sizeof(block_q6_K), nrows, ncols, k, vx, vy, out, bs, ith, nth, NULL);
 }
 int sgemm_q3_k_q8_k_best(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) {
-    return kq_best("sgemm_q3_k_q8_k", sgemm_q3_k_q8_k_r8v, sgemm_q3_k_q8_k_r8t, vec_dot_q3_K_q8_K, sizeof(block_q3_K), nrows, ncols, k, vx, vy, out, bs, ith, nth);
+    return kq_best("sgemm_q3_k_q8_k", sgemm_q3_k_q8_k_r8v, sgemm_q3_k_q8_k_r8t, vec_dot_q3_K_q8_K, sizeof(block_q3_K), nrows, ncols, k, vx, vy, out, bs, ith, nth, NULL);
 }
 int sgemm_q5_k_q8_k_best(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) {
-    return kq_best("sgemm_q5_k_q8_k", sgemm_q5_k_q8_k_r8v, sgemm_q5_k_q8_k_r8t, vec_dot_q5_K_q8_K, sizeof(block_q5_K), nrows, ncols, k, vx, vy, out, bs, ith, nth);
+    return kq_best("sgemm_q5_k_q8_k", sgemm_q5_k_q8_k_r8v, sgemm_q5_k_q8_k_r8t, vec_dot_q5_K_q8_K, sizeof(block_q5_K), nrows, ncols, k, vx, vy, out, bs, ith, nth, NULL);
 }
 int sgemm_q2_k_q8_k_best(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) {
-    return kq_best("sgemm_q2_k_q8_k", sgemm_q2_k_q8_k_r8v, sgemm_q2_k_q8_k_r8t, vec_dot_q2_K_q8_K, sizeof(block_q2_K), nrows, ncols, k, vx, vy, out, bs, ith, nth);
+    return kq_best("sgemm_q2_k_q8_k", sgemm_q2_k_q8_k_r8v, sgemm_q2_k_q8_k_r8t, vec_dot_q2_K_q8_K, sizeof(block_q2_K), nrows, ncols, k, vx, vy, out, bs, ith, nth, NULL);
 }
 /* Q4_K: no table entry (picolm_sgemm_d_q4k has its own signature); returns 1 if handled, 0 to fall through. */
 int sgemm_q4_k_q8_k_fast(int nrows, int ncols, int k_blocks, const void *vx, int lda, const void *vy, int ldb, float *out, size_t bs, int ith, int nth) {

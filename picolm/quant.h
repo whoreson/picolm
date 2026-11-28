@@ -2151,6 +2151,9 @@ void dequantize_row_iq4_xs_r8(const void *src, float *dst, int n);
 void vec_dot_iq3_xxs_r4_q8_k(const void *vx, const void *vy, int n, float *out, int nrows);
 void vec_dot_iq4_xs_r8_q8_k(const void *vx, const void *vy, int n, float *out, int nrows);
 float vec_dot_iq3_xxs_q8_k(const void *vx, const void *vy, int n);
+/* NC columns at once for one weight row: decode shared, bit-identical to NC calls of the above.
+ * ystride = byte stride between activation columns; res[c] gets column c's dot. */
+void vec_dot_iq3_xxs_q8_k_cols(const void *vx, const void *vy, size_t ystride, int nc, int n, float *res);
 /* Scalar (integer-exact) reference for vec_dot_iq3_xxs_q8_k, used as the
  * validation oracle by tests/kq_gemm_check.c. */
 float vec_dot_iq3_xxs_q8_k_ref(const void *vx, const void *vy, int n);
